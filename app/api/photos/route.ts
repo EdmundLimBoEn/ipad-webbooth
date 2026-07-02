@@ -11,7 +11,16 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   const event = safeEvent(req.nextUrl.searchParams.get("event"));
-  const { blobs } = await list({ prefix: `${event}/` });
+
+  // Page through ALL blobs — list() returns max 1000 per call, so a busy event
+  // would otherwise silently drop the newest photos past that.
+  const blobs = [];
+  let cursor: string | undefined;
+  do {
+    const page = await list({ prefix: `${event}/`, cursor });
+    blobs.push(...page.blobs);
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
 
   // filenames are `${event}/${Date.now()}-...jpg` — sort by that ms timestamp,
   // which is finer than blob uploadedAt (second granularity) so same-second
