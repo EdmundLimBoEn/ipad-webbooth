@@ -22,10 +22,11 @@ bun test app/templates.test.ts   # a single test file
 vercel --prod --yes     # deploy to production (authoritative build runs remotely)
 ```
 
-**Local `next build`/`tsc` can hang on this machine** due to a slow network/home-dir setup — when
-that happens, verify against the Vercel remote build (`vercel --prod`) instead, which type-checks
-and builds authoritatively. `next.config.ts` pins `outputFileTracingRoot` to this dir because a
-stray `~/package-lock.json` otherwise makes Next treat `$HOME` as the workspace root and scan it.
+If `next dev`/`next build` fails or hangs, suspect a corrupted `node_modules` (a bad
+`@swc/helpers/package.json` has done this) — `rm -rf node_modules && bun install` fixes it. As a
+fallback, the Vercel remote build (`vercel --prod`) type-checks and builds authoritatively.
+`next.config.ts` pins `outputFileTracingRoot` to this dir because a stray `~/package-lock.json`
+otherwise makes Next treat `$HOME` as the workspace root and scan it.
 
 ## Architecture
 
