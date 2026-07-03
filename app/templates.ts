@@ -29,12 +29,17 @@ export type Template = {
   slots: Slot[];
 };
 
-// ponytail: demo art is solid pink. Swap background->bgImage/overlay when the
-// real files arrive; slots + fit already define where and how photos land.
-//
-// The strip slots are 16:9 with fit:"contain" so the FULL photo shows (no crop)
-// with pink letterbox bands, and the pink rectangle is sized to hold three of
-// them plus a bottom band for a logo/caption.
+// The four strip frames come from FRAMES.pdf, rendered to 720x2160 PNGs in
+// /public/templates/. Each is drawn as bgImage (the photos land on top, filling
+// its three sky-placeholder holes). All four share the same hole geometry:
+// x=72, w=575, h=475 (≈1.21:1), only the y offsets differ. fit:"cover" so the
+// photo replaces the placeholder exactly with no letterbox — the camera preview
+// crops to the same aspect (see page.tsx). To re-measure holes, see HUMANS.md.
+const STRIP_W = 575;
+const STRIP_H = 475;
+const stripSlots = (ys: number[]): Slot[] =>
+  ys.map((y) => ({ x: 72, y, w: STRIP_W, h: STRIP_H }));
+
 export const TEMPLATES: Record<string, Template> = {
   square: {
     label: "Square",
@@ -45,18 +50,65 @@ export const TEMPLATES: Record<string, Template> = {
     background: "#ffd9e8", // soft pink border
     slots: [{ x: 70, y: 70, w: 940, h: 940 }],
   },
-  strip: {
-    label: "Photo Strip",
+  // Two square Talent Beacon frames from SQUARE FRAME.pdf, rendered to 1080x1080
+  // PNGs. The photo hole is the whole sky+grass landscape placeholder:
+  // x=67, y=70, 946x782 (~1.21:1), pixel-measured from the renders. Lighthouse
+  // adds an overlay (frame art with the hole punched transparent) so the
+  // lighthouse/glow that crosses the hole draws on top of the photo.
+  lighthouse: {
+    label: "Lighthouse",
+    shots: 1,
+    intervalMs: 3000,
+    canvas: { w: 1080, h: 1080 },
+    fit: "cover",
+    bgImage: "/templates/lighthouse.png",
+    overlay: "/templates/lighthouse-overlay.png",
+    slots: [{ x: 67, y: 70, w: 946, h: 782 }],
+  },
+  beaconSquare: {
+    label: "Beacon Square",
+    shots: 1,
+    intervalMs: 3000,
+    canvas: { w: 1080, h: 1080 },
+    fit: "cover",
+    bgImage: "/templates/beacon-square.png",
+    slots: [{ x: 67, y: 70, w: 946, h: 782 }],
+  },
+  beacon: {
+    label: "Beacon",
     shots: 3,
-    intervalMs: 10000,
-    canvas: { w: 700, h: 1360 },
-    fit: "contain", // show the whole 16:9 photo, letterboxed in pink
-    background: "#ff2d8b", // Barbie pink
-    slots: [
-      { x: 30, y: 30, w: 640, h: 360 }, // 640x360 = 16:9
-      { x: 30, y: 420, w: 640, h: 360 },
-      { x: 30, y: 810, w: 640, h: 360 },
-    ], // 190px bottom band (1170–1360) left for a logo/caption
+    intervalMs: 3000,
+    canvas: { w: 720, h: 2160 },
+    fit: "cover",
+    bgImage: "/templates/beacon.png",
+    slots: stripSlots([518, 1010, 1503]),
+  },
+  birthday: {
+    label: "Birthday",
+    shots: 3,
+    intervalMs: 3000,
+    canvas: { w: 720, h: 2160 },
+    fit: "cover",
+    bgImage: "/templates/birthday.png",
+    slots: stripSlots([213, 758, 1299]),
+  },
+  sheep: {
+    label: "Baaa-thday",
+    shots: 3,
+    intervalMs: 3000,
+    canvas: { w: 720, h: 2160 },
+    fit: "cover",
+    bgImage: "/templates/sheep.png",
+    slots: stripSlots([310, 838, 1367]),
+  },
+  starry: {
+    label: "Starry",
+    shots: 3,
+    intervalMs: 3000,
+    canvas: { w: 720, h: 2160 },
+    fit: "cover",
+    bgImage: "/templates/starry.png",
+    slots: stripSlots([333, 843, 1352]),
   },
 };
 

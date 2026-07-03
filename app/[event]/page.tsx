@@ -133,9 +133,20 @@ export default function Booth() {
     setStatus("ready");
   };
 
+  // preview crops to the chosen frame's photo aspect (w/h of its first slot),
+  // so guests see exactly what will be captured. Fullscreen until a mode is set.
+  const previewAspect = mode ? TEMPLATES[mode].slots[0].w / TEMPLATES[mode].slots[0].h : null;
+  const framed = mode !== null && status !== "picking";
+
   return (
     <main className={styles.booth}>
-      <video ref={videoRef} className={styles.video} playsInline muted />
+      <video
+        ref={videoRef}
+        className={`${styles.video} ${framed ? styles.framed : ""}`}
+        style={framed ? { aspectRatio: String(previewAspect) } : undefined}
+        playsInline
+        muted
+      />
       {flash && <div className={styles.flash} />}
       {count > 0 && (
         <div className={styles.count}>
@@ -148,16 +159,21 @@ export default function Booth() {
         <div className={styles.picker}>
           <h1>Pick a style</h1>
           <div className={styles.choices}>
-            <button className={styles.choice} onClick={() => pick("square")}>
-              <span className={`${styles.icon} ${styles.iconSquare}`} />
-              Square
-              <small>1 photo</small>
-            </button>
-            <button className={styles.choice} onClick={() => pick("strip")}>
-              <span className={`${styles.icon} ${styles.iconStrip}`} />
-              Photo Strip
-              <small>3 photos · 10s each</small>
-            </button>
+            {(Object.keys(TEMPLATES) as (keyof typeof TEMPLATES)[]).map((k) => {
+              const t = TEMPLATES[k];
+              return (
+                <button key={k} className={styles.choice} onClick={() => pick(k)}>
+                  {t.bgImage ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={t.bgImage} alt="" className={styles.iconFrame} />
+                  ) : (
+                    <span className={`${styles.icon} ${styles.iconSquare}`} />
+                  )}
+                  {t.label}
+                  <small>{t.shots === 1 ? "1 photo" : `${t.shots} photos`}</small>
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
@@ -184,7 +200,7 @@ export default function Booth() {
             disabled={status !== "ready"}
             aria-label="Start"
           >
-            {status === "uploading" ? "…" : status === "running" ? "" : mode === "strip" ? "▶" : ""}
+            {status === "uploading" ? "…" : status === "running" ? "" : mode && TEMPLATES[mode].shots > 1 ? "▶" : ""}
           </button>
           <button className={styles.change} onClick={() => setStatus("picking")} disabled={status !== "ready"}>
             {mode && TEMPLATES[mode].label} · change

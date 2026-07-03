@@ -19,25 +19,25 @@ gallery don't need it. To rotate it later: `vercel env rm BOOTH_UPLOAD_KEY` then
 re-add, and redeploy.
 
 
-## 4. Swapping in the real strip/border artwork (when your friend sends it)
+## 4. Frame artwork — done
 
-Right now the borders are demo colors (soft pink square, Barbie-pink strip). To
-use real art, edit `app/templates.ts`:
+The four strip frames from `FRAMES.pdf` are live as `public/templates/{beacon,
+birthday,sheep,starry}.png` (rendered at 720×2160), wired up in `app/templates.ts`
+as `bgImage` with the photo holes measured. The Square frame is unchanged. To
+add/replace a frame later: drop a PNG in `public/templates/`, add a template
+entry with `bgImage` + `slots` (x/y/w/h in canvas pixels over the holes), then
+`vercel --prod`. `bun test` checks the crop math.
 
-- Drop the PNG(s) into `public/templates/` (e.g. `public/templates/strip.png`).
-- On the template, set `overlay: "/templates/strip.png"` (frame art with holes,
-  drawn on top of the photos) **or** `bgImage: "/templates/strip.png"` (art
-  behind the photos). Remove/keep `background` as needed.
-- Adjust the `slots` (x/y/w/h in canvas pixels) so the photos line up with the
-  holes in the art. Canvas sizes: square `1080×1080`, strip `600×1800`.
-
-Redeploy with `vercel --prod` after editing. `bun test` checks the crop math.
+**Deploy the frames:** run `vercel --prod` so the new PNGs and code go live.
 
 ## 5. During the event
 
 - Open the booth URL on the iPad in Safari, allow camera access when prompted.
-- Walk-up flow: pick **Square** (1 photo) or **Photo Strip** (3 photos, 10s
-  between each), then press the shutter/▶.
+- Walk-up flow: pick a 1-photo square frame — **Square / Lighthouse / Beacon
+  Square** (from `SQUARE FRAME.pdf`) — or one of the four strip frames —
+  **Beacon / Birthday / Baaa-thday / Starry** (3 photos each) — then press the
+  shutter/▶. The preview crops to the frame's photo shape so guests frame
+  themselves correctly.
 - Put the live gallery URL on a laptop/projector/TV. Tap any photo → **Save
   photo** (on phones this opens the share sheet → Save to Photos).
 - To remove a photo: Vercel dashboard → Storage → `photobooth` blob store → delete the blob.

@@ -2,6 +2,10 @@
   position: fixed;
   inset: 0;
   overflow: hidden;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .video {
@@ -9,6 +13,13 @@
   height: 100%;
   object-fit: cover;
   transform: scaleX(-1); /* mirror preview like a selfie */
+}
+
+/* framed: crop the preview to the chosen frame's photo aspect (letterboxed) */
+.video.framed {
+  width: 100%;
+  height: auto;
+  max-height: 100%;
 }
 
 .flash {
@@ -98,15 +109,11 @@
 
 .iconSquare { width: 64px; height: 64px; border: 6px solid #ffd9e8; }
 
-.iconStrip {
-  width: 34px;
+.iconFrame {
   height: 84px;
-  border: 5px solid #ffd9e8;
-  background:
-    linear-gradient(#fff 0 0) center/18px 20px no-repeat,
-    #ff2d8b;
-  background-position: center 6px, center;
-  box-shadow: 0 -22px 0 -16px #fff inset, 0 22px 0 -16px #fff inset;
+  width: auto;
+  border-radius: 6px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
 }
 
 .change {
