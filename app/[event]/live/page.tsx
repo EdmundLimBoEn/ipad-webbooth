@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import styles from "./live.module.css";
+import { wrap } from "./wrap";
 
 type Photo = { url: string; uploadedAt: string };
 
@@ -31,6 +32,8 @@ export default function Live() {
   const periodsRef = useRef<number[]>([]);
   const posRef = useRef<number[]>([]);
   const fullRef = useRef(false);
+  // cumulative pointer travel of the last drag; >10px suppresses the tile click
+  const dragDistRef = useRef(0);
   useEffect(() => {
     fullRef.current = !!full;
   }, [full]);
@@ -90,7 +93,9 @@ export default function Live() {
 
   // Projector marquee: creep every column up forever. Each column wraps at its
   // own period (its content is duplicated), so all screen space stays filled.
-  // Pauses while a photo is open and for a few seconds after any touch/click.
+  // Viewers can also scroll it: wheel and touch-drag move all columns together
+  // (with a momentum fling on release), and auto-scroll resumes 4s after the
+  // last interaction. Pauses while a photo is open.
   useEffect(() => {
     if (!animate) {
       posRef.current = [];
@@ -102,30 +107,85 @@ export default function Live() {
     let raf = 0;
     let last: number | null = null;
     let idleUntil = 0;
+    let velocity = 0; // px/sec fling from a drag release, decays in step()
+    let dragY: number | null = null; // pointer y while dragging, else null
+    let lastMoveT = 0;
     const bump = () => {
       idleUntil = performance.now() + 4000;
     };
-    const events = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
-    events.forEach((e) => window.addEventListener(e, bump, { passive: true }));
+
+    const move = (delta: number) => {
+      colRefs.current.forEach((el, i) => {
+        const period = periodsRef.current[i];
+        if (!el || !period) return;
+        const pos = wrap((posRef.current[i] ?? 0) + delta, period);
+        posRef.current[i] = pos;
+        el.style.transform = `translateY(${-pos}px)`;
+      });
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      if (fullRef.current) return;
+      bump();
+      velocity = 0;
+      move(e.deltaY);
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      if (fullRef.current) return;
+      bump();
+      velocity = 0;
+      dragY = e.clientY;
+      lastMoveT = performance.now();
+      dragDistRef.current = 0;
+    };
+    const onPointerMove = (e: PointerEvent) => {
+      if (dragY === null || fullRef.current) return;
+      bump();
+      const dy = dragY - e.clientY;
+      dragY = e.clientY;
+      const now = performance.now();
+      const dt = (now - lastMoveT) / 1000;
+      lastMoveT = now;
+      if (dt > 0) velocity = dy / dt;
+      dragDistRef.current += Math.abs(dy);
+      move(dy);
+    };
+    const onPointerEnd = () => {
+      dragY = null;
+      bump();
+    };
+
+    window.addEventListener("wheel", onWheel, { passive: true });
+    window.addEventListener("pointerdown", onPointerDown, { passive: true });
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    window.addEventListener("pointerup", onPointerEnd, { passive: true });
+    window.addEventListener("pointercancel", onPointerEnd, { passive: true });
+    window.addEventListener("keydown", bump, { passive: true });
 
     const step = (t: number) => {
       const dt = last === null ? 0 : Math.min((t - last) / 1000, 0.1);
       last = t;
-      if (!fullRef.current && t > idleUntil) {
-        colRefs.current.forEach((el, i) => {
-          const period = periodsRef.current[i];
-          if (!el || !period) return;
-          const pos = ((posRef.current[i] ?? 0) + SPEED * dt) % period;
-          posRef.current[i] = pos;
-          el.style.transform = `translateY(${-pos}px)`;
-        });
+      if (!fullRef.current && dragY === null) {
+        if (Math.abs(velocity) > 1) {
+          move(velocity * dt);
+          velocity *= Math.pow(0.95, dt * 60); // frame-rate-independent decay
+          bump(); // keep auto-scroll paused until the fling settles
+        } else if (t > idleUntil) {
+          velocity = 0;
+          move(SPEED * dt);
+        }
       }
       raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
     return () => {
       cancelAnimationFrame(raf);
-      events.forEach((e) => window.removeEventListener(e, bump));
+      window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerEnd);
+      window.removeEventListener("pointercancel", onPointerEnd);
+      window.removeEventListener("keydown", bump);
     };
   }, [animate]);
 
@@ -185,7 +245,10 @@ export default function Live() {
                   alt=""
                   loading="lazy"
                   className={styles.tile}
-                  onClick={() => setFull(p.url)}
+                  onClick={() => {
+                    if (dragDistRef.current > 10) return; // was a drag, not a tap
+                    setFull(p.url);
+                  }}
                   onLoad={(e) => {
                     const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
                     if (w > 0) setRatios((mm) => (mm[p.url] ? mm : { ...mm, [p.url]: h / w }));

@@ -22,6 +22,7 @@
   display: flex;
   gap: 12px;
   height: 100%;
+  touch-action: none; /* drags drive the marquee, not iOS rubber-banding */
 }
 
 .col {
