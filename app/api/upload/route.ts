@@ -1,4 +1,4 @@
-import { put } from "@vercel/blob";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { NextRequest, NextResponse } from "next/server";
 import { keyOk, isImage, MAX_UPLOAD_BYTES } from "@/app/upload-auth";
 
@@ -8,8 +8,16 @@ function safeEvent(raw: string | null): string {
   return s || "event";
 }
 
+// 8 hex chars of randomness — replicates @vercel/blob's addRandomSuffix so
+// keys stay unguessable/collision-free without a real filename generator.
+function randomSuffix(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(4));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export async function POST(req: NextRequest) {
-  const expected = process.env.BOOTH_UPLOAD_KEY;
+  const { env } = getCloudflareContext();
+  const expected = env.BOOTH_UPLOAD_KEY;
   if (!expected) {
     // Fail closed: in production an unset key must NOT mean "anyone can upload".
     // Only local dev is allowed to run keyless for convenience.
@@ -37,11 +45,13 @@ export async function POST(req: NextRequest) {
   }
 
   const event = safeEvent(req.nextUrl.searchParams.get("event"));
-  const blob = await put(`${event}/${Date.now()}.jpg`, body, {
-    access: "public",
-    contentType: "image/jpeg",
-    addRandomSuffix: true,
+  // Key format `${event}/${Date.now()}-${suffix}.jpg` — the ms timestamp stays
+  // the leading path segment so the photos route's sort-by-filename (which
+  // reads `pathname.split("/")[1].split("-")[0]`) needs no changes.
+  const key = `${event}/${Date.now()}-${randomSuffix()}.jpg`;
+  await env.PHOTOS.put(key, body, {
+    httpMetadata: { contentType: "image/jpeg" },
   });
 
-  return NextResponse.json({ url: blob.url });
+  return NextResponse.json({ url: `${env.R2_PUBLIC_BASE}/${key}` });
 }

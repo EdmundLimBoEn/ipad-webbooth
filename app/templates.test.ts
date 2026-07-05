@@ -1,5 +1,25 @@
 import { test, expect } from "bun:test";
-import { coverRect, containRect } from "./templates";
+import { coverRect, containRect, availableTemplates, TEMPLATES, GROUPS } from "./templates";
+
+test("no config -> only ungrouped default frames", () => {
+  expect(availableTemplates(null)).toEqual(["square"]);
+});
+
+test("a saved config is the complete list — defaults can be off", () => {
+  expect(availableTemplates(["lighthouse", "beacon"])).toEqual(["lighthouse", "beacon"]);
+  expect(availableTemplates(["square", "starry"])).toEqual(["square", "starry"]);
+  expect(availableTemplates([])).toEqual([]);
+});
+
+test("unknown keys are ignored", () => {
+  expect(availableTemplates(["nope", "starry"])).toEqual(["starry"]);
+});
+
+test("every grouped template's group exists in GROUPS", () => {
+  for (const t of Object.values(TEMPLATES)) {
+    if (t.group) expect(GROUPS[t.group]).toBeString();
+  }
+});
 
 test("square into square = full image", () => {
   const r = coverRect(1000, 1000, 500, 500);

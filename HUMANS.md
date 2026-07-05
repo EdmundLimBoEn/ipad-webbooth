@@ -15,20 +15,36 @@ b29b8260981f1548
 ```
 
 Enter this on each iPad/phone used to take photos. Guests viewing the live
-gallery don't need it. To rotate it later: `vercel env rm BOOTH_UPLOAD_KEY` then
-re-add, and redeploy.
+gallery don't need it. To rotate it later:
+`bunx wrangler secret put BOOTH_UPLOAD_KEY` (takes effect immediately).
 
 
 ## 4. Frame artwork — done
 
-The four strip frames from `FRAMES.pdf` are live as `public/templates/{beacon,
-birthday,sheep,starry}.png` (rendered at 720×2160), wired up in `app/templates.ts`
-as `bgImage` with the photo holes measured. The Square frame is unchanged. To
-add/replace a frame later: drop a PNG in `public/templates/`, add a template
-entry with `bgImage` + `slots` (x/y/w/h in canvas pixels over the holes), then
-`vercel --prod`. `bun test` checks the crop math.
+The four strip frames from `FRAMES.pdf` are live in
+`public/templates/talent-beacon-9-anniversary/` (rendered at 720×2160), wired up
+in `app/templates.ts` as `bgImage` with the photo holes measured. The Square
+frame is unchanged. To add/replace a frame later: make/pick a group folder under
+`public/templates/<group>/`, drop the PNG there, add the group to `GROUPS` and a
+template entry with `group` + `bgImage` + `slots` (x/y/w/h in canvas pixels over
+the holes), then `bun run deploy`. `bun test` checks the crop math.
 
-**Deploy the frames:** run `vercel --prod` so the new PNGs and code go live.
+## 4b. Enable frames per event (do this for every event!)
+
+New events only get the pink Square frame by default. Open
+`/{event}/admin`, enter the upload key, tick the frames that event may use, and
+Save. **After deploying this change, re-enable the Talent Beacon frames for any
+event that is still running** — they are hidden everywhere until ticked. The
+admin page also has the photo zip export.
+
+## 4c. Cloudflare migration — done (2026-07-05)
+
+The app runs on Cloudflare Workers + R2. `photobooth.edmundlim.systems` is live
+on the Worker; all 100 photos migrated (0 failures). Remaining for you:
+
+- [ ] Test the camera on a real iPad against the new deployment (see §5).
+- [ ] Once confident: cancel the Vercel Pro subscription. Keep the Vercel Blob
+  store as-is — it's the untouched backup of every pre-migration photo.
 
 ## 5. During the event
 
@@ -40,6 +56,7 @@ entry with `bgImage` + `slots` (x/y/w/h in canvas pixels over the holes), then
   themselves correctly.
 - Put the live gallery URL on a laptop/projector/TV. Tap any photo → **Save
   photo** (on phones this opens the share sheet → Save to Photos).
-- To remove a photo: Vercel dashboard → Storage → `photobooth` blob store → delete the blob.
+- To remove a photo: Cloudflare dashboard → R2 → `photobooth` bucket → delete the object
+  (or `bunx wrangler r2 object delete "photobooth/<event>/<file>.jpg" --remote`).
 - **Test the camera + both modes on a real iPad before the event** — camera
   capture can't be verified headlessly, only on-device over HTTPS.

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import styles from "./booth.module.css";
-import { TEMPLATES, composite } from "../templates";
+import { TEMPLATES, availableTemplates, composite } from "../templates";
 
 type Status = "starting" | "picking" | "ready" | "denied" | "running" | "uploading";
 
@@ -20,6 +20,16 @@ export default function Booth() {
   const [flash, setFlash] = useState(false);
   const [lastUrl, setLastUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // per-event frame allowlist from /api/config; null (no config / not loaded
+  // yet / fetch failed) degrades to defaults-only, never to all frames
+  const [enabled, setEnabled] = useState<string[] | null>(null);
+
+  useEffect(() => {
+    fetch(`/api/config?event=${encodeURIComponent(event)}`)
+      .then((r) => r.json())
+      .then((d) => setEnabled(Array.isArray(d.frames) ? d.frames : null))
+      .catch(() => {});
+  }, [event]);
 
   // ask for the upload key once, keep it in localStorage
   const keyRef = useRef<string>("");
@@ -85,7 +95,11 @@ export default function Booth() {
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
-        setStatus("ready");
+        // every photo returns to the frame picker — each guest picks manually,
+        // the previous guest's mode never carries over. (Camera-denied fallback
+        // returns to its own screen instead.)
+        setMode(null);
+        setStatus(streamRef.current ? "picking" : "denied");
       }
     },
     [event]
@@ -140,10 +154,16 @@ export default function Booth() {
 
   return (
     <main className={styles.booth}>
+      {/* framed box is exactly the slot's aspect at the largest size that fits,
+          so the cover-cropped preview is edge-to-edge what composite() captures */}
       <video
         ref={videoRef}
         className={`${styles.video} ${framed ? styles.framed : ""}`}
-        style={framed ? { aspectRatio: String(previewAspect) } : undefined}
+        style={
+          framed
+            ? { aspectRatio: String(previewAspect), width: `min(100dvw, ${previewAspect} * 100dvh)` }
+            : undefined
+        }
         playsInline
         muted
       />
@@ -157,9 +177,16 @@ export default function Booth() {
 
       {status === "picking" && (
         <div className={styles.picker}>
+          {lastUrl && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={lastUrl} alt="last" className={styles.thumb} />
+          )}
           <h1>Pick a style</h1>
+          {availableTemplates(enabled).length === 0 && (
+            <p>No frames are enabled for this event yet.</p>
+          )}
           <div className={styles.choices}>
-            {(Object.keys(TEMPLATES) as (keyof typeof TEMPLATES)[]).map((k) => {
+            {availableTemplates(enabled).map((k) => {
               const t = TEMPLATES[k];
               return (
                 <button key={k} className={styles.choice} onClick={() => pick(k)}>

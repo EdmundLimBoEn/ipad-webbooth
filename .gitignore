@@ -7,3 +7,7 @@
 next-env.d.ts
 .DS_Store
 .gstack/
+.open-next/
+.wrangler/
+scripts/.migrated.json
+.claude/

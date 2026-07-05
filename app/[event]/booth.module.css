@@ -15,11 +15,10 @@
   transform: scaleX(-1); /* mirror preview like a selfie */
 }
 
-/* framed: crop the preview to the chosen frame's photo aspect (letterboxed) */
+/* framed: crop the preview to the chosen frame's photo aspect (letterboxed).
+   Width + aspect-ratio come inline from the template's slot. */
 .video.framed {
-  width: 100%;
   height: auto;
-  max-height: 100%;
 }
 
 .flash {

@@ -12,6 +12,15 @@
 //   4. Set `fit` per template (or per slot) to "contain" (show the whole photo,
 //      letterboxed — nothing cropped) or "cover" (fill the hole, cropping
 //      overflow). Unknown photo/hole aspect ratios are fine either way.
+//
+// GROUPING — frames belong to a `group` (one folder per event/design drop under
+// /public/templates/<group>/, one label in GROUPS). Ungrouped frames (the pink
+// square) are the defaults: on until a config says otherwise, but they can be
+// turned off. Grouped frames only show up once enabled per event
+// in that event's admin page (/{event}/admin),
+// which stores the allowlist at blob `_config/{event}.json`. To add frames:
+// make a new folder under /public/templates/, add the group to GROUPS, and tag
+// each new TEMPLATES entry with the group id.
 
 export type Fit = "cover" | "contain";
 
@@ -19,6 +28,7 @@ export type Slot = { x: number; y: number; w: number; h: number; fit?: Fit };
 
 export type Template = {
   label: string;
+  group?: string; // key of GROUPS; absent = default frame, always available
   shots: number; // how many photos to take
   intervalMs: number; // countdown seconds*1000 before each shot
   canvas: { w: number; h: number };
@@ -40,6 +50,13 @@ const STRIP_H = 475;
 const stripSlots = (ys: number[]): Slot[] =>
   ys.map((y) => ({ x: 72, y, w: STRIP_W, h: STRIP_H }));
 
+// group id -> display label (admin UI section headers)
+export const GROUPS: Record<string, string> = {
+  "talent-beacon-9-anniversary": "Talent Beacon 9 Anniversary",
+};
+
+const TB9 = "talent-beacon-9-anniversary";
+
 export const TEMPLATES: Record<string, Template> = {
   square: {
     label: "Square",
@@ -57,60 +74,76 @@ export const TEMPLATES: Record<string, Template> = {
   // lighthouse/glow that crosses the hole draws on top of the photo.
   lighthouse: {
     label: "Lighthouse",
+    group: TB9,
     shots: 1,
     intervalMs: 3000,
     canvas: { w: 1080, h: 1080 },
     fit: "cover",
-    bgImage: "/templates/lighthouse.png",
-    overlay: "/templates/lighthouse-overlay.png",
+    bgImage: "/templates/talent-beacon-9-anniversary/lighthouse.png",
+    overlay: "/templates/talent-beacon-9-anniversary/lighthouse-overlay.png",
     slots: [{ x: 67, y: 70, w: 946, h: 782 }],
   },
   beaconSquare: {
     label: "Beacon Square",
+    group: TB9,
     shots: 1,
     intervalMs: 3000,
     canvas: { w: 1080, h: 1080 },
     fit: "cover",
-    bgImage: "/templates/beacon-square.png",
+    bgImage: "/templates/talent-beacon-9-anniversary/beacon-square.png",
     slots: [{ x: 67, y: 70, w: 946, h: 782 }],
   },
   beacon: {
     label: "Beacon",
+    group: TB9,
     shots: 3,
     intervalMs: 3000,
     canvas: { w: 720, h: 2160 },
     fit: "cover",
-    bgImage: "/templates/beacon.png",
+    bgImage: "/templates/talent-beacon-9-anniversary/beacon.png",
     slots: stripSlots([518, 1010, 1503]),
   },
   birthday: {
     label: "Birthday",
+    group: TB9,
     shots: 3,
     intervalMs: 3000,
     canvas: { w: 720, h: 2160 },
     fit: "cover",
-    bgImage: "/templates/birthday.png",
+    bgImage: "/templates/talent-beacon-9-anniversary/birthday.png",
     slots: stripSlots([213, 758, 1299]),
   },
   sheep: {
     label: "Baaa-thday",
+    group: TB9,
     shots: 3,
     intervalMs: 3000,
     canvas: { w: 720, h: 2160 },
     fit: "cover",
-    bgImage: "/templates/sheep.png",
+    bgImage: "/templates/talent-beacon-9-anniversary/sheep.png",
     slots: stripSlots([310, 838, 1367]),
   },
   starry: {
     label: "Starry",
+    group: TB9,
     shots: 3,
     intervalMs: 3000,
     canvas: { w: 720, h: 2160 },
     fit: "cover",
-    bgImage: "/templates/starry.png",
+    bgImage: "/templates/talent-beacon-9-anniversary/starry.png",
     slots: stripSlots([333, 843, 1352]),
   },
 };
+
+// Template keys a booth may offer given an event's enabled-frames allowlist
+// (from /api/config). No config saved (null) -> just the ungrouped defaults.
+// A saved config is the complete list — defaults are on by default in the
+// admin UI but CAN be unticked. Unknown keys are ignored. Pure — unit tested.
+export function availableTemplates(enabled: string[] | null): string[] {
+  if (enabled === null) return Object.keys(TEMPLATES).filter((k) => !TEMPLATES[k].group);
+  const on = new Set(enabled);
+  return Object.keys(TEMPLATES).filter((k) => on.has(k));
+}
 
 // Source rectangle that fills a dw×dh slot from an iw×ih image without
 // distortion (center-crop / object-fit: cover). Pure — unit tested.

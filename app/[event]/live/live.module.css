@@ -1,5 +1,6 @@
 .live {
-  min-height: 100%;
+  height: 100dvh;
+  overflow: hidden;
   padding: 14px;
 }
 
@@ -13,37 +14,60 @@
   font-size: 20px;
 }
 
-/* masonry so full-height strips and squares sit together, uncropped */
+/* masonry so full-height strips and squares sit together, uncropped;
+   columns are JS-balanced by photo height, and each column loops
+   independently (content duplicated, translateY marquee) so the screen
+   is always fully covered — no black gaps */
 .grid {
-  column-count: 2;
-  column-gap: 12px;
+  display: flex;
+  gap: 12px;
+  height: 100%;
 }
 
-@media (min-width: 640px) {
-  .grid { column-count: 3; }
+.col {
+  flex: 1;
+  min-width: 0;
 }
-@media (min-width: 1000px) {
-  .grid { column-count: 4; }
+
+.colInner {
+  will-change: transform;
 }
-@media (min-width: 1500px) {
-  .grid { column-count: 5; }
+
+/* one loop copy; padding-bottom stands in for the gap between copies so the
+   wrap period is exactly this element's offsetHeight */
+.copy {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 12px;
 }
 
 .tile {
   display: block;
   width: 100%;
   height: auto; /* full image, not cropped */
-  margin-bottom: 12px;
   border-radius: 10px;
   cursor: pointer;
   background: #111;
-  break-inside: avoid;
   animation: pop 400ms ease-out;
 }
 
 @keyframes pop {
   from { opacity: 0; transform: scale(0.9); }
   to { opacity: 1; transform: scale(1); }
+}
+
+.qr {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  width: clamp(90px, 14vw, 180px);
+  height: clamp(90px, 14vw, 180px);
+  background: #fff;
+  padding: 8px;
+  border-radius: 10px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  z-index: 5;
 }
 
 .lightbox {
