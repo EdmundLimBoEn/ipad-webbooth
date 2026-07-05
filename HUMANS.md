@@ -45,6 +45,11 @@ on the Worker; all 100 photos migrated (0 failures). Remaining for you:
 - [ ] Test the camera on a real iPad against the new deployment (see §5).
 - [ ] Once confident: cancel the Vercel Pro subscription. Keep the Vercel Blob
   store as-is — it's the untouched backup of every pre-migration photo.
+- [ ] QA the new gallery manual scroll (deployed 2026-07-05): on desktop,
+  wheel scrolls the marquee both ways and wraps with no jump, auto-scroll
+  resumes after ~4s idle, a click still opens the lightbox but a drag doesn't;
+  on a real phone, touch-drag tracks the finger with no rubber-banding, a
+  flick coasts and settles, tap still opens the lightbox and Save works.
 
 ## 5. During the event
 
