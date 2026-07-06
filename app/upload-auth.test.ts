@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { keyOk, adminOk, sha256Hex, safeEvent, isImage } from "./upload-auth";
+import { keyOk, adminOk, hashBoothKey, boothKeyMatches, safeEvent, isImage } from "./upload-auth";
 
 test("keyOk accepts the exact key", () => {
   expect(keyOk("b29b8260981f1548", "b29b8260981f1548")).toBe(true);
@@ -42,8 +42,14 @@ test("adminOk gates on the admin key and fails closed without one", () => {
   else process.env.ALLOW_KEYLESS = prev;
 });
 
-test("sha256Hex matches a known vector", async () => {
-  expect(await sha256Hex("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+test("booth key hashing round-trips and is salted", async () => {
+  const stored = await hashBoothKey("my-booth-key-123");
+  expect(stored).toMatch(/^[0-9a-f]{32}:[0-9a-f]{64}$/); // salt:hash
+  expect(await boothKeyMatches("my-booth-key-123", stored)).toBe(true);
+  expect(await boothKeyMatches("wrong-key-00000", stored)).toBe(false);
+  expect(await boothKeyMatches("my-booth-key-123", "garbage")).toBe(false);
+  // fresh salt every time — identical keys must not produce identical hashes
+  expect(await hashBoothKey("my-booth-key-123")).not.toBe(stored);
 });
 
 test("safeEvent slugs to a-z0-9- and never emits an underscore", () => {

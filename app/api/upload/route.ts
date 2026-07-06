@@ -1,6 +1,6 @@
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { NextRequest, NextResponse } from "next/server";
-import { keyOk, adminOk, sha256Hex, safeEvent, readEventConfig, isImage, MAX_UPLOAD_BYTES } from "@/app/upload-auth";
+import { adminOk, boothKeyMatches, safeEvent, readEventConfig, isImage, MAX_UPLOAD_BYTES } from "@/app/upload-auth";
 
 // 8 hex chars of randomness — replicates @vercel/blob's addRandomSuffix so
 // keys stay unguessable/collision-free without a real filename generator.
@@ -23,7 +23,7 @@ export async function POST(req: NextRequest) {
   }
   if (admin === "unauthorized") {
     const cfg = await readEventConfig(env.PHOTOS, event);
-    const ok = !!cfg?.boothKeyHash && provided !== "" && keyOk(await sha256Hex(provided), cfg.boothKeyHash);
+    const ok = !!cfg?.boothKeyHash && provided !== "" && (await boothKeyMatches(provided, cfg.boothKeyHash));
     if (!ok) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 

@@ -1,6 +1,6 @@
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { NextRequest, NextResponse } from "next/server";
-import { adminOk, sha256Hex, safeEvent, configPath, readEventConfig } from "@/app/upload-auth";
+import { adminOk, hashBoothKey, safeEvent, configPath, readEventConfig } from "@/app/upload-auth";
 import { TEMPLATES } from "@/app/templates";
 
 // no caching by Next — the booth reads this on every load and admin edits must
@@ -31,8 +31,9 @@ export async function GET(req: NextRequest) {
 }
 
 // Admin-key only. Saves the frame allowlist and (optionally) this event's
-// booth key — stored as a SHA-256 hash because the config object is publicly
-// readable via the bucket's public URL. Omitting boothKey keeps the old one.
+// booth key — stored as a salted PBKDF2 hash because the config object is
+// publicly readable via the bucket's public URL. Omitting boothKey keeps the
+// old one.
 export async function PUT(req: NextRequest) {
   const { env } = getCloudflareContext();
   const auth = adminOk(req.headers.get("x-booth-key") ?? "", env.BOOTH_UPLOAD_KEY);
@@ -49,13 +50,15 @@ export async function PUT(req: NextRequest) {
     return NextResponse.json({ error: "frames must be an array of template keys" }, { status: 400 });
   }
   const boothKey = body?.boothKey;
-  if (boothKey !== undefined && (typeof boothKey !== "string" || boothKey.length < 8 || boothKey.length > 128)) {
-    return NextResponse.json({ error: "boothKey must be a string of 8-128 chars" }, { status: 400 });
+  // 12-char floor: the hash is public, so short human-chosen keys are the
+  // one thing key-stretching can't save
+  if (boothKey !== undefined && (typeof boothKey !== "string" || boothKey.length < 12 || boothKey.length > 128)) {
+    return NextResponse.json({ error: "boothKey must be a string of 12-128 chars" }, { status: 400 });
   }
 
   const event = safeEvent(req.nextUrl.searchParams.get("event"));
   const prev = await readEventConfig(env.PHOTOS, event);
-  const boothKeyHash = typeof boothKey === "string" ? await sha256Hex(boothKey) : prev?.boothKeyHash;
+  const boothKeyHash = typeof boothKey === "string" ? await hashBoothKey(boothKey) : prev?.boothKeyHash;
   // R2 put() overwrites by default, so this always leaves exactly one config
   // object per event.
   await env.PHOTOS.put(configPath(event), JSON.stringify({ frames, ...(boothKeyHash ? { boothKeyHash } : {}) }), {

@@ -71,8 +71,8 @@ export default function Admin() {
   };
 
   const save = useCallback(async () => {
-    if (boothKey && boothKey.length < 8) {
-      setError("Booth key must be at least 8 characters");
+    if (boothKey && boothKey.length < 12) {
+      setError("Booth key must be at least 12 characters — use Generate");
       return;
     }
     setSaving(true);

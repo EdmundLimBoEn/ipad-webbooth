@@ -23,12 +23,38 @@ export function adminOk(provided: string, adminKey: string | undefined): "ok" | 
   return keyOk(provided, adminKey) ? "ok" : "unauthorized";
 }
 
-// Per-event booth keys are stored in the config object as a SHA-256 hash,
-// never plaintext — the whole bucket (including _config/) is publicly
-// readable through R2_PUBLIC_BASE, so a plaintext key there would leak.
-export async function sha256Hex(s: string): Promise<string> {
-  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-  return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+// Per-event booth keys are stored in the config object hashed, never
+// plaintext — the whole bucket (including _config/) is publicly readable
+// through R2_PUBLIC_BASE. The hash is therefore public too, so it must be
+// salted + stretched (PBKDF2), not a bare fast hash: a human-chosen key's
+// SHA-256 would be offline-brute-forceable straight from the bucket.
+// ponytail: 20k iterations ≈ 5ms — sized to the Workers free tier's 10ms CPU
+// cap per request; raise it if the plan ever changes. Real safety comes from
+// using the admin page's Generate button (96-bit random keys).
+const PBKDF2_ITERS = 20_000;
+const toHex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+const fromHex = (s: string) => new Uint8Array((s.match(/../g) ?? []).map((h) => parseInt(h, 16)));
+
+async function pbkdf2(key: string, salt: Uint8Array): Promise<string> {
+  const mat = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: salt as BufferSource, iterations: PBKDF2_ITERS },
+    mat,
+    256
+  );
+  return toHex(new Uint8Array(bits));
+}
+
+// -> "salthex:hashhex", the format stored in the config object
+export async function hashBoothKey(key: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  return `${toHex(salt)}:${await pbkdf2(key, salt)}`;
+}
+
+export async function boothKeyMatches(key: string, stored: string): Promise<boolean> {
+  const [saltHex, hashHex] = stored.split(":");
+  if (!saltHex || !hashHex) return false;
+  return keyOk(await pbkdf2(key, fromHex(saltHex)), hashHex);
 }
 
 // Slugs an event name to a safe key prefix; anything else -> "event".

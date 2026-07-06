@@ -43,8 +43,8 @@ through the Worker, so only the JSON API counts against the free 100k requests/d
 
 **Two keys** (helpers in `app/upload-auth.ts`): the **admin key** (`BOOTH_UPLOAD_KEY` Worker
 secret) gates config PUT + export + admin; a **per-event booth key** (set on `/{event}/admin`,
-stored as a SHA-256 hash in the config object — the bucket is publicly readable, so never
-plaintext) only uploads to its own event. `adminOk()` fails closed when the secret is unset
+stored as a salted PBKDF2 hash in the config object — the bucket is publicly readable, so the
+hash is public too and must resist offline brute force) only uploads to its own event. `adminOk()` fails closed when the secret is unset
 unless `ALLOW_KEYLESS=1` (local dev, `.env.local`).
 
 - **Upload** (`app/api/upload/route.ts`): accepts the `x-booth-key` header matching the admin key

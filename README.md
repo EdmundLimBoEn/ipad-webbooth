@@ -30,8 +30,8 @@ served publicly from `R2_PUBLIC_BASE`. Two kinds of key:
 - **Admin key** — `BOOTH_UPLOAD_KEY`, a Worker secret in production
   (`bunx wrangler secret put BOOTH_UPLOAD_KEY`). Gates the admin page, config
   saves, and the zip export.
-- **Booth key** — per event, set on `/{event}/admin` (stored as a SHA-256 hash
-  in `_config/{event}.json`, since the bucket is publicly readable). Only
+- **Booth key** — per event, set on `/{event}/admin` (stored as a salted
+  PBKDF2 hash in `_config/{event}.json`, since the bucket is publicly readable). Only
   uploads photos to its own event; this is the key the booth page prompts for
   and keeps in `localStorage`. Until one is set, only the admin key can upload.
 
