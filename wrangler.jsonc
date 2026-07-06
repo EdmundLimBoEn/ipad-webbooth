@@ -5,8 +5,7 @@
 	"compatibility_date": "2026-07-01",
 	"compatibility_flags": ["nodejs_compat"],
 	// Custom-domain routes (zone is on Cloudflare, so these auto-create DNS).
-	// photobooth-cf.* is the staging hostname; the real photobooth.* hostname
-	// gets added at cutover once the migration is verified.
+	// photobooth-cf.* is staging, photobooth.* is production.
 	"routes": [
 		{ "pattern": "photobooth-cf.edmundlim.systems", "custom_domain": true },
 		{ "pattern": "photobooth.edmundlim.systems", "custom_domain": true }

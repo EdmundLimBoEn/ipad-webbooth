@@ -5,11 +5,10 @@ export const metadata: Metadata = {
   title: "Photo Booth",
 };
 
+// pinch-zoom stays enabled (accessibility; phone viewers zoom gallery photos)
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
   themeColor: "#000000",
 };
 

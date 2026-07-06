@@ -1,12 +1,6 @@
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { NextRequest, NextResponse } from "next/server";
-import { keyOk, isImage, MAX_UPLOAD_BYTES } from "@/app/upload-auth";
-
-// slugs an event name to a safe blob prefix; anything else -> "event"
-function safeEvent(raw: string | null): string {
-  const s = (raw ?? "").toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-  return s || "event";
-}
+import { keyOk, adminOk, sha256Hex, safeEvent, readEventConfig, isImage, MAX_UPLOAD_BYTES } from "@/app/upload-auth";
 
 // 8 hex chars of randomness — replicates @vercel/blob's addRandomSuffix so
 // keys stay unguessable/collision-free without a real filename generator.
@@ -17,15 +11,20 @@ function randomSuffix(): string {
 
 export async function POST(req: NextRequest) {
   const { env } = getCloudflareContext();
-  const expected = env.BOOTH_UPLOAD_KEY;
-  if (!expected) {
-    // Fail closed: in production an unset key must NOT mean "anyone can upload".
-    // Only local dev is allowed to run keyless for convenience.
-    if (process.env.NODE_ENV === "production") {
-      return NextResponse.json({ error: "upload disabled: no key configured" }, { status: 503 });
-    }
-  } else if (!keyOk(req.headers.get("x-booth-key") ?? "", expected)) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const event = safeEvent(req.nextUrl.searchParams.get("event"));
+  const provided = req.headers.get("x-booth-key") ?? "";
+
+  // Two accepted keys: the admin key (BOOTH_UPLOAD_KEY), or this event's own
+  // booth key — set per event in /{event}/admin, stored hashed in the config
+  // object. A booth key only ever uploads to its own event.
+  const admin = adminOk(provided, env.BOOTH_UPLOAD_KEY);
+  if (admin === "disabled") {
+    return NextResponse.json({ error: "upload disabled: no key configured" }, { status: 503 });
+  }
+  if (admin === "unauthorized") {
+    const cfg = await readEventConfig(env.PHOTOS, event);
+    const ok = !!cfg?.boothKeyHash && provided !== "" && keyOk(await sha256Hex(provided), cfg.boothKeyHash);
+    if (!ok) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
   // Early reject via declared size before buffering the whole body.
@@ -44,7 +43,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "not an image" }, { status: 415 });
   }
 
-  const event = safeEvent(req.nextUrl.searchParams.get("event"));
   // Key format `${event}/${Date.now()}-${suffix}.jpg` — the ms timestamp stays
   // the leading path segment so the photos route's sort-by-filename (which
   // reads `pathname.split("/")[1].split("-")[0]`) needs no changes.

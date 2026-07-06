@@ -4,8 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import { TEMPLATES, GROUPS } from "../../templates";
 
-// One-stop event admin: per-event frame allowlist + photo export. Gated by the
-// same booth upload key (prompted once, kept in localStorage like the booth).
+// One-stop event admin (Edmund only — gated by the admin key, a Worker
+// secret): per-event frame allowlist, per-event booth key, photo export.
 export default function Admin() {
   const { event } = useParams<{ event: string }>();
   const [frames, setFrames] = useState<Set<string>>(new Set());
@@ -14,27 +14,35 @@ export default function Admin() {
   const [exporting, setExporting] = useState(false);
   const [msg, setMsg] = useState("");
   const [error, setError] = useState("");
+  const [loadError, setLoadError] = useState(false);
+  // the per-event booth key: write-only (the server stores a hash), so this
+  // field is what will be SET on save; empty = keep the current one
+  const [boothKey, setBoothKey] = useState("");
+  const [hasBoothKey, setHasBoothKey] = useState(false);
 
   const getKey = () => {
-    let key = localStorage.getItem("boothKey");
+    let key = localStorage.getItem("adminKey");
     if (!key) {
-      key = window.prompt("Enter booth upload key") ?? "";
-      if (key) localStorage.setItem("boothKey", key);
+      key = window.prompt("Enter admin key") ?? "";
+      if (key) localStorage.setItem("adminKey", key);
     }
     return key ?? "";
   };
 
-  useEffect(() => {
+  const load = useCallback(() => {
+    setLoadError(false);
     fetch(`/api/config?event=${encodeURIComponent(event)}`)
       .then((r) => r.json())
       .then((d) => {
         // no config yet -> the ungrouped defaults start ticked (on by default)
         const defaults = Object.keys(TEMPLATES).filter((k) => !TEMPLATES[k].group);
         setFrames(new Set(Array.isArray(d.frames) ? d.frames : defaults));
+        setHasBoothKey(!!d.hasBoothKey);
         setLoaded(true);
       })
-      .catch(() => setError("Failed to load config"));
+      .catch(() => setLoadError(true));
   }, [event]);
+  useEffect(load, [load]);
 
   const toggle = (k: string) => {
     setFrames((prev) => {
@@ -56,7 +64,17 @@ export default function Admin() {
     setMsg("");
   };
 
+  const generateBoothKey = () => {
+    const bytes = crypto.getRandomValues(new Uint8Array(12));
+    setBoothKey(Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(""));
+    setMsg("");
+  };
+
   const save = useCallback(async () => {
+    if (boothKey && boothKey.length < 8) {
+      setError("Booth key must be at least 8 characters");
+      return;
+    }
     setSaving(true);
     setError("");
     setMsg("");
@@ -64,20 +82,25 @@ export default function Admin() {
       const res = await fetch(`/api/config?event=${encodeURIComponent(event)}`, {
         method: "PUT",
         headers: { "x-booth-key": getKey(), "content-type": "application/json" },
-        body: JSON.stringify({ frames: [...frames] }),
+        body: JSON.stringify({ frames: [...frames], ...(boothKey ? { boothKey } : {}) }),
       });
       if (res.status === 401) {
-        localStorage.removeItem("boothKey"); // wrong key: re-prompt next try
-        throw new Error("Wrong upload key");
+        localStorage.removeItem("adminKey"); // wrong key: re-prompt next try
+        throw new Error("Wrong admin key");
       }
       if (!res.ok) throw new Error(`Save failed (${res.status})`);
-      setMsg("Saved ✓");
+      if (boothKey) {
+        setHasBoothKey(true);
+        setMsg("Saved ✓ — record the booth key in EDMUNDS-STUFF.md, it can't be shown again");
+      } else {
+        setMsg("Saved ✓");
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
     }
-  }, [event, frames]);
+  }, [event, frames, boothKey]);
 
   const exportZip = useCallback(async () => {
     setExporting(true);
@@ -87,8 +110,8 @@ export default function Admin() {
         headers: { "x-booth-key": getKey() },
       });
       if (res.status === 401) {
-        localStorage.removeItem("boothKey");
-        throw new Error("Wrong upload key");
+        localStorage.removeItem("adminKey");
+        throw new Error("Wrong admin key");
       }
       if (!res.ok) throw new Error(`Export failed (${res.status})`);
       const blob = await res.blob();
@@ -112,11 +135,25 @@ export default function Admin() {
     borderRadius: 12, background: "rgba(255,255,255,0.08)", cursor: "pointer",
   };
   const thumb: React.CSSProperties = { height: 48, width: "auto", borderRadius: 6 };
-  const btn: React.CSSProperties = { padding: "12px 24px", fontSize: 16, borderRadius: 8, border: "none", cursor: "pointer" };
+  const btn: React.CSSProperties = {
+    padding: "12px 24px", fontSize: 16, fontWeight: 600, borderRadius: 8, border: "none",
+    cursor: "pointer", background: "#ff2d8b", color: "#fff",
+  };
+  const input: React.CSSProperties = {
+    flex: 1, padding: "10px 12px", fontSize: 15, borderRadius: 8, border: "none",
+    background: "rgba(255,255,255,0.12)", color: "#fff", fontFamily: "ui-monospace, monospace",
+  };
 
   return (
     <main style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "40px 0 80px", minHeight: "100dvh", gap: 28, color: "#fff", background: "#111", fontFamily: "system-ui" }}>
       <h1>Admin — {event}</h1>
+
+      {loadError && (
+        <section style={section}>
+          <p style={{ color: "salmon" }}>Failed to load config.</p>
+          <button onClick={load} style={btn}>Retry</button>
+        </section>
+      )}
 
       <section style={section}>
         <h2 style={{ fontSize: 18 }}>Frames</h2>
@@ -161,9 +198,35 @@ export default function Admin() {
             </div>
           );
         })}
+      </section>
 
-        <button onClick={save} disabled={!loaded || saving} style={{ ...btn, marginTop: 8 }}>
-          {saving ? "Saving…" : "Save frames"}
+      <section style={section}>
+        <h2 style={{ fontSize: 18 }}>Booth key</h2>
+        <p style={{ opacity: 0.7, fontSize: 14 }}>
+          The key the booth page asks for. Per event — it can only upload photos to this
+          event, so it&apos;s safe to type into the guest-facing iPad.{" "}
+          {hasBoothKey
+            ? "This event has a booth key. Fill the field to replace it; leave empty to keep it."
+            : "No booth key set yet — only the admin key can upload. Generate one and save."}
+        </p>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={boothKey}
+            onChange={(e) => { setBoothKey(e.target.value.trim()); setMsg(""); }}
+            placeholder={hasBoothKey ? "(unchanged)" : "(none set)"}
+            style={input}
+            autoComplete="off"
+          />
+          <button onClick={generateBoothKey} style={btn}>Generate</button>
+        </div>
+        <p style={{ opacity: 0.7, fontSize: 13 }}>
+          The server stores only a hash — record the key in EDMUNDS-STUFF.md before leaving this page.
+        </p>
+      </section>
+
+      <section style={section}>
+        <button onClick={save} disabled={!loaded || saving} style={btn}>
+          {saving ? "Saving…" : "Save frames + booth key"}
         </button>
         {msg && <p style={{ color: "#8f8" }}>{msg}</p>}
       </section>

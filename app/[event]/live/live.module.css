@@ -117,3 +117,10 @@
   background: rgba(255, 255, 255, 0.15);
   color: #fff;
 }
+
+.saveMsg {
+  color: #ffb3d9;
+  font-size: 15px;
+  text-align: center;
+  max-width: 80vw;
+}

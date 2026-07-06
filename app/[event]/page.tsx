@@ -13,6 +13,7 @@ export default function Booth() {
   const { event } = useParams<{ event: string }>();
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const unmountedRef = useRef(false);
   const [status, setStatus] = useState<Status>("starting");
   const [mode, setMode] = useState<keyof typeof TEMPLATES | null>(null);
   const [count, setCount] = useState(0);
@@ -20,6 +21,9 @@ export default function Booth() {
   const [flash, setFlash] = useState(false);
   const [lastUrl, setLastUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // a composited photo whose upload failed — kept so the guest can retry
+  // instead of silently losing their shots to flaky venue Wi-Fi
+  const [pending, setPending] = useState<Blob | null>(null);
   // per-event frame allowlist from /api/config; null (no config / not loaded
   // yet / fetch failed) degrades to defaults-only, never to all frames
   const [enabled, setEnabled] = useState<string[] | null>(null);
@@ -31,16 +35,21 @@ export default function Booth() {
       .catch(() => {});
   }, [event]);
 
-  // ask for the upload key once, keep it in localStorage
+  // this event's booth key (set per event in /{event}/admin) — asked once,
+  // kept in localStorage namespaced by event, cleared + re-asked on 401
   const keyRef = useRef<string>("");
-  useEffect(() => {
-    let k = localStorage.getItem("boothKey");
-    if (!k) {
-      k = window.prompt("Enter booth upload key") ?? "";
-      if (k) localStorage.setItem("boothKey", k);
-    }
+  const storageKey = `boothKey:${event}`;
+  const promptKey = useCallback(() => {
+    const k = window.prompt("Enter this event's booth key") ?? "";
+    if (k) localStorage.setItem(storageKey, k);
+    else localStorage.removeItem(storageKey);
     keyRef.current = k;
-  }, []);
+  }, [storageKey]);
+  useEffect(() => {
+    const k = localStorage.getItem(storageKey);
+    if (k) keyRef.current = k;
+    else promptKey();
+  }, [storageKey, promptKey]);
 
   const startCamera = useCallback(async () => {
     setStatus("starting");
@@ -50,6 +59,13 @@ export default function Booth() {
         video: { facingMode: "user", width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: false,
       });
+      // unmounted while getUserMedia was pending: stop the tracks now or the
+      // camera light stays on with nothing to clean it up
+      if (unmountedRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      streamRef.current?.getTracks().forEach((t) => t.stop());
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -63,8 +79,13 @@ export default function Booth() {
   }, []);
 
   useEffect(() => {
+    unmountedRef.current = false;
     startCamera();
-    return () => streamRef.current?.getTracks().forEach((t) => t.stop());
+    return () => {
+      unmountedRef.current = true;
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    };
   }, [startCamera]);
 
   // grab the current video frame, mirrored to match the preview, at full res
@@ -89,11 +110,19 @@ export default function Booth() {
           headers: { "x-booth-key": keyRef.current, "content-type": "image/jpeg" },
           body: blob,
         });
-        if (!res.ok) throw new Error(res.status === 401 ? "Wrong upload key" : `Upload failed (${res.status})`);
+        if (res.status === 401) {
+          // wrong key: forget it so Retry re-prompts instead of looping
+          localStorage.removeItem(storageKey);
+          keyRef.current = "";
+          throw new Error("Wrong booth key — tap Retry upload to re-enter it");
+        }
+        if (!res.ok) throw new Error(`Upload failed (${res.status}) — tap Retry upload`);
         const { url } = await res.json();
         setLastUrl(url);
+        setPending(null);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
+        setPending(blob); // keep the photo; don't lose the guest's shots
       } finally {
         // every photo returns to the frame picker — each guest picks manually,
         // the previous guest's mode never carries over. (Camera-denied fallback
@@ -102,42 +131,77 @@ export default function Booth() {
         setStatus(streamRef.current ? "picking" : "denied");
       }
     },
-    [event]
+    [event, storageKey]
   );
+
+  const retryUpload = useCallback(() => {
+    if (!pending) return;
+    if (!keyRef.current) promptKey();
+    upload(pending);
+  }, [pending, promptKey, upload]);
 
   // take the whole sequence for the chosen mode, composite, upload
   const run = useCallback(async () => {
     if (status !== "ready" || !mode) return;
     const t = TEMPLATES[mode];
     setStatus("running");
-    const frames: HTMLCanvasElement[] = [];
-    for (let i = 0; i < t.shots; i++) {
-      setShot(t.shots > 1 ? i + 1 : 0);
-      for (let n = Math.round(t.intervalMs / 1000); n >= 1; n--) {
-        setCount(n);
-        await sleep(1000);
+    try {
+      const frames: HTMLCanvasElement[] = [];
+      for (let i = 0; i < t.shots; i++) {
+        setShot(t.shots > 1 ? i + 1 : 0);
+        for (let n = Math.round(t.intervalMs / 1000); n >= 1; n--) {
+          setCount(n);
+          await sleep(1000);
+        }
+        setCount(0);
+        setFlash(true);
+        frames.push(grabFrame());
+        await sleep(300);
+        setFlash(false);
+        if (i < t.shots - 1) await sleep(400); // brief pause between shots
       }
+      setShot(0);
+      const blob = await composite(
+        frames,
+        frames.map((f) => ({ w: f.width, h: f.height })),
+        t
+      );
+      await upload(blob);
+    } catch (e) {
+      // composite (frame art fetch, toBlob) failed — surface it and recover
+      // instead of leaving the booth stuck in "running" until a reload
+      setError(e instanceof Error ? e.message : String(e));
+      setShot(0);
       setCount(0);
-      setFlash(true);
-      frames.push(grabFrame());
-      await sleep(300);
       setFlash(false);
-      if (i < t.shots - 1) await sleep(400); // brief pause between shots
+      setMode(null);
+      setStatus(streamRef.current ? "picking" : "denied");
     }
-    setShot(0);
-    const blob = await composite(
-      frames,
-      frames.map((f) => ({ w: f.width, h: f.height })),
-      t
-    );
-    await upload(blob);
   }, [status, mode, grabFrame, upload]);
 
-  // fallback: native file input (camera) when getUserMedia is blocked
+  // fallback: native file input (camera) when getUserMedia is blocked.
+  // Re-encode to a real JPEG first — iPhones hand back HEIC, and the stored
+  // key/content-type is always .jpg / image/jpeg.
+  // ponytail: fallback photos stay frameless; compositing needs the live capture flow.
   const onFile = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
-      if (file) await upload(file);
+      e.target.value = "";
+      if (!file) return;
+      let blob: Blob = file;
+      try {
+        const bmp = await createImageBitmap(file);
+        const c = document.createElement("canvas");
+        c.width = bmp.width;
+        c.height = bmp.height;
+        c.getContext("2d")!.drawImage(bmp, 0, 0);
+        blob = await new Promise<Blob>((res, rej) =>
+          c.toBlob((b) => (b ? res(b) : rej(new Error("re-encode failed"))), "image/jpeg", 0.9)
+        );
+      } catch {
+        // undecodable file: send as-is and let the server's signature check decide
+      }
+      await upload(blob);
     },
     [upload]
   );
@@ -179,7 +243,7 @@ export default function Booth() {
         <div className={styles.picker}>
           {lastUrl && (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={lastUrl} alt="last" className={styles.thumb} />
+            <img src={lastUrl} alt="Last photo" className={styles.thumb} />
           )}
           <h1>Pick a style</h1>
           {availableTemplates(enabled).length === 0 && (
@@ -219,7 +283,7 @@ export default function Booth() {
         <div className={styles.bottom}>
           {lastUrl && (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={lastUrl} alt="last" className={styles.thumb} />
+            <img src={lastUrl} alt="Last photo" className={styles.thumb} />
           )}
           <button
             className={styles.shutter}
@@ -238,6 +302,11 @@ export default function Booth() {
         </div>
       )}
 
+      {pending && status !== "uploading" && status !== "running" && (
+        <button className={styles.retry} onClick={retryUpload}>
+          ⟳ Retry upload
+        </button>
+      )}
       {error && <div className={styles.error} onClick={() => setError(null)}>{error}</div>}
     </main>
   );

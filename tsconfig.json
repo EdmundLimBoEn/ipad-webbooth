@@ -17,5 +17,8 @@
     "paths": { "@/*": ["./*"] }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  // tests are deliberately excluded from tsc: they import bun:test, whose
+  // ambient types (via @types/bun) override DOM/fetch globals app-wide.
+  // `bun test` still executes them; only their type-checking is skipped.
   "exclude": ["node_modules", "**/*.test.ts"]
 }

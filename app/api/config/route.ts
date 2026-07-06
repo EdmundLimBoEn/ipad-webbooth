@@ -1,44 +1,45 @@
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { NextRequest, NextResponse } from "next/server";
-import { keyOk } from "@/app/upload-auth";
+import { adminOk, sha256Hex, safeEvent, configPath, readEventConfig } from "@/app/upload-auth";
 import { TEMPLATES } from "@/app/templates";
 
-// slugs an event name to a safe blob prefix; anything else -> "event".
-// Keep in sync with the copies in the upload/photos/export routes.
-function safeEvent(raw: string | null): string {
-  const s = (raw ?? "").toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-  return s || "event";
-}
-
-// Per-event config lives at `_config/{event}.json` — safeEvent can never emit
-// an underscore, so this prefix can't collide with any event's photo prefix.
-const configPath = (event: string) => `_config/${event}.json`;
-
-// no caching — the booth reads this on every load and admin edits must show up
+// no caching by Next — the booth reads this on every load and admin edits must
+// show up. The micro-cache below only smooths over request floods.
 export const dynamic = "force-dynamic";
 
+// ponytail: per-isolate micro-cache so the public GET can't be hammered into
+// R2 costs; a WAF rate rule on /api/* is the real backstop (see HUMANS.md).
+const microCache = new Map<string, { exp: number; body: string }>();
+const TTL = 3000;
+
 // Public: which frames an event has enabled isn't secret, and the booth picker
-// needs it before (or without) the upload key. { frames: null } = no config
-// saved yet, meaning defaults only.
+// needs it before (or without) a key. The booth key hash is deliberately NOT
+// returned — only `hasBoothKey`. { frames: null } = no config saved yet.
 export async function GET(req: NextRequest) {
   const event = safeEvent(req.nextUrl.searchParams.get("event"));
+  const hit = microCache.get(event);
+  if (hit && hit.exp > Date.now()) {
+    return new NextResponse(hit.body, { headers: { "content-type": "application/json" } });
+  }
   const { env } = getCloudflareContext();
-  const obj = await env.PHOTOS.get(configPath(event));
-  if (!obj) return NextResponse.json({ frames: null });
-  const cfg = await obj.json<{ frames?: unknown }>().catch(() => null);
+  const cfg = await readEventConfig(env.PHOTOS, event);
   const frames = Array.isArray(cfg?.frames) ? cfg.frames.filter((f: unknown) => typeof f === "string") : null;
-  return NextResponse.json({ frames });
+  const body = JSON.stringify({ frames, hasBoothKey: !!cfg?.boothKeyHash });
+  if (microCache.size > 200) microCache.clear();
+  microCache.set(event, { exp: Date.now() + TTL, body });
+  return new NextResponse(body, { headers: { "content-type": "application/json" } });
 }
 
+// Admin-key only. Saves the frame allowlist and (optionally) this event's
+// booth key — stored as a SHA-256 hash because the config object is publicly
+// readable via the bucket's public URL. Omitting boothKey keeps the old one.
 export async function PUT(req: NextRequest) {
   const { env } = getCloudflareContext();
-  const expected = env.BOOTH_UPLOAD_KEY;
-  if (!expected) {
-    // Fail closed in production, same as the upload route.
-    if (process.env.NODE_ENV === "production") {
-      return NextResponse.json({ error: "config disabled: no key configured" }, { status: 503 });
-    }
-  } else if (!keyOk(req.headers.get("x-booth-key") ?? "", expected)) {
+  const auth = adminOk(req.headers.get("x-booth-key") ?? "", env.BOOTH_UPLOAD_KEY);
+  if (auth === "disabled") {
+    return NextResponse.json({ error: "config disabled: no key configured" }, { status: 503 });
+  }
+  if (auth === "unauthorized") {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
@@ -47,13 +48,20 @@ export async function PUT(req: NextRequest) {
   if (!Array.isArray(frames) || !frames.every((f) => typeof f === "string" && f in TEMPLATES)) {
     return NextResponse.json({ error: "frames must be an array of template keys" }, { status: 400 });
   }
+  const boothKey = body?.boothKey;
+  if (boothKey !== undefined && (typeof boothKey !== "string" || boothKey.length < 8 || boothKey.length > 128)) {
+    return NextResponse.json({ error: "boothKey must be a string of 8-128 chars" }, { status: 400 });
+  }
 
   const event = safeEvent(req.nextUrl.searchParams.get("event"));
+  const prev = await readEventConfig(env.PHOTOS, event);
+  const boothKeyHash = typeof boothKey === "string" ? await sha256Hex(boothKey) : prev?.boothKeyHash;
   // R2 put() overwrites by default, so this always leaves exactly one config
-  // object per event (unlike @vercel/blob, no addRandomSuffix option to worry about).
-  await env.PHOTOS.put(configPath(event), JSON.stringify({ frames }), {
+  // object per event.
+  await env.PHOTOS.put(configPath(event), JSON.stringify({ frames, ...(boothKeyHash ? { boothKeyHash } : {}) }), {
     httpMetadata: { contentType: "application/json" },
   });
+  microCache.delete(event);
 
-  return NextResponse.json({ frames });
+  return NextResponse.json({ frames, hasBoothKey: !!boothKeyHash });
 }

@@ -136,7 +136,9 @@
   bottom: 0;
   left: 0;
   right: 0;
-  padding: 24px env(safe-area-inset-right, 24px) calc(24px + env(safe-area-inset-bottom, 0px)) env(safe-area-inset-left, 24px);
+  /* calc(base + env()) — a bare env() fallback only kicks in when env() is
+     unsupported; on devices where the inset is defined as 0 it would give 0 padding */
+  padding: 24px calc(24px + env(safe-area-inset-right, 0px)) calc(24px + env(safe-area-inset-bottom, 0px)) calc(24px + env(safe-area-inset-left, 0px));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -159,7 +161,10 @@
 .shutter:disabled { opacity: 0.6; }
 
 .thumb {
-  position: absolute;
+  /* fixed, not absolute: it renders both inside .picker (full-screen) and
+     inside .bottom (a short bar) — absolute inside .bottom overflowed onto
+     the change button */
+  position: fixed;
   left: 20px;
   top: calc(20px + env(safe-area-inset-top, 0px));
   width: 60px;
@@ -204,6 +209,22 @@
   border-radius: 14px;
   font-weight: 600;
   font-size: 18px;
+}
+
+.retry {
+  position: absolute;
+  top: calc(72px + env(safe-area-inset-top, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  background: #ff2d8b;
+  color: #fff;
+  border: none;
+  border-radius: 22px;
+  padding: 12px 22px;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  z-index: 5;
 }
 
 .error {

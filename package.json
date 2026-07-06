@@ -11,16 +11,18 @@
   },
   "dependencies": {
     "@opennextjs/cloudflare": "^1.20.1",
-    "@vercel/blob": "^0.27.0",
     "next": "^15.1.0",
+    "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260705.1",
     "@types/node": "^22",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@vercel/blob": "0.27.0",
     "typescript": "^5",
     "wrangler": "^4.107.0"
   }

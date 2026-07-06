@@ -220,5 +220,7 @@ export async function composite(
     ctx.drawImage(await loadImage(t.overlay), 0, 0, canvas.width, canvas.height);
   }
 
-  return new Promise((res) => canvas.toBlob((b) => res(b!), "image/jpeg", 0.9));
+  return new Promise((res, rej) =>
+    canvas.toBlob((b) => (b ? res(b) : rej(new Error("could not encode the photo"))), "image/jpeg", 0.9)
+  );
 }

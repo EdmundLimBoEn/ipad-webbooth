@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
+import QRCode from "qrcode";
 import styles from "./live.module.css";
 import { wrap } from "./wrap";
 
@@ -16,14 +17,19 @@ export default function Live() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [full, setFull] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState("");
   // measured height/width per photo url, so columns can be balanced by real height
   const [ratios, setRatios] = useState<Record<string, number>>({});
   const [vw, setVw] = useState(0);
   const [vh, setVh] = useState(0);
-  const [pageUrl, setPageUrl] = useState("");
+  // QR is generated locally — a third-party QR service going down (or being
+  // blocked on venue Wi-Fi) must not break how guests find the gallery
+  const [qr, setQr] = useState("");
 
   useEffect(() => {
-    setPageUrl(window.location.href);
+    QRCode.toDataURL(window.location.href, { width: 300, margin: 1 })
+      .then(setQr)
+      .catch(() => {});
   }, []);
 
   // per-column marquee state: each column loops independently so there are
@@ -44,7 +50,8 @@ export default function Live() {
       try {
         const res = await fetch(`/api/photos?event=${encodeURIComponent(event)}`, { cache: "no-store" });
         const { photos } = await res.json();
-        if (alive) setPhotos(photos);
+        // guard the shape — an error body would white-screen the render loop
+        if (alive && Array.isArray(photos)) setPhotos(photos);
       } catch {
         /* keep last good state; try again next tick */
       }
@@ -189,13 +196,39 @@ export default function Live() {
     };
   }, [animate]);
 
-  // Save to device. Fetch → object URL so it works cross-origin. On mobile,
-  // prefer the native share sheet (Save to Photos on iOS); fall back to a
-  // download link on desktop.
+  // Pre-fetch the open photo's bytes so save() can call navigator.share()
+  // immediately — Safari drops the transient user activation if share() comes
+  // after a slow awaited fetch, making "Save photo" silently do nothing.
+  const fullBlobRef = useRef<{ url: string; blob: Blob } | null>(null);
+  useEffect(() => {
+    if (!full) return;
+    setSaveMsg("");
+    let alive = true;
+    fetch(full)
+      .then((r) => r.blob())
+      .then((blob) => {
+        if (alive) fullBlobRef.current = { url: full, blob };
+      })
+      .catch(() => {});
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFull(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      alive = false;
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [full]);
+
+  // Save to device. On mobile, prefer the native share sheet (Save to Photos
+  // on iOS); fall back to a download link on desktop. Cross-origin-safe: the
+  // bytes are fetched, then shared/linked as a same-origin object.
   const save = useCallback(async (url: string) => {
     setSaving(true);
+    setSaveMsg("");
     try {
-      const blob = await (await fetch(url)).blob();
+      const blob =
+        fullBlobRef.current?.url === url ? fullBlobRef.current.blob : await (await fetch(url)).blob();
       const file = new File([blob], `photobooth-${Date.now()}.jpg`, { type: "image/jpeg" });
       if (typeof navigator.canShare === "function" && navigator.canShare({ files: [file] })) {
         await navigator.share({ files: [file] });
@@ -207,8 +240,11 @@ export default function Live() {
         a.click();
         URL.revokeObjectURL(obj);
       }
-    } catch {
-      /* user cancelled share, or blocked — ignore */
+    } catch (e) {
+      // cancelling the share sheet is fine; anything else deserves feedback
+      if (!(e instanceof DOMException && e.name === "AbortError")) {
+        setSaveMsg("Couldn't save — try pressing and holding the photo instead");
+      }
     } finally {
       setSaving(false);
     }
@@ -218,13 +254,9 @@ export default function Live() {
     <main className={styles.live}>
       {photos.length === 0 && <p className={styles.empty}>Waiting for the first photo…</p>}
 
-      {pageUrl && (
+      {qr && (
         // eslint-disable-next-line @next/next/no-img-element
-        <img
-          className={styles.qr}
-          src={`https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(pageUrl)}`}
-          alt="Scan to view this live gallery on your phone"
-        />
+        <img className={styles.qr} src={qr} alt="Scan to view this live gallery on your phone" />
       )}
 
       <div className={styles.grid}>
@@ -235,12 +267,21 @@ export default function Live() {
           const unit: Photo[] = [];
           for (let k = 0; k < m; k++) unit.push(...col);
 
+          // key by url + occurrence, not list index: a new photo at the head
+          // must not re-key (remount + replay the pop animation on) every
+          // tile after it
+          const seen = new Map<string, number>();
+          const tileKey = (url: string) => {
+            const n = seen.get(url) ?? 0;
+            seen.set(url, n + 1);
+            return `${url}#${n}`;
+          };
           const copy = (prefix: string) => (
             <div key={prefix} className={styles.copy} aria-hidden={prefix === "b" || undefined}>
-              {unit.map((p, j) => (
+              {unit.map((p) => (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img
-                  key={`${prefix}-${j}-${p.url}`}
+                  key={tileKey(p.url)}
                   src={p.url}
                   alt=""
                   loading="lazy"
@@ -275,9 +316,9 @@ export default function Live() {
       </div>
 
       {full && (
-        <div className={styles.lightbox} onClick={() => setFull(null)}>
+        <div className={styles.lightbox} role="dialog" aria-modal="true" onClick={() => setFull(null)}>
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={full} alt="" className={styles.fullImg} onClick={(e) => e.stopPropagation()} />
+          <img src={full} alt="Event photo" className={styles.fullImg} onClick={(e) => e.stopPropagation()} />
           <div className={styles.actions} onClick={(e) => e.stopPropagation()}>
             <button className={styles.save} onClick={() => save(full)} disabled={saving}>
               {saving ? "Saving…" : "⬇ Save photo"}
@@ -286,6 +327,11 @@ export default function Live() {
               Close
             </button>
           </div>
+          {saveMsg && (
+            <p className={styles.saveMsg} onClick={(e) => e.stopPropagation()}>
+              {saveMsg}
+            </p>
+          )}
         </div>
       )}
     </main>
