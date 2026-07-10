@@ -34,6 +34,10 @@ served publicly from `R2_PUBLIC_BASE`. Two kinds of key:
   PBKDF2 hash in `_config/{event}.json`, since the bucket is publicly readable). Only
   uploads photos to its own event; this is the key the booth page prompts for
   and keeps in `localStorage`. Until one is set, only the admin key can upload.
+  Re-setting the key on `/{event}/admin` **revokes the old one immediately**:
+  the stored hash changes, devices holding the old key get a 401 on their next
+  upload, which clears their `localStorage` copy and re-prompts — so a lost or
+  leaked booth key is fixed by generating a new one.
 
 With no admin key configured, the API fails closed unless `ALLOW_KEYLESS=1`
 (set in `.env.local` for local dev only).
@@ -41,6 +45,16 @@ With no admin key configured, the API fails closed unless `ALLOW_KEYLESS=1`
 The old Vercel Blob store still holds a pre-migration copy of every photo as a
 backup (`BLOB_READ_WRITE_TOKEN` in `.env.local` reaches it; `scripts/migrate-to-r2.ts`
 re-copies anything new).
+
+## Status page
+
+A 5-minute cron (`custom-worker.ts` → `app/health.ts`) probes the R2 binding
+(→ **Upload** component) and the public bucket URL (→ **Live page** component),
+and on status changes PATCHes the statuspage.io component
+(`operational`/`major_outage`) via the Statuspage REST API. Secrets:
+`STATUSPAGE_API_KEY`, `STATUSPAGE_PAGE_ID`, `STATUSPAGE_COMPONENT_UPLOAD`,
+`STATUSPAGE_COMPONENT_LIVE`. Last status lives at `_health/state.json` in the
+bucket. Any secret unset → no reporting.
 
 ## Local dev
 

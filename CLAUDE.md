@@ -25,14 +25,32 @@ bun run deploy          # opennextjs-cloudflare build + wrangler deploy (needs `
 bun run preview         # build + run the real worker locally (miniflare)
 ```
 
-On macOS 27 `bun run` is broken — use the underlying commands directly:
-`./node_modules/.bin/next build`, then `bunx opennextjs-cloudflare build --skipNextBuild`,
-then `OPEN_NEXT_DEPLOY=true bunx wrangler deploy`.
+On macOS 27 `bun run <script>` is broken (`CouldntReadCurrentDirectory` — iCloud Desktop &
+Documents sync evicts `node_modules` contents). Use the underlying binaries directly. The
+deploy chain that actually works:
 
-If `next dev`/`next build` fails or hangs, suspect a corrupted `node_modules` (a bad
+```bash
+NEXT_PRIVATE_STANDALONE=true ./node_modules/.bin/next build
+./node_modules/.bin/opennextjs-cloudflare build --skipNextBuild
+OPEN_NEXT_DEPLOY=true node ./node_modules/wrangler/bin/wrangler.js deploy
+```
+
+macOS has no `timeout` command (use `gtimeout` or nothing). If `next dev`/`next build` fails,
+hangs, or throws `ERR_INVALID_PACKAGE_CONFIG`, suspect evicted/corrupted `node_modules` (a bad
 `@swc/helpers/package.json` has done this) — `rm -rf node_modules && bun install` fixes it.
 `next.config.ts` pins `outputFileTracingRoot` to this dir because a stray `~/package-lock.json`
 otherwise makes Next treat `$HOME` as the workspace root and scan it.
+
+## Safety invariants
+
+- **NEVER bulk-delete or empty photo storage** — not the R2 bucket, not the old Vercel Blob
+  store (a `blob empty-store` once wiped real event photos). Both hold live/backup event data.
+  Delete test uploads only by exact key/URL under a throwaway event name.
+- `FRAMES.pdf` and `SQUARE FRAME.pdf` at the repo root are design sources, **not used at
+  runtime** — never Read them (they're MBs and blow up the context). Runtime frame art is the
+  PNGs under `public/templates/<group>/`.
+- Square-frame photos have a different aspect ratio than the rectangular strips — slot
+  positions in `app/templates.ts` are per-template; don't reuse rectangular crop math.
 
 ## Architecture
 
@@ -105,19 +123,49 @@ scroll/tap, so mobile viewers can browse/save unimpeded.
 `<a download>` link on desktop. Cross-origin-safe because it fetches then creates a same-origin
 object URL.
 
+**Statuspage health cron**: `wrangler.jsonc` `main` is `custom-worker.ts`, which wraps the
+OpenNext-generated worker to add a `scheduled` handler (official OpenNext recipe). Every 5 min
+it runs `healthCheck()` (`app/health.ts`): probes the R2 binding (→ "Upload" component) and
+`R2_PUBLIC_BASE` (→ "Live page" component), keeps last per-component status at
+`_health/state.json` (underscore prefix — same no-collision argument as `_config/`), and on
+transitions PATCHes the statuspage.io component to `operational`/`degraded_performance`/
+`major_outage` via the REST
+API (`STATUSPAGE_API_KEY`/`_PAGE_ID`/`_COMPONENT_UPLOAD`/`_COMPONENT_LIVE` secrets; email
+automation was ruled out — Worker email sending needs the paid plan). The transition rule
+`decide()` is pure and tested in `app/health.test.ts`. Any secret unset → no-op.
+The cron also checks free-tier request headroom: `requestsToday()` queries the Cloudflare
+GraphQL analytics API (`CF_ANALYTICS_TOKEN` secret + `CF_ACCOUNT_ID` var) and flips the
+Upload component to `degraded_performance` at ≥80% of the 100k/day Workers cap — a soft
+signal that never escalates to an outage and is skipped when the token is unset or the
+query fails. Self-reporting can't catch a fully dead worker (broken deploy kills the cron
+too), so an external UptimeRobot check on `/api/photos` covers that case (see HUMANS.md).
+
 ## Env vars / secrets
 
 - `BOOTH_UPLOAD_KEY` — the **admin key**. Production: a Worker secret
   (`bunx wrangler secret put BOOTH_UPLOAD_KEY`). Unset → upload/config/export **fail closed**
   (503) everywhere, unless `ALLOW_KEYLESS=1` (only ever set in `.env.local` for local dev).
   Per-event booth keys are data, not env — hashed into `_config/{event}.json` via admin.
-- `R2_PUBLIC_BASE` — public base URL of the bucket (currently the r2.dev subdomain), set in
-  `wrangler.jsonc` `vars`. API routes compose photo URLs as `${R2_PUBLIC_BASE}/${key}`.
+- `R2_PUBLIC_BASE` — public base URL of the bucket (`bucket.photobooth.edmundlim.systems`,
+  a custom domain bound to the bucket; the old r2.dev subdomain still works as a fallback),
+  set in `wrangler.jsonc` `vars`. API routes compose photo URLs as `${R2_PUBLIC_BASE}/${key}`.
+- `CF_ANALYTICS_TOKEN` — Worker secret, a Cloudflare API token with Account Analytics Read;
+  enables the health cron's request-headroom check (unset → check skipped).
+- `STATUSPAGE_API_KEY` / `STATUSPAGE_PAGE_ID` / `STATUSPAGE_COMPONENT_UPLOAD` /
+  `STATUSPAGE_COMPONENT_LIVE` — Worker secrets for the health cron's Statuspage REST calls
+  (values recorded in `EDMUNDS-STUFF.md`, never in code). All four must be set for
+  reporting to happen.
 - `BLOB_READ_WRITE_TOKEN` (`.env.local` only) — reaches the **old Vercel Blob store**, which is
   kept as an untouched backup of every pre-migration photo. `scripts/migrate-to-r2.ts` is the
   idempotent copy script (Vercel → R2, never deletes).
 
 ## Deployment notes
+
+Worker name `ipad-webbooth`; wrangler is OAuth'd as `limboenedmund@gmail.com`, account
+`2132f9cf03d557cc3be87ca4208e683d`. Migrated off Vercel 2026-07-05 — the Workers+R2 vs Vercel
+question is settled, don't re-litigate. Photos are served from a custom domain bound to the
+bucket (no r2.dev rate limit) and the live-gallery QR is generated locally (`qrcode` npm
+package) — no third-party dependency to break on locked-down venue Wi-Fi.
 
 Cloudflare Workers free tier: 100k requests/day. The live gallery polls `/api/photos` every 3s
 (~1.2k req/hr per open tab) — fine for 2-3h events, but don't leave galleries polling for days.

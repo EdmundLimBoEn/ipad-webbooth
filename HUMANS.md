@@ -5,12 +5,40 @@ deploy, adding the domain to the project) is already done.
 
 ## One-time (Cloudflare dashboard)
 
-- [ ] Bind a custom domain (e.g. `photos.edmundlim.systems`) to the R2 bucket
-  and update `R2_PUBLIC_BASE` in `wrangler.jsonc` — the current r2.dev
-  subdomain is rate-limited and not meant for production.
+- [x] Bind a custom domain to the R2 bucket (`bucket.photobooth.edmundlim.systems`
+  was already attached with SSL active; `R2_PUBLIC_BASE` now points at it,
+  2026-07-10). The r2.dev subdomain still works as a fallback.
+- [ ] Create a Cloudflare API token with **Account Analytics: Read** and set it
+  as the `CF_ANALYTICS_TOKEN` Worker secret
+  (`bunx wrangler secret put CF_ANALYTICS_TOKEN`) — enables the health cron's
+  request-headroom check (Upload component goes *degraded* at 80% of the
+  100k req/day free-tier cap). Until set, the check is silently skipped.
+- [ ] Set up a free external uptime monitor (e.g. UptimeRobot) hitting
+  `https://photobooth.edmundlim.systems/api/photos?event=uptime` every 5 min —
+  this catches a fully dead Worker, which the self-hosted health cron
+  structurally can't (a broken deploy kills the cron too).
 - [ ] Add a WAF rate-limiting rule on `/api/*` (e.g. block an IP that gets
   many 401s, and cap request rate per IP) — the code has a per-isolate
   micro-cache but the WAF is the real brute-force/DoS backstop.
+
+## One-time (this Mac)
+
+- [ ] Get this repo out of iCloud sync. iCloud's Desktop & Documents sync
+  keeps evicting `node_modules` file contents (the source of the random
+  `CouldntReadCurrentDirectory` / `ERR_INVALID_PACKAGE_CONFIG` / timeout
+  errors and the `" 2"` duplicate files). Either move `~/Documents/apps`
+  somewhere unsynced (e.g. `~/dev`), or turn off System Settings → Apple ID →
+  iCloud → Drive → Desktop & Documents Folders. Until then, the workaround is
+  `rm -rf node_modules && bun install`.
+
+## One-time (statuspage.io health reporting)
+
+- [x] API key created + the four Worker secrets set (2026-07-08; values in
+  `EDMUNDS-STUFF.md`). Probes map R2 binding → **Upload**, public bucket →
+  **Live page**.
+- [ ] After deploy, wait one 5-minute cron tick and confirm both Statuspage
+  components stay **Operational** (cron logs: dashboard → Workers →
+  ipad-webbooth → Logs).
 
 ## Per event (before doors open)
 
@@ -36,5 +64,8 @@ deploy, adding the domain to the project) is already done.
   photo** (on phones this opens the share sheet → Save to Photos).
 - To remove a photo: Cloudflare dashboard → R2 → `photobooth` bucket → delete the object
   (or `bunx wrangler r2 object delete "photobooth/<event>/<file>.jpg" --remote`).
+- Lost or leaked booth key mid-event: open `/{event}/admin`, Generate a new
+  key, Save. The old key is revoked instantly — devices still holding it get a
+  401, drop their saved copy, and prompt for the new key.
 - Event galleries are public to anyone who knows the event name — use a
   non-obvious slug (e.g. `tb9-x7k2`, not `wedding`) for private events.

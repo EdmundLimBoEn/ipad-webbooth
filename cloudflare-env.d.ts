@@ -18,5 +18,15 @@ declare global {
     PHOTOS: R2Bucket;
     R2_PUBLIC_BASE: string;
     BOOTH_UPLOAD_KEY?: string;
+    // statuspage.io REST API credentials for the health cron (all Worker
+    // secrets; the key lives in EDMUNDS-STUFF.md). Any unset → no reporting.
+    STATUSPAGE_API_KEY?: string;
+    STATUSPAGE_PAGE_ID?: string;
+    STATUSPAGE_COMPONENT_UPLOAD?: string;
+    STATUSPAGE_COMPONENT_LIVE?: string;
+    // Workers-requests headroom check (free tier: 100k req/day). Var + secret;
+    // either unset → the check is skipped, never blocks the up/down probes.
+    CF_ACCOUNT_ID?: string;
+    CF_ANALYTICS_TOKEN?: string;
   }
 }
