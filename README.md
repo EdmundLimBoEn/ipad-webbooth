@@ -1,85 +1,76 @@
 # iPad Photo Booth
 
-Live event photo booth. An iPad (or any phone) runs the booth page, takes photos,
-and they appear on a live gallery within ~3s. Next.js on Cloudflare Workers +
-R2 (via `@opennextjs/cloudflare`), no database.
+A live-event photo booth for iPad and mobile browsers. Guests capture framed photos at `/{event}` and the projector-friendly Live Gallery at `/{event}/live` receives incremental updates. The application is Next.js on Cloudflare Workers with two R2 stores and no database or WebSockets.
 
-## Routes
+## Event routes
 
-- `/{event}` — booth. Live camera, 3-2-1 countdown, shutter, upload. After each
-  photo it returns to the frame picker.
-- `/{event}/live` — auto-refreshing gallery (newest first). Good for a projector/TV.
-- `/{event}/admin` — event admin (needs the admin key): choose which frames the
-  booth offers at this event, set the event's booth key, and export all photos
-  as a zip.
+- `/` — build a canonical Event slug and open its Booth, Live Gallery, or Admin.
+- `/{event}` — Booth: choose a Frame, capture, composite, and upload.
+- `/{event}/live` — public Live Gallery.
+- `/{event}/admin` — select Frames, rotate the Booth Key, moderate exact photos, and export.
+- `/frame-lab` — calibrate photo slots against artwork and export manifest JSON.
 
-`{event}` is any name; it's slugged to `a-z0-9-`. Different events don't see each
-other's photos. Galleries are public to anyone who knows the event name, so use
-a non-obvious slug for private events.
+Event slugs are canonical lowercase `a-z`, `0-9`, and hyphens (for example `tb9-x7k2`). API requests reject aliases instead of silently turning different names into the same Event. Gallery URLs are public capabilities, so use an unguessable slug when the event is private.
 
-By default a new event's booth only offers the pink Square frame. Extra frames
-(grouped per design drop, e.g. Talent Beacon 9 Anniversary) must be enabled per
-event on its admin page; the allowlist is stored as an R2 object at
-`_config/{event}.json`.
+## Architecture
 
-## Storage / env
+`EventStore` owns Event keys, configuration, photo ordering, and the incremental Photo Feed:
 
-Photos live in the R2 bucket `photobooth` (binding `PHOTOS` in `wrangler.jsonc`),
-served publicly from `R2_PUBLIC_BASE`. Two kinds of key:
+- `PHOTOS` is the public-delivery R2 bucket. It contains photo bytes at `{event}/{timestamp}-{suffix}.jpg` and the health canary used to test the complete write/read/public-read path.
+- `STATE` is private R2 storage. It contains Event configuration and Booth Key hashes under `events/{event}/` plus health reporting state.
+- Old `_config/{event}.json` and `_health/state.json` records in `PHOTOS` are read lazily and copied into `STATE`. They are not deleted; rollback remains possible.
 
-- **Admin key** — `BOOTH_UPLOAD_KEY`, a Worker secret in production
-  (`bunx wrangler secret put BOOTH_UPLOAD_KEY`). Gates the admin page, config
-  saves, and the zip export.
-- **Booth key** — per event, set on `/{event}/admin` (stored as a salted
-  PBKDF2 hash in `_config/{event}.json`, since the bucket is publicly readable). Only
-  uploads photos to its own event; this is the key the booth page prompts for
-  and keeps in `localStorage`. Until one is set, only the admin key can upload.
-  Re-setting the key on `/{event}/admin` **revokes the old one immediately**:
-  the stored hash changes, devices holding the old key get a 401 on their next
-  upload, which clears their `localStorage` copy and re-prompts — so a lost or
-  leaked booth key is fixed by generating a new one.
+The Live Gallery retains the Photo Feed cursor and asks only for objects after it. The Booth Session writes every completed composite to an ordered Photo Outbox before upload. IndexedDB makes the outbox survive reloads and reconnects; if IndexedDB is unavailable, an explicit in-memory degraded mode keeps the current page usable but cannot survive a reload. A later capture can never replace an earlier failed one.
 
-With no admin key configured, the API fails closed unless `ALLOW_KEYLESS=1`
-(set in `.env.local` for local dev only).
+Deletion is exact-key moderation: the admin must supply both a canonical Event and a complete photo key belonging to that Event. There is no prefix or bulk delete route. The safety rule is absolute: never empty either R2 bucket or the Vercel backup store.
 
-The old Vercel Blob store still holds a pre-migration copy of every photo as a
-backup (`BLOB_READ_WRITE_TOKEN` in `.env.local` reaches it; `scripts/migrate-to-r2.ts`
-re-copies anything new).
+Architecture decisions and vocabulary are in [CONTEXT.md](./CONTEXT.md) and [docs/adr](./docs/adr).
 
-## Status page
+## Frame Packs
 
-A 5-minute cron (`custom-worker.ts` → `app/health.ts`) probes the R2 binding
-(→ **Upload** component) and the public bucket URL (→ **Live page** component),
-and on status changes PATCHes the statuspage.io component
-(`operational`/`major_outage`) via the Statuspage REST API. Secrets:
-`STATUSPAGE_API_KEY`, `STATUSPAGE_PAGE_ID`, `STATUSPAGE_COMPONENT_UPLOAD`,
-`STATUSPAGE_COMPONENT_LIVE`. Last status lives at `_health/state.json` in the
-bucket. Any secret unset → no reporting.
+Each design drop is a Frame Pack under `public/templates/<pack>/` with a `manifest.json` beside its PNG artwork. The manifest declares the canvas, slots, fit, shot count, timing, and draw layers. Create and validate packs with:
 
-## Local dev
+```bash
+bun run scaffold:frames summer-party "Summer Party"
+bun run validate:frames
+```
+
+Use `/frame-lab` to load PNG artwork, drag/resize openings in exact canvas pixels, preview the composite, and copy/download the manifest. Put the exported manifest and artwork in the pack directory, then run validation. The Booth always requires a fresh Frame choice after a completed capture.
+
+## Local development and verification
 
 ```bash
 bun install
 bun dev
+bun run typecheck
+bun run typecheck:tests
+bun test
+bun run validate:frames
+bun run build
 ```
 
-`getUserMedia` needs HTTPS or `localhost`. Test the camera on the deployed URL
-from a real iPad/phone.
+`getUserMedia` requires HTTPS or `localhost`; final camera verification must happen on a real iPad or phone. CI runs application type-checking, test type-checking, tests, Frame Pack validation, and a production build.
 
-## Deploy
+## Environments and deployment
+
+Local, staging, and production have distinct Worker names, `PHOTOS` buckets, `STATE` buckets, public photo domains, and secrets. A hostname pointing to production is not staging.
 
 ```bash
-bun run deploy    # opennextjs-cloudflare build + deploy
+# Exercise staging, then promote the same reviewed source.
+bun run deploy:staging
+bun run deploy:production
 ```
 
-On macOS 27 `bun run` is currently broken — deploy with the underlying
-commands instead:
+The R2 buckets, public bucket custom domains, and Worker secrets must exist before deployment; commands are in [the deployment runbook](./docs/runbooks/deployment.md). Bare `bun run deploy` intentionally fails so an operator must name staging or production; never deploy the unnamed/default Wrangler environment to an event domain.
+
+For the event-day checklist and rollback procedure, see [pre-event readiness](./docs/runbooks/pre-event-readiness.md) and [deployment and rollback](./docs/runbooks/deployment.md).
+
+## Vercel backup reconciliation
+
+The old Vercel Blob store remains a backup. Reconciliation checks R2 and adds only objects that are missing; it never deletes or overwrites either store.
 
 ```bash
-./node_modules/.bin/next build
-bunx opennextjs-cloudflare build --skipNextBuild
-OPEN_NEXT_DEPLOY=true bunx wrangler deploy
+bun run reconcile:backup -- --env production
 ```
 
-Custom domains (`photobooth.edmundlim.systems`, staging `photobooth-cf.…`) are
-declared in `wrangler.jsonc` and attach on deploy.
+`bun run migrate:vercel` and `bun scripts/migrate-to-r2.ts` remain compatibility entries for the same additive reconciliation. Keep `BLOB_READ_WRITE_TOKEN` in `.env.local`, never in source or shell history.

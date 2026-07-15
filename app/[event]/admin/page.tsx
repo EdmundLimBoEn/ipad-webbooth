@@ -1,244 +1,370 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import { TEMPLATES, GROUPS } from "../../templates";
+import QRCode from "qrcode";
+import { GROUPS, TEMPLATES } from "../../templates";
+import type { Template } from "../../frame-packs/types";
+import styles from "./admin.module.css";
 
-// One-stop event admin (Edmund only — gated by the admin key, a Worker
-// secret): per-event frame allowlist, per-event booth key, photo export.
+type Photo = { key: string; url: string; uploadedAt: string };
+type AuthState = "missing" | "ready" | "invalid";
+type Probe = { status: "up" | "degraded" | "down"; detail: string };
+type Health = { upload: Probe; live: Probe };
+type FilePickerWindow = Window & { showSaveFilePicker?: (options: { suggestedName: string; types: { description: string; accept: Record<string, string[]> }[] }) => Promise<{ createWritable(): Promise<WritableStream<Uint8Array>> }> };
+
+function FramePreview({ frame }: { frame: Template }) {
+  return (
+    <span className={styles.framePreview} style={{ aspectRatio: `${frame.canvas.w}/${frame.canvas.h}`, backgroundColor: frame.background || "#d8d5cc" }}>
+      {frame.bgImage && <img src={frame.bgImage} alt="" className={styles.frameLayer} />}
+      {frame.slots.map((slot, index) => (
+        <span
+          key={index}
+          className={styles.photoSlot}
+          style={{
+            left: `${slot.x / frame.canvas.w * 100}%`,
+            top: `${slot.y / frame.canvas.h * 100}%`,
+            width: `${slot.w / frame.canvas.w * 100}%`,
+            height: `${slot.h / frame.canvas.h * 100}%`,
+          }}
+        />
+      ))}
+      {frame.overlay && <img src={frame.overlay} alt="" className={styles.overlayLayer} />}
+    </span>
+  );
+}
+
 export default function Admin() {
   const { event } = useParams<{ event: string }>();
+  const [adminKey, setAdminKey] = useState("");
+  const [auth, setAuth] = useState<AuthState>("missing");
   const [frames, setFrames] = useState<Set<string>>(new Set());
-  const [loaded, setLoaded] = useState(false);
+  const [configLoaded, setConfigLoaded] = useState(false);
+  const [configError, setConfigError] = useState("");
+  const [hasBoothKey, setHasBoothKey] = useState(false);
+  const [boothKey, setBoothKey] = useState("");
+  const [boothKeySaved, setBoothKeySaved] = useState(false);
+  const [photos, setPhotos] = useState<Photo[]>([]);
+  const [photosLoaded, setPhotosLoaded] = useState(false);
+  const [photosError, setPhotosError] = useState("");
   const [saving, setSaving] = useState(false);
   const [exporting, setExporting] = useState(false);
-  const [msg, setMsg] = useState("");
+  const [deleting, setDeleting] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState("");
+  const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const [loadError, setLoadError] = useState(false);
-  // the per-event booth key: write-only (the server stores a hash), so this
-  // field is what will be SET on save; empty = keep the current one
-  const [boothKey, setBoothKey] = useState("");
-  const [hasBoothKey, setHasBoothKey] = useState(false);
+  const [origin, setOrigin] = useState("");
+  const [boothQr, setBoothQr] = useState("");
+  const [liveQr, setLiveQr] = useState("");
+  const [copied, setCopied] = useState("");
+  const [health, setHealth] = useState<Health | null>(null);
+  const [checkingHealth, setCheckingHealth] = useState(false);
+  const photoCursor = useRef<string | null>(null);
 
-  const getKey = () => {
-    let key = localStorage.getItem("adminKey");
-    if (!key) {
-      key = window.prompt("Enter admin key") ?? "";
-      if (key) localStorage.setItem("adminKey", key);
+  const boothUrl = `${origin}/${event}`;
+  const liveUrl = `${boothUrl}/live`;
+  const defaults = useMemo(() => Object.keys(TEMPLATES).filter((key) => !TEMPLATES[key].group), []);
+
+  const runHealth = useCallback(async (key = adminKey) => {
+    setCheckingHealth(true); setError("");
+    try {
+      const response = await fetch("/api/health", { cache: "no-store", headers: { "x-booth-key": key } });
+      if (response.status === 401) {
+        sessionStorage.removeItem("adminKey");
+        setAuth("invalid");
+        throw new Error("That admin key was rejected.");
+      }
+      if (!response.ok) throw new Error(`Readiness checks failed (${response.status})`);
+      setHealth(await response.json() as Health);
+      setAuth("ready");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Readiness checks could not run");
+    } finally { setCheckingHealth(false); }
+  }, [adminKey]);
+
+  useEffect(() => {
+    setOrigin(window.location.origin);
+    const stored = sessionStorage.getItem("adminKey") || "";
+    if (stored) {
+      setAdminKey(stored);
+      setAuth("ready");
     }
-    return key ?? "";
-  };
+  }, []);
 
-  const load = useCallback(() => {
-    setLoadError(false);
-    fetch(`/api/config?event=${encodeURIComponent(event)}`)
-      .then((r) => r.json())
-      .then((d) => {
-        // no config yet -> the ungrouped defaults start ticked (on by default)
-        const defaults = Object.keys(TEMPLATES).filter((k) => !TEMPLATES[k].group);
-        setFrames(new Set(Array.isArray(d.frames) ? d.frames : defaults));
-        setHasBoothKey(!!d.hasBoothKey);
-        setLoaded(true);
-      })
-      .catch(() => setLoadError(true));
+  useEffect(() => {
+    if (!origin) return;
+    void QRCode.toDataURL(boothUrl, { width: 240, margin: 1 }).then(setBoothQr).catch(() => setBoothQr(""));
+    void QRCode.toDataURL(liveUrl, { width: 240, margin: 1 }).then(setLiveQr).catch(() => setLiveQr(""));
+  }, [boothUrl, liveUrl, origin]);
+
+  const loadConfig = useCallback(async () => {
+    setConfigError("");
+    try {
+      const response = await fetch(`/api/config?event=${encodeURIComponent(event)}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Config returned ${response.status}`);
+      const data = await response.json();
+      setFrames(new Set(Array.isArray(data.frames) ? data.frames : defaults));
+      setHasBoothKey(Boolean(data.hasBoothKey));
+      setConfigLoaded(true);
+    } catch (cause) {
+      setConfigError(cause instanceof Error ? cause.message : "Config could not be loaded");
+    }
+  }, [defaults, event]);
+
+  const loadPhotos = useCallback(async (reset = false) => {
+    setPhotosError("");
+    try {
+      const query = new URLSearchParams({ event });
+      if (!reset && photoCursor.current) query.set("after", photoCursor.current);
+      const response = await fetch(`/api/photos?${query}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Photo feed returned ${response.status}`);
+      const data = await response.json();
+      if (!Array.isArray(data.photos)) throw new Error("Photo feed had an unexpected shape");
+      setPhotos((current) => {
+        if (reset || !photoCursor.current) return data.photos;
+        const incoming = data.photos as Photo[];
+        const keys = new Set(incoming.map((photo) => photo.key));
+        return [...incoming, ...current.filter((photo) => !keys.has(photo.key))];
+      });
+      if (typeof data.cursor === "string" && data.cursor) photoCursor.current = data.cursor;
+      setPhotosLoaded(true);
+    } catch (cause) {
+      setPhotosError(cause instanceof Error ? cause.message : "Photos could not be loaded");
+    }
   }, [event]);
-  useEffect(load, [load]);
 
-  const toggle = (k: string) => {
-    setFrames((prev) => {
-      const next = new Set(prev);
-      if (next.has(k)) next.delete(k);
-      else next.add(k);
-      return next;
-    });
-    setMsg("");
+  useEffect(() => {
+    void loadConfig();
+    photoCursor.current = null;
+    void loadPhotos(true);
+    const poll = window.setInterval(() => void loadPhotos(), 5000);
+    return () => window.clearInterval(poll);
+  }, [loadConfig, loadPhotos]);
+
+  const authenticate = (submitEvent: FormEvent) => {
+    submitEvent.preventDefault();
+    const next = adminKey.trim();
+    if (!next) return;
+    sessionStorage.setItem("adminKey", next);
+    setAdminKey(next);
+    setAuth("ready");
+    setError("");
+    void runHealth(next);
   };
 
-  const setGroup = (gid: string, on: boolean) => {
-    const keys = Object.keys(TEMPLATES).filter((k) => TEMPLATES[k].group === gid);
-    setFrames((prev) => {
-      const next = new Set(prev);
-      keys.forEach((k) => (on ? next.add(k) : next.delete(k)));
+  const invalidateAuth = () => {
+    sessionStorage.removeItem("adminKey");
+    setAuth("invalid");
+  };
+
+  const toggle = (key: string) => {
+    setFrames((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key); else next.add(key);
       return next;
     });
-    setMsg("");
+    setNotice("");
+  };
+
+  const setGroup = (group: string, enabled: boolean) => {
+    const keys = Object.keys(TEMPLATES).filter((key) => TEMPLATES[key].group === group);
+    setFrames((current) => {
+      const next = new Set(current);
+      keys.forEach((key) => enabled ? next.add(key) : next.delete(key));
+      return next;
+    });
   };
 
   const generateBoothKey = () => {
     const bytes = crypto.getRandomValues(new Uint8Array(12));
-    setBoothKey(Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(""));
-    setMsg("");
+    setBoothKey(Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""));
+    setBoothKeySaved(false);
+    setNotice("New key generated. Copy it now, then save the event.");
   };
 
-  const save = useCallback(async () => {
+  const copy = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(label);
+      window.setTimeout(() => setCopied((current) => current === label ? "" : current), 1800);
+    } catch {
+      setError("Clipboard access was blocked. Select and copy the value manually.");
+    }
+  };
+
+  const save = async () => {
     if (boothKey && boothKey.length < 12) {
-      setError("Booth key must be at least 12 characters — use Generate");
+      setError("Booth keys need at least 12 characters.");
       return;
     }
-    setSaving(true);
-    setError("");
-    setMsg("");
+    setSaving(true); setError(""); setNotice("");
     try {
-      const res = await fetch(`/api/config?event=${encodeURIComponent(event)}`, {
+      const response = await fetch(`/api/config?event=${encodeURIComponent(event)}`, {
         method: "PUT",
-        headers: { "x-booth-key": getKey(), "content-type": "application/json" },
+        headers: { "x-booth-key": adminKey, "content-type": "application/json" },
         body: JSON.stringify({ frames: [...frames], ...(boothKey ? { boothKey } : {}) }),
       });
-      if (res.status === 401) {
-        localStorage.removeItem("adminKey"); // wrong key: re-prompt next try
-        throw new Error("Wrong admin key");
-      }
-      if (!res.ok) throw new Error(`Save failed (${res.status})`);
-      if (boothKey) {
-        setHasBoothKey(true);
-        setMsg("Saved ✓ — record the booth key in EDMUNDS-STUFF.md, it can't be shown again");
-      } else {
-        setMsg("Saved ✓");
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
-  }, [event, frames, boothKey]);
+      if (response.status === 401) { invalidateAuth(); throw new Error("That admin key was rejected."); }
+      if (!response.ok) throw new Error(`Save failed (${response.status})`);
+      if (boothKey) { setHasBoothKey(true); setBoothKeySaved(true); }
+      setNotice(boothKey ? "Event saved. Keep the new booth key somewhere secure." : "Event configuration saved.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Event could not be saved");
+    } finally { setSaving(false); }
+  };
 
-  const exportZip = useCallback(async () => {
-    setExporting(true);
-    setError("");
+  const exportZip = async () => {
+    setExporting(true); setError("");
     try {
-      const res = await fetch(`/api/export?event=${encodeURIComponent(event)}`, {
-        headers: { "x-booth-key": getKey() },
-      });
-      if (res.status === 401) {
-        localStorage.removeItem("adminKey");
-        throw new Error("Wrong admin key");
+      // Ask for the destination while the click's user activation is still
+      // live. The response can then stream straight to disk without a giant blob.
+      const picker = (window as FilePickerWindow).showSaveFilePicker;
+      const handle = picker ? await picker({ suggestedName: `${event}-photos.zip`, types: [{ description: "ZIP archive", accept: { "application/zip": [".zip"] } }] }) : null;
+      const response = await fetch(`/api/export?event=${encodeURIComponent(event)}`, { headers: { "x-booth-key": adminKey } });
+      if (response.status === 401) { invalidateAuth(); throw new Error("That admin key was rejected."); }
+      if (!response.ok) throw new Error(`Export failed (${response.status})`);
+      if (handle && response.body) {
+        const writable = await handle.createWritable();
+        await response.body.pipeTo(writable);
+      } else {
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url; anchor.download = `${event}-photos.zip`; anchor.click();
+        URL.revokeObjectURL(url);
       }
-      if (!res.ok) throw new Error(`Export failed (${res.status})`);
-      const blob = await res.blob();
-      const obj = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = obj;
-      a.download = `${event}-photos.zip`;
-      a.click();
-      URL.revokeObjectURL(obj);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setExporting(false);
-    }
-  }, [event]);
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === "AbortError") return;
+      setError(cause instanceof Error ? cause.message : "Export could not be created");
+    } finally { setExporting(false); }
+  };
 
-  const defaults = Object.keys(TEMPLATES).filter((k) => !TEMPLATES[k].group);
-  const section: React.CSSProperties = { width: "min(680px, 92vw)", display: "flex", flexDirection: "column", gap: 12 };
-  const card: React.CSSProperties = {
-    display: "flex", alignItems: "center", gap: 12, padding: "10px 14px",
-    borderRadius: 12, background: "rgba(255,255,255,0.08)", cursor: "pointer",
+  const deletePhoto = async (photo: Photo) => {
+    setDeleting(photo.key); setError("");
+    try {
+      const response = await fetch(`/api/photos?event=${encodeURIComponent(event)}&key=${encodeURIComponent(photo.key)}`, {
+        method: "DELETE", headers: { "x-booth-key": adminKey },
+      });
+      if (response.status === 401) { invalidateAuth(); throw new Error("That admin key was rejected."); }
+      if (!response.ok) throw new Error(`Delete failed (${response.status})`);
+      setPhotos((current) => current.filter((item) => item.key !== photo.key));
+      setConfirmDelete("");
+      setNotice("Photo removed from the event.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Photo could not be deleted");
+    } finally { setDeleting(""); }
   };
-  const thumb: React.CSSProperties = { height: 48, width: "auto", borderRadius: 6 };
-  const btn: React.CSSProperties = {
-    padding: "12px 24px", fontSize: 16, fontWeight: 600, borderRadius: 8, border: "none",
-    cursor: "pointer", background: "#ff2d8b", color: "#fff",
-  };
-  const input: React.CSSProperties = {
-    flex: 1, padding: "10px 12px", fontSize: 15, borderRadius: 8, border: "none",
-    background: "rgba(255,255,255,0.12)", color: "#fff", fontFamily: "ui-monospace, monospace",
-  };
+
+  const facts: { label: string; value: string; tone: "good" | "bad" | "wait"; detail?: string }[] = [
+    { label: "Config", value: configLoaded ? "Loaded" : configError ? "Error" : "Checking", tone: configLoaded ? "good" : configError ? "bad" : "wait" },
+    { label: "Frames", value: `${frames.size} enabled`, tone: frames.size > 0 ? "good" : "bad" },
+    { label: "Booth key", value: hasBoothKey ? "Installed" : "Missing", tone: hasBoothKey ? "good" : "bad" },
+    { label: "Photos", value: photosLoaded ? `${photos.length} live` : photosError ? "Error" : "Checking", tone: photosLoaded ? "good" : photosError ? "bad" : "wait" },
+    { label: "Upload", value: health ? health.upload.status : "Unchecked", tone: health ? health.upload.status === "up" ? "good" : health.upload.status === "degraded" ? "wait" : "bad" : "wait", detail: health?.upload.detail },
+    { label: "Live", value: health ? health.live.status : "Unchecked", tone: health ? health.live.status === "up" ? "good" : health.live.status === "degraded" ? "wait" : "bad" : "wait", detail: health?.live.detail },
+  ];
+
+  if (auth !== "ready") {
+    return (
+      <main className={styles.authPage}>
+        <form className={styles.authCard} onSubmit={authenticate}>
+          <p className={styles.kicker}>Darkroom access / {event}</p>
+          <h1>Operator<br />sign-in</h1>
+          <p>{auth === "invalid" ? "That credential was rejected. Enter the admin key again." : "Load the admin credential to operate this event."}</p>
+          <label htmlFor="admin-key">Admin key</label>
+          <input id="admin-key" type="password" value={adminKey} onChange={(e) => setAdminKey(e.target.value)} autoComplete="current-password" autoFocus />
+          <button type="submit" disabled={!adminKey.trim()}>Enter darkroom →</button>
+        </form>
+      </main>
+    );
+  }
 
   return (
-    <main style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "40px 0 80px", minHeight: "100dvh", gap: 28, color: "#fff", background: "#111", fontFamily: "system-ui" }}>
-      <h1>Admin — {event}</h1>
-
-      {loadError && (
-        <section style={section}>
-          <p style={{ color: "salmon" }}>Failed to load config.</p>
-          <button onClick={load} style={btn}>Retry</button>
-        </section>
-      )}
-
-      <section style={section}>
-        <h2 style={{ fontSize: 18 }}>Frames</h2>
-        <p style={{ opacity: 0.7, fontSize: 14 }}>
-          Tick the frames this event may use, then save. Default frames start on.
-        </p>
-
-        {defaults.map((k) => (
-          <label key={k} style={card}>
-            <input type="checkbox" checked={frames.has(k)} onChange={() => toggle(k)} style={{ width: 20, height: 20 }} />
-            <span style={{ ...thumb, width: 48, background: TEMPLATES[k].background ?? "#ff2d8b" }} />
-            <span style={{ flex: 1 }}>{TEMPLATES[k].label}</span>
-            <span style={{ fontSize: 13, opacity: 0.7 }}>default</span>
-          </label>
-        ))}
-
-        {Object.entries(GROUPS).map(([gid, glabel]) => {
-          const keys = Object.keys(TEMPLATES).filter((k) => TEMPLATES[k].group === gid);
-          const allOn = keys.every((k) => frames.has(k));
-          return (
-            <div key={gid} style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 12 }}>
-              <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
-                <h3 style={{ fontSize: 16 }}>{glabel}</h3>
-                <button
-                  onClick={() => setGroup(gid, !allOn)}
-                  style={{ background: "none", border: "none", color: "#ffb3d9", cursor: "pointer", fontSize: 13 }}
-                >
-                  {allOn ? "disable all" : "enable all"}
-                </button>
-              </div>
-              {keys.map((k) => (
-                <label key={k} style={card}>
-                  <input type="checkbox" checked={frames.has(k)} onChange={() => toggle(k)} style={{ width: 20, height: 20 }} />
-                  {TEMPLATES[k].bgImage && (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={TEMPLATES[k].bgImage} alt="" style={thumb} />
-                  )}
-                  <span style={{ flex: 1 }}>{TEMPLATES[k].label}</span>
-                  <span style={{ fontSize: 13, opacity: 0.7 }}>{TEMPLATES[k].shots === 1 ? "1 photo" : `${TEMPLATES[k].shots} photos`}</span>
-                </label>
-              ))}
-            </div>
-          );
-        })}
-      </section>
-
-      <section style={section}>
-        <h2 style={{ fontSize: 18 }}>Booth key</h2>
-        <p style={{ opacity: 0.7, fontSize: 14 }}>
-          The key the booth page asks for. Per event — it can only upload photos to this
-          event, so it&apos;s safe to type into the guest-facing iPad.{" "}
-          {hasBoothKey
-            ? "This event has a booth key. Fill the field to replace it; leave empty to keep it."
-            : "No booth key set yet — only the admin key can upload. Generate one and save."}
-        </p>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input
-            value={boothKey}
-            onChange={(e) => { setBoothKey(e.target.value.trim()); setMsg(""); }}
-            placeholder={hasBoothKey ? "(unchanged)" : "(none set)"}
-            style={input}
-            autoComplete="off"
-          />
-          <button onClick={generateBoothKey} style={btn}>Generate</button>
+    <main className={styles.console}>
+      <header className={styles.header}>
+        <div><p className={styles.kicker}>Webbooth / operator console</p><h1>{event}</h1><code>/{event}</code></div>
+        <div className={styles.headerActions}>
+          <a href="/frame-lab">Open frame lab ↗</a>
+          <button onClick={() => { sessionStorage.removeItem("adminKey"); setAuth("missing"); setAdminKey(""); }}>Lock console</button>
         </div>
-        <p style={{ opacity: 0.7, fontSize: 13 }}>
-          The server stores only a hash — record the key in EDMUNDS-STUFF.md before leaving this page.
-        </p>
+      </header>
+
+      <section className={styles.readiness} aria-label="Event readiness">
+        <div className={styles.railLabel}><span>Ready?</span><strong>{facts.every((fact) => fact.tone === "good") ? "YES" : "CHECK"}</strong><button onClick={() => void runHealth()} disabled={checkingHealth}>{checkingHealth ? "Running…" : "Run checks"}</button></div>
+        {facts.map((fact, index) => <div className={styles.fact} key={fact.label} title={fact.detail}><span>0{index + 1} / {fact.label}</span><strong data-tone={fact.tone}>{fact.value}</strong></div>)}
       </section>
 
-      <section style={section}>
-        <button onClick={save} disabled={!loaded || saving} style={btn}>
-          {saving ? "Saving…" : "Save frames + booth key"}
-        </button>
-        {msg && <p style={{ color: "#8f8" }}>{msg}</p>}
-      </section>
+      {(error || notice) && <div className={error ? styles.errorBanner : styles.noticeBanner} role="status"><span>{error ? "Attention" : "Done"}</span><p>{error || notice}</p><button onClick={() => { setError(""); setNotice(""); }}>×</button></div>}
 
-      <section style={section}>
-        <h2 style={{ fontSize: 18 }}>Export</h2>
-        <button onClick={exportZip} disabled={exporting} style={btn}>
-          {exporting ? "Zipping…" : "Download all photos (.zip)"}
-        </button>
-      </section>
+      <div className={styles.layout}>
+        <div className={styles.mainColumn}>
+          <section className={styles.section}>
+            <div className={styles.sectionHead}><div><span>01</span><h2>Frame programme</h2></div><p>Choose what guests see at the booth. Previews follow the real background → photo → overlay composition.</p></div>
+            {configError ? <div className={styles.failure}><strong>Config unavailable</strong><p>{configError}</p><button onClick={() => void loadConfig()}>Retry config</button></div> :
+            <div className={styles.frameGroups}>
+              <div className={styles.frameGroup}>
+                <div className={styles.groupHead}><h3>House frames</h3></div>
+                <div className={styles.filmRail}>{defaults.map((key) => <FrameCard key={key} frameKey={key} enabled={frames.has(key)} toggle={toggle} />)}</div>
+              </div>
+              {Object.entries(GROUPS).map(([group, label]) => {
+                const keys = Object.keys(TEMPLATES).filter((key) => TEMPLATES[key].group === group);
+                const allOn = keys.every((key) => frames.has(key));
+                return <div className={styles.frameGroup} key={group}>
+                  <div className={styles.groupHead}><h3>{label}</h3><button onClick={() => setGroup(group, !allOn)}>{allOn ? "Disable pack" : "Enable pack"}</button></div>
+                  <div className={styles.filmRail}>{keys.map((key) => <FrameCard key={key} frameKey={key} enabled={frames.has(key)} toggle={toggle} />)}</div>
+                </div>;
+              })}
+            </div>}
+          </section>
 
-      {error && <p style={{ color: "salmon" }}>{error}</p>}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}><div><span>02</span><h2>Recent contact sheet</h2></div><p>{photos.length} photograph{photos.length === 1 ? "" : "s"} currently in this event.</p></div>
+            {photosError && photos.length === 0 ? <div className={styles.failure}><strong>Photo feed unavailable</strong><p>{photosError}</p><button onClick={() => void loadPhotos(true)}>Retry photos</button></div> : photosLoaded && photos.length === 0 ?
+              <div className={styles.emptySheet}><strong>No exposures yet.</strong><p>Open the booth link and take a test photo before doors open.</p></div> :
+              <div className={styles.contactSheet}>{photos.slice(0, 16).map((photo) => <article key={photo.key} className={styles.contactPhoto}>
+                <img src={photo.url} alt={`Event photograph uploaded ${new Date(photo.uploadedAt).toLocaleString()}`} />
+                <div><time>{new Date(photo.uploadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><code title={photo.key}>{photo.key.split("/").pop()}</code></div>
+                {confirmDelete === photo.key ? <div className={styles.deleteConfirm}><span>Delete exactly this photo?</span><button onClick={() => void deletePhoto(photo)} disabled={deleting === photo.key}>{deleting === photo.key ? "Removing…" : "Yes, remove"}</button><button onClick={() => setConfirmDelete("")}>Keep</button></div> : <button className={styles.removePhoto} onClick={() => setConfirmDelete(photo.key)}>Remove</button>}
+              </article>)}</div>}
+          </section>
+        </div>
+
+        <aside className={styles.sideColumn}>
+          <section className={styles.sideCard}>
+            <span className={styles.cardNumber}>03</span><h2>Booth credential</h2>
+            <p>{hasBoothKey ? "A booth key is installed. Generate a replacement only when rotating iPad access." : "No booth key yet. Generate one before the booth can upload."}</p>
+            <div className={styles.keyRow}><input aria-label="New booth key" value={boothKey} onChange={(e) => { setBoothKey(e.target.value.trim()); setBoothKeySaved(false); }} placeholder={hasBoothKey ? "Unchanged" : "Generate a key"} autoComplete="off" /><button onClick={generateBoothKey}>Generate</button></div>
+            {boothKey && <button className={styles.copyWide} onClick={() => void copy(boothKey, "key")}>{copied === "key" ? "Copied ✓" : "Copy generated key"}</button>}
+            {boothKey && boothKeySaved && <button className={styles.clearKey} onClick={() => { setBoothKey(""); setBoothKeySaved(false); setCopied(""); }}>Stored safely — clear key</button>}
+          </section>
+
+          <LinkCard label="Booth / iPad" url={boothUrl} qr={boothQr} copied={copied === "booth"} copy={() => void copy(boothUrl, "booth")} />
+          <LinkCard label="Live / projector" url={liveUrl} qr={liveQr} copied={copied === "live"} copy={() => void copy(liveUrl, "live")} />
+
+          <section className={styles.sideCard}>
+            <span className={styles.cardNumber}>06</span><h2>Ship the event</h2>
+            <button className={styles.saveButton} onClick={() => void save()} disabled={!configLoaded || saving}>{saving ? "Saving event…" : "Save configuration"}</button>
+            <button className={styles.exportButton} onClick={() => void exportZip()} disabled={exporting}>{exporting ? "Building archive…" : `Export ${photos.length} photos (.zip)`}</button>
+          </section>
+        </aside>
+      </div>
     </main>
   );
+}
+
+function FrameCard({ frameKey, enabled, toggle }: { frameKey: string; enabled: boolean; toggle: (key: string) => void }) {
+  const frame = TEMPLATES[frameKey];
+  return <label className={styles.frameCard} data-enabled={enabled}>
+    <input type="checkbox" checked={enabled} onChange={() => toggle(frameKey)} />
+    <FramePreview frame={frame} />
+    <span className={styles.frameMeta}><strong>{frame.label}</strong><small>{frame.shots} shot{frame.shots === 1 ? "" : "s"} / {frame.canvas.w}×{frame.canvas.h}</small></span>
+    <span className={styles.frameCheck}>{enabled ? "ON" : "OFF"}</span>
+  </label>;
+}
+
+function LinkCard({ label, url, qr, copied, copy }: { label: string; url: string; qr: string; copied: boolean; copy: () => void }) {
+  return <section className={styles.linkCard}>
+    <div><span>Event route</span><h2>{label}</h2><code>{url || "Building URL…"}</code><div className={styles.linkActions}><a href={url}>Open ↗</a><button onClick={copy}>{copied ? "Copied ✓" : "Copy URL"}</button></div></div>
+    {qr && <img src={qr} alt={`QR code for ${label}`} />}
+  </section>;
 }

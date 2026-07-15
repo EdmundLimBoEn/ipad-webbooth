@@ -1,0 +1,43 @@
+.home {
+  --ink: #10100f;
+  --paper: #f4f0e6;
+  --pink: #ff3d8d;
+  min-height: 100dvh;
+  color: var(--ink);
+  background:
+    linear-gradient(90deg, transparent 49.8%, rgba(16, 16, 15, .09) 50%, transparent 50.2%),
+    var(--paper);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 31vw);
+  padding: clamp(28px, 5vw, 78px);
+  gap: clamp(40px, 8vw, 130px);
+}
+
+.hero { align-self: center; max-width: 850px; }
+.eyebrow { font: 700 12px/1 ui-monospace, monospace; letter-spacing: .15em; text-transform: uppercase; margin-bottom: 26px; }
+.hero h1 { font: 900 clamp(64px, 10vw, 148px)/.78 Impact, "Arial Narrow", sans-serif; letter-spacing: -.055em; text-transform: uppercase; }
+.intro { max-width: 610px; margin: 30px 0 38px; font-size: clamp(17px, 1.8vw, 23px); line-height: 1.35; }
+.launcher { border-top: 5px solid var(--ink); padding-top: 18px; max-width: 720px; }
+.launcher > label { display: block; font: 800 13px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .09em; margin-bottom: 10px; }
+.inputRow { display: flex; align-items: center; border: 2px solid var(--ink); background: #fff; }
+.inputRow span { padding: 0 0 0 16px; font: 800 22px/1 ui-monospace, monospace; color: var(--pink); }
+.inputRow input { min-width: 0; width: 100%; border: 0; outline: 0; padding: 15px 14px 14px 4px; background: transparent; color: var(--ink); font: 700 clamp(17px, 2vw, 22px)/1 ui-monospace, monospace; }
+.inputRow:focus-within { box-shadow: 5px 5px 0 var(--pink); }
+.canonical { min-height: 34px; padding-top: 10px; color: #57564f; font: 12px/1.4 ui-monospace, monospace; overflow-wrap: anywhere; }
+.canonical strong { color: var(--ink); }
+.launchActions { display: flex; flex-wrap: wrap; gap: 8px; }
+.launchActions button { border: 2px solid var(--ink); padding: 12px 17px; color: var(--ink); background: transparent; font: 800 13px/1 system-ui, sans-serif; cursor: pointer; }
+.launchActions button:hover:not(:disabled), .launchActions button:focus-visible { background: var(--ink); color: var(--paper); }
+.launchActions button:focus-visible { outline: 3px solid var(--pink); outline-offset: 3px; }
+.launchActions button:disabled { opacity: .3; cursor: not-allowed; }
+.launchActions .primary { background: var(--pink); min-width: 180px; display: flex; justify-content: space-between; }
+.note { align-self: end; border-top: 2px solid var(--ink); padding-top: 4px; font: 12px/1.4 ui-monospace, monospace; }
+.note ol { list-style: none; }.note li { display: grid; grid-template-columns: 34px 1fr; gap: 8px; padding: 11px 0; border-bottom: 1px solid rgba(16,16,15,.25); }.note span { color: var(--pink); font-weight: 800; }.note strong { display: block; color: var(--ink); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 2px; }
+
+@media (max-width: 720px) {
+  .home { grid-template-columns: 1fr; background: var(--paper); padding: 24px 18px 36px; }
+  .hero { align-self: start; padding-top: 8vh; }
+  .hero h1 { font-size: clamp(58px, 19vw, 92px); }
+  .note { margin-top: 20px; }
+  .launchActions button { flex: 1 1 auto; }
+}

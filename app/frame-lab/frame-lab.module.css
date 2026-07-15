@@ -1,0 +1,54 @@
+.lab { min-height: 100vh; overflow: auto; background: #e9edf0; color: #19232c; font-family: Arial, sans-serif; padding: 28px; }
+.header { max-width: 1560px; margin: 0 auto 22px; display: flex; align-items: flex-end; justify-content: space-between; gap: 32px; }
+.header h1 { font: 600 clamp(30px, 4vw, 54px)/.95 Georgia, serif; letter-spacing: -.04em; }
+.header p { max-width: 440px; color: #586570; line-height: 1.5; }
+.kicker { display: block; color: #ae5b17; font: 700 11px/1.5 ui-monospace, monospace; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 6px; }
+.workspace { max-width: 1560px; margin: auto; display: grid; grid-template-columns: 320px minmax(360px, 1fr) 360px; min-height: 700px; background: #f8fafb; border: 1px solid #c7d0d6; box-shadow: 0 22px 60px #53616c29; }
+.controls, .output { padding: 22px; min-width: 0; }
+.controls { border-right: 1px solid #cbd3d8; }
+.output { border-left: 1px solid #cbd3d8; display: flex; flex-direction: column; gap: 16px; background: #f1f4f6; }
+.field { display: grid; gap: 6px; margin-bottom: 16px; color: #596670; font-size: 12px; font-weight: 700; }
+.field select, .slotCard input, .slotCard select { width: 100%; border: 1px solid #b9c4cb; border-radius: 3px; background: white; color: #19232c; padding: 9px; font: 13px ui-monospace, monospace; }
+.artRow { display: grid; grid-template-columns: 1fr 90px; gap: 8px; align-items: end; }
+.fileButton { position: relative; overflow: hidden; display: grid; place-items: center; height: 35px; margin-bottom: 16px; border: 1px solid #9b5b20; color: #8c4a11; border-radius: 3px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.fileButton input { position: absolute; opacity: 0; inset: 0; cursor: pointer; }
+.canvasReadout { display: flex; justify-content: space-between; border-top: 1px solid #d0d7dc; border-bottom: 1px solid #d0d7dc; padding: 12px 0; font: 12px ui-monospace, monospace; }
+.slotHeading { display: flex; align-items: center; justify-content: space-between; margin: 20px 0 10px; }
+.slotHeading h2, .output h2 { font: 600 21px Georgia, serif; }
+.slotHeading button, .remove { border: 0; background: none; color: #9a4e0d; font-weight: 700; cursor: pointer; }
+.slotList { display: grid; gap: 10px; max-height: 470px; overflow: auto; padding-right: 3px; }
+.slotCard { border: 1px solid #cbd3d8; padding: 12px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 9px; }
+.slotCard legend { padding: 0 5px; color: #934b0e; font: 700 11px ui-monospace, monospace; }
+.slotCard label { font: 700 10px ui-monospace, monospace; color: #65717a; }
+.slotCard input, .slotCard select { margin-top: 3px; padding: 6px; }
+.remove { text-align: left; align-self: end; padding: 7px 0; }
+.remove:disabled { color: #aeb6bc; cursor: default; }
+.previewColumn { min-width: 0; display: flex; flex-direction: column; background: #303942; }
+.previewBar { height: 48px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; color: #dce3e7; font: 11px ui-monospace, monospace; }
+.previewBar span:last-child { color: #9daab3; }
+.stageShell { flex: 1; min-height: 0; display: grid; place-items: center; padding: 26px; background-image: linear-gradient(45deg,#343e47 25%,transparent 25%),linear-gradient(-45deg,#343e47 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#343e47 75%),linear-gradient(-45deg,transparent 75%,#343e47 75%); background-size: 24px 24px; background-position: 0 0,0 12px,12px -12px,-12px 0; }
+.stage { position: relative; max-height: 650px; max-width: 100%; height: 100%; box-shadow: 0 12px 35px #10141880; touch-action: none; }
+.stage canvas { width: 100%; height: 100%; display: block; }
+.slotBox { position: absolute; border: 2px solid #ffad31; box-shadow: inset 0 0 0 1px #101820aa, 0 0 0 1px #fff7; cursor: move; }
+.slotBox span { position: absolute; top: -1px; left: -1px; background: #ffad31; color: #172029; min-width: 22px; padding: 3px; text-align: center; font: 800 11px ui-monospace, monospace; }
+.slotBox button { position: absolute; right: -7px; bottom: -7px; width: 15px; height: 15px; padding: 0; border: 2px solid #172029; background: #ffad31; cursor: nwse-resize; }
+.output pre { flex: 1; overflow: auto; white-space: pre-wrap; background: #172129; color: #dce6eb; padding: 16px; border-radius: 3px; font: 11px/1.55 ui-monospace, monospace; }
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.actions button { border: 1px solid #8c4d17; background: #a95a18; color: white; padding: 11px; border-radius: 3px; font-weight: 700; cursor: pointer; }
+.actions button + button { background: transparent; color: #8c4d17; }
+.field select:focus-visible,
+.slotCard input:focus-visible,
+.slotCard select:focus-visible,
+.fileButton:has(input:focus-visible),
+.slotHeading button:focus-visible,
+.remove:focus-visible,
+.slotBox button:focus-visible,
+.actions button:focus-visible {
+  outline: 3px solid #ffad31;
+  outline-offset: 2px;
+}
+.output p { color: #64717a; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.output code { font-family: ui-monospace, monospace; color: #914b10; }
+@media (max-width: 1100px) { .workspace { grid-template-columns: 280px 1fr; } .output { grid-column: 1 / -1; border-left: 0; border-top: 1px solid #cbd3d8; min-height: 460px; } }
+@media (max-width: 700px) { .lab { padding: 16px; } .header { display: block; } .header p { margin-top: 12px; } .workspace { display: block; } .controls { border-right: 0; } .previewColumn { height: 650px; } .previewBar span:last-child { display: none; } }
+@media (prefers-reduced-motion: reduce) { .lab * { scroll-behavior: auto !important; } }

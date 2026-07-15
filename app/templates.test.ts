@@ -21,6 +21,25 @@ test("every grouped template's group exists in GROUPS", () => {
   }
 });
 
+test("manifest catalog preserves the public runtime contract", () => {
+  expect(Object.keys(TEMPLATES)).toEqual([
+    "square",
+    "lighthouse",
+    "beaconSquare",
+    "beacon",
+    "birthday",
+    "sheep",
+    "starry",
+  ]);
+  expect(TEMPLATES.lighthouse.bgImage).toBe(
+    "/templates/talent-beacon-9-anniversary/lighthouse.png",
+  );
+  expect(TEMPLATES.lighthouse.overlay).toBe(
+    "/templates/talent-beacon-9-anniversary/lighthouse-overlay.png",
+  );
+  expect(TEMPLATES.square.group).toBeUndefined();
+});
+
 test("square into square = full image", () => {
   const r = coverRect(1000, 1000, 500, 500);
   expect(r).toEqual({ sx: 0, sy: 0, sw: 1000, sh: 1000 });

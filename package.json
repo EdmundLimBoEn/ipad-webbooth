@@ -6,8 +6,17 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit --incremental false",
+    "typecheck:tests": "tsc -p tsconfig.test.json",
+    "validate:frames": "bun scripts/frame-packs.ts validate",
+    "scaffold:frames": "bun scripts/frame-packs.ts scaffold",
+    "reconcile:backup": "bun scripts/reconcile-vercel-backup.ts",
+    "migrate:vercel": "bun scripts/migrate-to-r2.ts",
     "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
-    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy"
+    "deploy": "node -e \"console.error('Choose bun run deploy:staging or bun run deploy:production'); process.exit(1)\"",
+    "deploy:staging": "opennextjs-cloudflare build && OPEN_NEXT_DEPLOY=true wrangler deploy --env staging",
+    "deploy:production": "opennextjs-cloudflare build && OPEN_NEXT_DEPLOY=true wrangler deploy --env production"
   },
   "dependencies": {
     "@opennextjs/cloudflare": "^1.20.1",
@@ -18,6 +27,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260705.1",
+    "@types/bun": "^1.2.19",
     "@types/node": "^22",
     "@types/qrcode": "^1.5.6",
     "@types/react": "^19",

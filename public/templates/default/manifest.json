@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "pack": { "key": "default", "label": "Default frames" },
+  "templates": {
+    "square": {
+      "label": "Square",
+      "shots": 1,
+      "intervalMs": 3000,
+      "canvas": { "w": 1080, "h": 1080 },
+      "fit": "cover",
+      "background": "#ffd9e8",
+      "slots": [{ "x": 70, "y": 70, "w": 940, "h": 940 }]
+    }
+  }
+}

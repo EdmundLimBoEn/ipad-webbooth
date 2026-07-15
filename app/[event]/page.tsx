@@ -4,15 +4,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import styles from "./booth.module.css";
 import { TEMPLATES, availableTemplates, composite } from "../templates";
+import { createOutboxStore } from "./booth-session/outbox";
+import { BoothSession, runCaptureSequence, type UploadState } from "./booth-session/session";
 
-type Status = "starting" | "picking" | "ready" | "denied" | "running" | "uploading";
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+type Status = "starting" | "picking" | "ready" | "denied" | "running";
 
 export default function Booth() {
   const { event } = useParams<{ event: string }>();
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const sessionRef = useRef<BoothSession | null>(null);
+  const captureRef = useRef<AbortController | null>(null);
   const unmountedRef = useRef(false);
   const [status, setStatus] = useState<Status>("starting");
   const [mode, setMode] = useState<keyof typeof TEMPLATES | null>(null);
@@ -21,9 +23,12 @@ export default function Booth() {
   const [flash, setFlash] = useState(false);
   const [lastUrl, setLastUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // a composited photo whose upload failed — kept so the guest can retry
-  // instead of silently losing their shots to flaky venue Wi-Fi
-  const [pending, setPending] = useState<Blob | null>(null);
+  const [uploadState, setUploadState] = useState<UploadState>({
+    status: "idle",
+    pendingCount: 0,
+    error: null,
+    durable: true,
+  });
   // per-event frame allowlist from /api/config; null (no config / not loaded
   // yet / fetch failed) degrades to defaults-only, never to all frames
   const [enabled, setEnabled] = useState<string[] | null>(null);
@@ -83,6 +88,7 @@ export default function Booth() {
     startCamera();
     return () => {
       unmountedRef.current = true;
+      captureRef.current?.abort();
       streamRef.current?.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     };
@@ -101,72 +107,79 @@ export default function Booth() {
     return c;
   }, []);
 
-  const upload = useCallback(
+  const uploadOne = useCallback(
     async (blob: Blob) => {
-      setStatus("uploading");
-      try {
-        const res = await fetch(`/api/upload?event=${encodeURIComponent(event)}`, {
-          method: "POST",
-          headers: { "x-booth-key": keyRef.current, "content-type": "image/jpeg" },
-          body: blob,
-        });
-        if (res.status === 401) {
-          // wrong key: forget it so Retry re-prompts instead of looping
-          localStorage.removeItem(storageKey);
-          keyRef.current = "";
-          throw new Error("Wrong booth key — tap Retry upload to re-enter it");
-        }
-        if (!res.ok) throw new Error(`Upload failed (${res.status}) — tap Retry upload`);
-        const { url } = await res.json();
-        setLastUrl(url);
-        setPending(null);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-        setPending(blob); // keep the photo; don't lose the guest's shots
-      } finally {
-        // every photo returns to the frame picker — each guest picks manually,
-        // the previous guest's mode never carries over. (Camera-denied fallback
-        // returns to its own screen instead.)
-        setMode(null);
-        setStatus(streamRef.current ? "picking" : "denied");
+      const res = await fetch(`/api/upload?event=${encodeURIComponent(event)}`, {
+        method: "POST",
+        headers: { "x-booth-key": keyRef.current, "content-type": "image/jpeg" },
+        body: blob,
+      });
+      if (res.status === 401) {
+        localStorage.removeItem(storageKey);
+        keyRef.current = "";
+        throw new Error("Wrong booth key — tap Retry to re-enter it");
       }
+      if (!res.ok) throw new Error(`Upload failed (${res.status}) — tap Retry`);
+      return res.json() as Promise<{ url: string }>;
     },
     [event, storageKey]
   );
 
+  useEffect(() => {
+    const session = new BoothSession(
+      event,
+      createOutboxStore(),
+      uploadOne,
+      ({ url }) => setLastUrl(url)
+    );
+    sessionRef.current = session;
+    const unsubscribe = session.subscribe(setUploadState);
+    void session.recover().then(() => session.process());
+    return () => {
+      unsubscribe();
+      if (sessionRef.current === session) sessionRef.current = null;
+    };
+  }, [event, uploadOne]);
+
   const retryUpload = useCallback(() => {
-    if (!pending) return;
+    if (!uploadState.pendingCount) return;
     if (!keyRef.current) promptKey();
-    upload(pending);
-  }, [pending, promptKey, upload]);
+    void sessionRef.current?.retry();
+  }, [uploadState.pendingCount, promptKey]);
 
   // take the whole sequence for the chosen mode, composite, upload
   const run = useCallback(async () => {
     if (status !== "ready" || !mode) return;
     const t = TEMPLATES[mode];
     setStatus("running");
+    const controller = new AbortController();
+    captureRef.current = controller;
     try {
-      const frames: HTMLCanvasElement[] = [];
-      for (let i = 0; i < t.shots; i++) {
-        setShot(t.shots > 1 ? i + 1 : 0);
-        for (let n = Math.round(t.intervalMs / 1000); n >= 1; n--) {
-          setCount(n);
-          await sleep(1000);
-        }
-        setCount(0);
-        setFlash(true);
-        frames.push(grabFrame());
-        await sleep(300);
-        setFlash(false);
-        if (i < t.shots - 1) await sleep(400); // brief pause between shots
-      }
-      setShot(0);
-      const blob = await composite(
-        frames,
-        frames.map((f) => ({ w: f.width, h: f.height })),
-        t
+      const session = sessionRef.current;
+      if (!session) throw new Error("Photo queue is still starting — please try again");
+      await session.enqueueCapture(
+        async (signal) => {
+          const frames = await runCaptureSequence({
+            shots: t.shots,
+            intervalMs: t.intervalMs,
+            signal,
+            captureFrame: grabFrame,
+            onCountdown: (nextCount, nextShot) => {
+              setCount(nextCount);
+              setShot(nextShot);
+            },
+            onFlash: setFlash,
+          });
+          return composite(frames, frames.map((f) => ({ w: f.width, h: f.height })), t);
+        },
+        controller.signal
       );
-      await upload(blob);
+      // Durable handoff is complete. Return to the picker before uploading so
+      // the next guest is never trapped on the previous guest's frame.
+      setError(null);
+      setMode(null);
+      setStatus("picking");
+      void session.process();
     } catch (e) {
       // composite (frame art fetch, toBlob) failed — surface it and recover
       // instead of leaving the booth stuck in "running" until a reload
@@ -176,8 +189,10 @@ export default function Booth() {
       setFlash(false);
       setMode(null);
       setStatus(streamRef.current ? "picking" : "denied");
+    } finally {
+      if (captureRef.current === controller) captureRef.current = null;
     }
-  }, [status, mode, grabFrame, upload]);
+  }, [status, mode, grabFrame]);
 
   // fallback: native file input (camera) when getUserMedia is blocked.
   // Re-encode to a real JPEG first — iPhones hand back HEIC, and the stored
@@ -188,22 +203,32 @@ export default function Booth() {
       const file = e.target.files?.[0];
       e.target.value = "";
       if (!file) return;
-      let blob: Blob = file;
       try {
-        const bmp = await createImageBitmap(file);
-        const c = document.createElement("canvas");
-        c.width = bmp.width;
-        c.height = bmp.height;
-        c.getContext("2d")!.drawImage(bmp, 0, 0);
-        blob = await new Promise<Blob>((res, rej) =>
-          c.toBlob((b) => (b ? res(b) : rej(new Error("re-encode failed"))), "image/jpeg", 0.9)
-        );
-      } catch {
-        // undecodable file: send as-is and let the server's signature check decide
+        const session = sessionRef.current;
+        if (!session) throw new Error("Photo queue is still starting — please try again");
+        await session.enqueueCapture(async () => {
+          let blob: Blob = file;
+          try {
+            const bmp = await createImageBitmap(file);
+            const c = document.createElement("canvas");
+            c.width = bmp.width;
+            c.height = bmp.height;
+            c.getContext("2d")!.drawImage(bmp, 0, 0);
+            blob = await new Promise<Blob>((res, rej) =>
+              c.toBlob((b) => (b ? res(b) : rej(new Error("re-encode failed"))), "image/jpeg", 0.9)
+            );
+          } catch {
+            // Undecodable file: preserve it; the server signature check decides.
+          }
+          return blob;
+        });
+        setError(null);
+        void session.process();
+      } catch (uploadError) {
+        setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
       }
-      await upload(blob);
     },
-    [upload]
+    []
   );
 
   const pick = (m: keyof typeof TEMPLATES) => {
@@ -279,7 +304,7 @@ export default function Booth() {
         </div>
       )}
 
-      {(status === "ready" || status === "running" || status === "uploading") && (
+      {(status === "ready" || status === "running") && (
         <div className={styles.bottom}>
           {lastUrl && (
             // eslint-disable-next-line @next/next/no-img-element
@@ -291,7 +316,7 @@ export default function Booth() {
             disabled={status !== "ready"}
             aria-label="Start"
           >
-            {status === "uploading" ? "…" : status === "running" ? "" : mode && TEMPLATES[mode].shots > 1 ? "▶" : ""}
+            {status === "running" ? "" : mode && TEMPLATES[mode].shots > 1 ? "▶" : ""}
           </button>
           <button className={styles.change} onClick={() => setStatus("picking")} disabled={status !== "ready"}>
             {mode && TEMPLATES[mode].label} · change
@@ -302,12 +327,28 @@ export default function Booth() {
         </div>
       )}
 
-      {pending && status !== "uploading" && status !== "running" && (
-        <button className={styles.retry} onClick={retryUpload}>
-          ⟳ Retry upload
+      {uploadState.pendingCount > 0 && status !== "running" && (
+        <button
+          className={styles.retry}
+          onClick={retryUpload}
+          disabled={uploadState.status === "uploading"}
+          aria-live="polite"
+        >
+          {uploadState.status === "uploading"
+            ? `Uploading ${uploadState.pendingCount}…`
+            : `⟳ Retry ${uploadState.pendingCount} pending`}
         </button>
       )}
-      {error && <div className={styles.error} onClick={() => setError(null)}>{error}</div>}
+      {(error || uploadState.error) && (
+        <div className={styles.error} onClick={() => setError(null)}>
+          {error || uploadState.error}
+        </div>
+      )}
+      {!uploadState.durable && (
+        <div className={styles.storageWarning} role="status">
+          Offline photo storage is unavailable. Pending photos may be lost if this page reloads.
+        </div>
+      )}
     </main>
   );
 }

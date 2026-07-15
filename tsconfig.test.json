@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": false,
+    "types": ["bun"],
+    "plugins": []
+  },
+  "include": [
+    "next-env.d.ts",
+    "cloudflare-env.d.ts",
+    "app/**/*.test.ts",
+    "scripts/**/*.test.ts"
+  ],
+  "exclude": ["node_modules"]
+}

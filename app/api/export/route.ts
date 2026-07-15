@@ -1,6 +1,7 @@
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { NextRequest, NextResponse } from "next/server";
-import { adminOk, safeEvent } from "@/app/upload-auth";
+import { canonicalEvent, EventStore, InvalidEventSlugError } from "@/app/event-store";
+import { adminOk } from "@/app/upload-auth";
 import { localPart, centralPart, endPart } from "@/app/zip";
 
 export const dynamic = "force-dynamic";
@@ -16,15 +17,17 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const event = safeEvent(req.nextUrl.searchParams.get("event"));
+  let event: string;
+  try {
+    event = canonicalEvent(req.nextUrl.searchParams.get("event"));
+  } catch (error) {
+    if (error instanceof InvalidEventSlugError) return NextResponse.json({ error: error.message }, { status: 400 });
+    throw error;
+  }
+  const store = EventStore.fromEnv(env);
 
   const objects: { key: string; size: number }[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await env.PHOTOS.list({ prefix: `${event}/`, cursor });
-    objects.push(...page.objects);
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
+  for await (const object of store.iteratePhotoObjects(event)) objects.push(object);
 
   // STORE zip has no ZIP64 — reject past its hard limits instead of silently
   // emitting a corrupt archive.
@@ -44,7 +47,7 @@ export async function GET(req: NextRequest) {
     async pull(controller) {
       while (i < objects.length) {
         const { key } = objects[i++];
-        const obj = await env.PHOTOS.get(key);
+        const obj = await store.getPhoto(key);
         if (!obj) continue; // deleted mid-export; skip it
         const data = new Uint8Array(await obj.arrayBuffer());
         const name = te.encode(key.split("/").pop() ?? key);

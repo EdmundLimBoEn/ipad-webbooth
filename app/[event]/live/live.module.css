@@ -4,15 +4,42 @@
   padding: 14px;
 }
 
-.empty {
+.feedStatus {
   position: fixed;
   inset: 0;
   display: flex;
+  flex-direction: column;
+  gap: 10px;
   align-items: center;
   justify-content: center;
-  color: #888;
-  font-size: 20px;
+  padding: 28px;
+  color: #c7c7c7;
+  background: #050505;
+  text-align: center;
+  z-index: 2;
 }
+
+.feedStatus strong { color: #fff; font-size: clamp(24px, 4vw, 48px); }
+.feedStatus p { font-size: 16px; }
+.feedStatus button, .feedToast button { border: 1px solid #777; border-radius: 999px; padding: 10px 15px; color: #fff; background: transparent; cursor: pointer; }
+.feedToast {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  z-index: 6;
+  width: min(440px, calc(100vw - 28px));
+  padding: 12px 14px;
+  border: 1px solid #6f2944;
+  border-radius: 12px;
+  color: #fff;
+  background: rgba(30, 8, 17, .94);
+  box-shadow: 0 8px 30px rgba(0,0,0,.5);
+  transform: translateX(-50%);
+  text-align: center;
+}
+.feedToast p { color: #d4b7c2; margin: 4px 0 9px; font-size: 13px; }
+.pulse { width: 12px; height: 12px; border-radius: 50%; background: #ff2d8b; animation: pulse 1s ease-in-out infinite alternate; }
+@keyframes pulse { to { opacity: .25; transform: scale(.7); } }
 
 /* masonry so full-height strips and squares sit together, uncropped;
    columns are JS-balanced by photo height, and each column loops
@@ -52,6 +79,7 @@
   background: #111;
   animation: pop 400ms ease-out;
 }
+.tile:focus-visible { outline: 4px solid #ff2d8b; outline-offset: -4px; }
 
 @keyframes pop {
   from { opacity: 0; transform: scale(0.9); }
@@ -123,4 +151,9 @@
   font-size: 15px;
   text-align: center;
   max-width: 80vw;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tile, .pulse { animation: none; }
+  .colInner { will-change: auto; }
 }

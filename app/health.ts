@@ -1,3 +1,5 @@
+import { EventStore, HEALTH_CANARY_KEY } from "./event-store";
+
 // Cron health check → statuspage.io components, via the REST API
 // (PATCH /v1/pages/{page}/components/{component}). Email automation was the
 // first design but sending email from a Worker needs the paid plan; the API
@@ -21,10 +23,6 @@ const STATUSPAGE_STATUS: Record<Status, string> = {
 const DAILY_REQ_LIMIT = 100_000;
 const HEADROOM_RATIO = 0.8;
 
-// `_health/` can't collide with a photo prefix for the same reason `_config/`
-// can't: safeEvent() never emits an underscore.
-export const STATE_KEY = "_health/state.json";
-
 // Pure transition rule: report only when the status changes. Missing state
 // (first run, or R2 unreadable) is treated as "up" so a healthy steady state
 // never reports.
@@ -34,6 +32,8 @@ export function decide(
 ): { report: Status | null; next: Status } {
   return { report: next === (prev ?? "up") ? null : next, next };
 }
+
+type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 // Today's (UTC — the free-tier day resets at 00:00 UTC) Workers request count
 // across the account, via the GraphQL analytics API. null = check unavailable
@@ -64,12 +64,25 @@ async function requestsToday(env: CloudflareEnv): Promise<number | null> {
   }
 }
 
-async function probes(env: CloudflareEnv): Promise<Record<Component, { status: Status; detail: string }>> {
+export async function probes(
+  env: CloudflareEnv,
+  fetcher: Fetcher = fetch
+): Promise<Record<Component, { status: Status; detail: string }>> {
+  const store = EventStore.fromEnv(env);
+  const probeId = crypto.randomUUID();
+  const canary = `webbooth-health:${probeId}`;
+  // A unique key prevents an operator readiness check and the scheduled probe
+  // from overwriting or deleting one another when they overlap.
+  const canaryKey = `${HEALTH_CANARY_KEY}/${probeId}.txt`;
   let upload: { status: Status; detail: string } = { status: "up", detail: "ok" };
   try {
-    await env.PHOTOS.list({ limit: 1 });
+    await store.photos.put(canaryKey, canary, {
+      httpMetadata: { contentType: "text/plain", cacheControl: "no-store" },
+    });
+    const read = await store.photos.get(canaryKey);
+    if (!read || await read.text() !== canary) throw new Error("canary read did not match write");
   } catch (e) {
-    upload = { status: "down", detail: `R2 binding: ${e}` };
+    upload = { status: "down", detail: `R2 canary write/read: ${e}` };
   }
   if (upload.status === "up") {
     // Request-count headroom lands on the Upload component: the daily cap
@@ -80,13 +93,25 @@ async function probes(env: CloudflareEnv): Promise<Record<Component, { status: S
     }
   }
   let live: { status: Status; detail: string } = { status: "up", detail: "ok" };
+  if (upload.status === "down") {
+    live = { status: "down", detail: "public canary unavailable because R2 write/read failed" };
+  } else {
+    try {
+      const url = `${store.publicUrl(canaryKey)}?probe=${encodeURIComponent(canary)}`;
+      const res = await fetcher(url, { headers: { "cache-control": "no-cache" } });
+      const body = await res.text();
+      if (!res.ok || body !== canary) {
+        live = { status: "down", detail: `public canary: HTTP ${res.status}, matching body=${body === canary}` };
+      }
+    } catch (e) {
+      live = { status: "down", detail: `public canary: ${e}` };
+    }
+  }
   try {
-    // Any HTTP response < 500 (even a 404) proves the public endpoint serves.
-    const res = await fetch(env.R2_PUBLIC_BASE);
-    res.body?.cancel();
-    if (res.status >= 500) live = { status: "down", detail: `public bucket: HTTP ${res.status}` };
+    // Delete exactly the canary object, including after a failed read/public probe.
+    await store.photos.delete(canaryKey);
   } catch (e) {
-    live = { status: "down", detail: `public bucket: ${e}` };
+    upload = { status: "down", detail: `R2 canary delete: ${e}` };
   }
   return { upload, live };
 }
@@ -98,14 +123,12 @@ export async function healthCheck(env: CloudflareEnv): Promise<void> {
   };
   if (!env.STATUSPAGE_API_KEY || !env.STATUSPAGE_PAGE_ID || !ids.upload || !ids.live) return; // fail closed, like adminOk
 
+  const store = EventStore.fromEnv(env);
   const health = await probes(env);
 
   let prev: Partial<Record<Component, Status>> = {};
   try {
-    const obj = await env.PHOTOS.get(STATE_KEY);
-    prev = obj ? ((await obj.json<Partial<Record<Component, Status>>>()) ?? {}) : {};
-    // ponytail: if R2 is down we can't read state, so a long R2 outage
-    // re-reports DOWN every tick — harmless, the PATCH is idempotent.
+    prev = (await store.readHealthState<Partial<Record<Component, Status>>>()) ?? {};
   } catch {}
 
   const state: Partial<Record<Component, Status>> = {};
@@ -137,6 +160,6 @@ export async function healthCheck(env: CloudflareEnv): Promise<void> {
       failures.push(`${c}: HTTP ${res.status}`);
     }
   }
-  if (changed) await env.PHOTOS.put(STATE_KEY, JSON.stringify(state)).catch(() => {});
+  if (changed) await store.writeHealthState(state).catch(() => {});
   if (failures.length) throw new Error(`statuspage PATCH failed: ${failures.join(", ")}`);
 }

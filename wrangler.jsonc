@@ -1,36 +1,67 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "ipad-webbooth",
-	// Custom entrypoint wraps the OpenNext-generated worker to add the cron
-	// health check (statuspage.io email automation) — see custom-worker.ts.
+	"name": "ipad-webbooth-local",
 	"main": "custom-worker.ts",
-	"compatibility_date": "2026-07-01",
+	"compatibility_date": "2026-07-15",
 	"compatibility_flags": ["nodejs_compat"],
 	"triggers": { "crons": ["*/5 * * * *"] },
-	// Custom-domain routes (zone is on Cloudflare, so these auto-create DNS).
-	// photobooth-cf.* is staging, photobooth.* is production.
-	"routes": [
-		{ "pattern": "photobooth-cf.edmundlim.systems", "custom_domain": true },
-		{ "pattern": "photobooth.edmundlim.systems", "custom_domain": true }
-	],
 	"assets": {
 		"directory": ".open-next/assets",
 		"binding": "ASSETS"
 	},
-	// Photo storage. Bucket must exist (`wrangler r2 bucket create photobooth`)
-	// before deploying; build works fine without it.
 	"r2_buckets": [
-		{
-			"binding": "PHOTOS",
-			"bucket_name": "photobooth"
-		}
+		{ "binding": "PHOTOS", "bucket_name": "photobooth-dev" },
+		{ "binding": "STATE", "bucket_name": "photobooth-state-dev" }
 	],
 	"vars": {
-		// Public base URL for the R2 bucket — a custom domain bound to the bucket
-		// (the r2.dev subdomain still works but is rate-limited; kept as fallback).
-		"R2_PUBLIC_BASE": "https://bucket.photobooth.edmundlim.systems",
-		// Account id for the health cron's analytics query (not a secret — the
-		// token is; see CF_ANALYTICS_TOKEN in cloudflare-env.d.ts).
+		"R2_PUBLIC_BASE": "http://localhost:8787/__photos",
 		"CF_ACCOUNT_ID": "2132f9cf03d557cc3be87ca4208e683d"
+	},
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1,
+		"logs": { "enabled": true, "head_sampling_rate": 1, "invocation_logs": true }
+	},
+	"env": {
+		"staging": {
+			"name": "ipad-webbooth-staging",
+			"workers_dev": false,
+			"routes": [
+				{ "pattern": "photobooth-cf.edmundlim.systems", "custom_domain": true }
+			],
+			"r2_buckets": [
+				{ "binding": "PHOTOS", "bucket_name": "photobooth-staging" },
+				{ "binding": "STATE", "bucket_name": "photobooth-state-staging" }
+			],
+			"vars": {
+				"R2_PUBLIC_BASE": "https://bucket-cf.photobooth.edmundlim.systems",
+				"CF_ACCOUNT_ID": "2132f9cf03d557cc3be87ca4208e683d"
+			},
+			"observability": {
+				"enabled": true,
+				"head_sampling_rate": 1,
+				"logs": { "enabled": true, "head_sampling_rate": 1, "invocation_logs": true }
+			}
+		},
+		"production": {
+			"name": "ipad-webbooth",
+			"workers_dev": false,
+			"routes": [
+				{ "pattern": "photobooth.edmundlim.systems", "custom_domain": true }
+			],
+			"r2_buckets": [
+				{ "binding": "PHOTOS", "bucket_name": "photobooth" },
+				{ "binding": "STATE", "bucket_name": "photobooth-state" }
+			],
+			"vars": {
+				"R2_PUBLIC_BASE": "https://bucket.photobooth.edmundlim.systems",
+				"CF_ACCOUNT_ID": "2132f9cf03d557cc3be87ca4208e683d"
+			},
+			"observability": {
+				"enabled": true,
+				"head_sampling_rate": 1,
+				"logs": { "enabled": true, "head_sampling_rate": 1, "invocation_logs": true }
+			}
+		}
 	}
 }

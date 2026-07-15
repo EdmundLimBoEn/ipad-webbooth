@@ -1,17 +1,18 @@
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { NextRequest, NextResponse } from "next/server";
-import { adminOk, boothKeyMatches, safeEvent, readEventConfig, isImage, MAX_UPLOAD_BYTES } from "@/app/upload-auth";
-
-// 8 hex chars of randomness — replicates @vercel/blob's addRandomSuffix so
-// keys stay unguessable/collision-free without a real filename generator.
-function randomSuffix(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(4));
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
+import { canonicalEvent, EventStore, InvalidEventSlugError } from "@/app/event-store";
+import { adminOk, boothKeyMatches, isImage, MAX_UPLOAD_BYTES } from "@/app/upload-auth";
 
 export async function POST(req: NextRequest) {
   const { env } = getCloudflareContext();
-  const event = safeEvent(req.nextUrl.searchParams.get("event"));
+  let event: string;
+  try {
+    event = canonicalEvent(req.nextUrl.searchParams.get("event"));
+  } catch (error) {
+    if (error instanceof InvalidEventSlugError) return NextResponse.json({ error: error.message }, { status: 400 });
+    throw error;
+  }
+  const store = EventStore.fromEnv(env);
   const provided = req.headers.get("x-booth-key") ?? "";
 
   // Two accepted keys: the admin key (BOOTH_UPLOAD_KEY), or this event's own
@@ -22,7 +23,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "upload disabled: no key configured" }, { status: 503 });
   }
   if (admin === "unauthorized") {
-    const cfg = await readEventConfig(env.PHOTOS, event);
+    const cfg = await store.readConfig(event);
     const ok = !!cfg?.boothKeyHash && provided !== "" && (await boothKeyMatches(provided, cfg.boothKeyHash));
     if (!ok) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
@@ -43,13 +44,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "not an image" }, { status: 415 });
   }
 
-  // Key format `${event}/${Date.now()}-${suffix}.jpg` — the ms timestamp stays
-  // the leading path segment so the photos route's sort-by-filename (which
-  // reads `pathname.split("/")[1].split("-")[0]`) needs no changes.
-  const key = `${event}/${Date.now()}-${randomSuffix()}.jpg`;
-  await env.PHOTOS.put(key, body, {
-    httpMetadata: { contentType: "image/jpeg" },
-  });
-
-  return NextResponse.json({ url: `${env.R2_PUBLIC_BASE}/${key}` });
+  const photo = await store.putPhoto(event, body);
+  return NextResponse.json({ url: photo.url });
 }

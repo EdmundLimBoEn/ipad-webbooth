@@ -16,6 +16,9 @@ import type { R2Bucket } from "@cloudflare/workers-types";
 declare global {
   interface CloudflareEnv {
     PHOTOS: R2Bucket;
+    // Private state (event config, booth-key hashes, health transitions).
+    // This bucket must not have an r2.dev URL or public custom domain.
+    STATE: R2Bucket;
     R2_PUBLIC_BASE: string;
     BOOTH_UPLOAD_KEY?: string;
     // statuspage.io REST API credentials for the health cron (all Worker

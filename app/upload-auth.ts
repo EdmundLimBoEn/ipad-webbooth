@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import type { R2Bucket } from "@cloudflare/workers-types";
+import { slugifyEvent } from "./event-identity";
 
 // Booth JPEGs are a few hundred KB; this is an explicit belt-and-suspenders cap.
 export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
@@ -23,11 +23,9 @@ export function adminOk(provided: string, adminKey: string | undefined): "ok" | 
   return keyOk(provided, adminKey) ? "ok" : "unauthorized";
 }
 
-// Per-event booth keys are stored in the config object hashed, never
-// plaintext — the whole bucket (including _config/) is publicly readable
-// through R2_PUBLIC_BASE. The hash is therefore public too, so it must be
-// salted + stretched (PBKDF2), not a bare fast hash: a human-chosen key's
-// SHA-256 would be offline-brute-forceable straight from the bucket.
+// Per-event booth keys are stored hashed, never plaintext, in private STATE.
+// Salt + stretch them as defense in depth against a backup/config exposure;
+// a human-chosen key's bare SHA-256 would be offline-brute-forceable.
 // ponytail: 20k iterations ≈ 5ms — sized to the Workers free tier's 10ms CPU
 // cap per request; raise it if the plan ever changes. Real safety comes from
 // using the admin page's Generate button (96-bit random keys).
@@ -59,21 +57,7 @@ export async function boothKeyMatches(key: string, stored: string): Promise<bool
 
 // Slugs an event name to a safe key prefix; anything else -> "event".
 // Shared by every API route (was four hand-synced copies).
-export function safeEvent(raw: string | null): string {
-  const s = (raw ?? "").toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-  return s || "event";
-}
-
-// Per-event config lives at `_config/{event}.json` — safeEvent can never emit
-// an underscore, so this prefix can't collide with any event's photo prefix.
-export type EventConfig = { frames?: string[]; boothKeyHash?: string };
-export const configPath = (event: string) => `_config/${event}.json`;
-
-export async function readEventConfig(bucket: R2Bucket, event: string): Promise<EventConfig | null> {
-  const obj = await bucket.get(configPath(event));
-  if (!obj) return null;
-  return obj.json<EventConfig>().catch(() => null);
-}
+export const safeEvent = slugifyEvent;
 
 // Allowlist the sink to real image signatures so it can't be used to stash
 // arbitrary files. Needs the first ~12 bytes. Covers what a phone camera or the

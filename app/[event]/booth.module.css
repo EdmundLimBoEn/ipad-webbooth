@@ -226,6 +226,10 @@
   cursor: pointer;
   z-index: 5;
 }
+.retry:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
 
 .error {
   position: absolute;
@@ -237,4 +241,18 @@
   border-radius: 12px;
   font-size: 15px;
   max-width: 80vw;
+}
+
+.storageWarning {
+  position: absolute;
+  right: 16px;
+  top: calc(16px + env(safe-area-inset-top, 0px));
+  max-width: min(360px, 70vw);
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(145, 90, 0, 0.95);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 650;
+  z-index: 6;
 }

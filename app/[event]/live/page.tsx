@@ -6,7 +6,7 @@ import QRCode from "qrcode";
 import styles from "./live.module.css";
 import { wrap } from "./wrap";
 
-type Photo = { url: string; uploadedAt: string };
+type Photo = { key: string; url: string; uploadedAt: string };
 
 const SPEED = 40; // px/sec
 const GAP = 12; // must match the CSS gap/padding-bottom on .copy
@@ -15,6 +15,8 @@ const PAD = 14;
 export default function Live() {
   const { event } = useParams<{ event: string }>();
   const [photos, setPhotos] = useState<Photo[]>([]);
+  const [feedState, setFeedState] = useState<"loading" | "ready" | "error">("loading");
+  const [feedError, setFeedError] = useState("");
   const [full, setFull] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
@@ -25,11 +27,20 @@ export default function Live() {
   // QR is generated locally — a third-party QR service going down (or being
   // blocked on venue Wi-Fi) must not break how guests find the gallery
   const [qr, setQr] = useState("");
+  const [reducedMotion, setReducedMotion] = useState(false);
 
   useEffect(() => {
     QRCode.toDataURL(window.location.href, { width: 300, margin: 1 })
       .then(setQr)
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReducedMotion(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
   }, []);
 
   // per-column marquee state: each column loops independently so there are
@@ -40,29 +51,50 @@ export default function Live() {
   const fullRef = useRef(false);
   // cumulative pointer travel of the last drag; >10px suppresses the tile click
   const dragDistRef = useRef(0);
+  const cursorRef = useRef<string | null>(null);
   useEffect(() => {
     fullRef.current = !!full;
   }, [full]);
 
+  const pollPhotos = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const after = cursorRef.current;
+      const query = new URLSearchParams({ event });
+      if (after) query.set("after", after);
+      const res = await fetch(`/api/photos?${query}`, { cache: "no-store", signal });
+      if (!res.ok) throw new Error(`Gallery feed returned ${res.status}`);
+      const data = await res.json();
+      if (!Array.isArray(data.photos)) throw new Error("Gallery feed had an unexpected shape");
+      const incoming = data.photos as Photo[];
+      setPhotos((current) => {
+        if (!after) return incoming;
+        const seen = new Set(incoming.map((photo) => photo.key || photo.url));
+        return [...incoming, ...current.filter((photo) => !seen.has(photo.key || photo.url))];
+      });
+      if (typeof data.cursor === "string" && data.cursor) cursorRef.current = data.cursor;
+      setFeedState("ready");
+      setFeedError("");
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === "AbortError") return;
+      setFeedState("error");
+      setFeedError(cause instanceof Error ? cause.message : "The gallery feed is unavailable");
+    }
+  }, [event]);
+
   useEffect(() => {
     let alive = true;
-    const poll = async () => {
-      try {
-        const res = await fetch(`/api/photos?event=${encodeURIComponent(event)}`, { cache: "no-store" });
-        const { photos } = await res.json();
-        // guard the shape — an error body would white-screen the render loop
-        if (alive && Array.isArray(photos)) setPhotos(photos);
-      } catch {
-        /* keep last good state; try again next tick */
-      }
-    };
-    poll();
-    const id = setInterval(poll, 3000);
+    const controller = new AbortController();
+    cursorRef.current = null;
+    setPhotos([]);
+    setFeedState("loading");
+    void pollPhotos(controller.signal);
+    const id = setInterval(() => { if (alive) void pollPhotos(controller.signal); }, 3000);
     return () => {
       alive = false;
+      controller.abort();
       clearInterval(id);
     };
-  }, [event]);
+  }, [event, pollPhotos]);
 
   useEffect(() => {
     const calc = () => {
@@ -87,7 +119,7 @@ export default function Live() {
     columns[i].push(p);
     heights[i] += (ratios[p.url] ?? 1) * colW + GAP; // assume square until measured
   }
-  const animate = vh > 0 && Math.max(0, ...heights) > vh;
+  const animate = !reducedMotion && vh > 0 && Math.max(0, ...heights) > vh;
 
   // Measure each column's loop period (one copy's height, incl. its trailing
   // padding) after every render, so the wrap always lands on identical pixels.
@@ -252,7 +284,9 @@ export default function Live() {
 
   return (
     <main className={styles.live}>
-      {photos.length === 0 && <p className={styles.empty}>Waiting for the first photo…</p>}
+      {photos.length === 0 && feedState === "loading" && <div className={styles.feedStatus}><span className={styles.pulse} /> <p>Opening the gallery…</p></div>}
+      {photos.length === 0 && feedState === "ready" && <div className={styles.feedStatus}><strong>Ready for the first photo.</strong><p>New photographs will appear here automatically.</p></div>}
+      {feedState === "error" && <div className={photos.length ? styles.feedToast : styles.feedStatus} role="alert"><strong>Gallery connection lost</strong><p>{feedError}</p><button onClick={() => void pollPhotos()}>Try again now</button></div>}
 
       {qr && (
         // eslint-disable-next-line @next/next/no-img-element
@@ -286,9 +320,17 @@ export default function Live() {
                   alt=""
                   loading="lazy"
                   className={styles.tile}
+                  role="button"
+                  tabIndex={prefix === "b" ? -1 : 0}
                   onClick={() => {
                     if (dragDistRef.current > 10) return; // was a drag, not a tap
                     setFull(p.url);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setFull(p.url);
+                    }
                   }}
                   onLoad={(e) => {
                     const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
