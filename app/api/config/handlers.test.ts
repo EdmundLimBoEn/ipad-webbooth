@@ -265,6 +265,23 @@ describe("config handlers", () => {
     expect(malformed.status).toBe(400);
   });
 
+  test("save rejects inherited object names as Frames without writing config", async () => {
+    for (const frame of ["constructor", "toString"]) {
+      const d = deps();
+      const response = await putConfig(
+        adminRequest(
+          "/api/config?event=launch",
+          "PUT",
+          saveBody({ frames: [frame] })
+        ),
+        d.deps
+      );
+
+      expect(response.status).toBe(400);
+      expect(await d.deps.store.readConfig("launch")).toBeNull();
+    }
+  });
+
   test("save maps stale bases and mutation reuse to conflict", async () => {
     const d = deps();
     expect((await putConfig(

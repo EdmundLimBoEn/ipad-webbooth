@@ -99,7 +99,9 @@ function parseSaveBody(value: unknown): SaveBody | null {
   }
   if (
     !Array.isArray(value.frames)
-    || !value.frames.every((frame) => typeof frame === "string" && frame in TEMPLATES)
+    || !value.frames.every((frame) =>
+      typeof frame === "string" && Object.hasOwn(TEMPLATES, frame)
+    )
     || !isRevisionId(value.mutationId)
     || (value.baseRevisionId !== null && !isRevisionId(value.baseRevisionId))
   ) {
