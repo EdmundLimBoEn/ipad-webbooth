@@ -10,6 +10,7 @@ export type ConfigHistoryPanelProps = {
   revisions: readonly ConfigRevision[];
   loading: boolean;
   restoringRevisionId: string | null;
+  mutationBusy: boolean;
   error: string;
   onReload: () => void;
   onRestore: (revisionId: string) => void;
@@ -38,6 +39,7 @@ export function ConfigHistoryPanel({
   revisions,
   loading,
   restoringRevisionId,
+  mutationBusy,
   error,
   onReload,
   onRestore,
@@ -105,14 +107,15 @@ export function ConfigHistoryPanel({
                       <button
                         type="button"
                         onClick={() => {
+                          if (mutationBusy) return;
                           setConfirmRevisionId(null);
                           onRestore(revision.id);
                         }}
-                        disabled={isRestoring}
+                        disabled={mutationBusy}
                       >
                         {isRestoring ? "Restoring…" : "Confirm exact restore"}
                       </button>
-                      <button type="button" onClick={() => setConfirmRevisionId(null)} disabled={isRestoring}>
+                      <button type="button" onClick={() => setConfirmRevisionId(null)}>
                         Keep current
                       </button>
                     </div>
@@ -120,10 +123,13 @@ export function ConfigHistoryPanel({
                     <button
                       type="button"
                       className={styles.restoreButton}
-                      onClick={() => setConfirmRevisionId(revision.id)}
-                      disabled={isCurrent || restoringRevisionId !== null}
+                      onClick={() => {
+                        if (mutationBusy) return;
+                        setConfirmRevisionId(revision.id);
+                      }}
+                      disabled={isCurrent || mutationBusy}
                     >
-                      {isCurrent ? "Current" : "Restore this version"}
+                      {isCurrent ? "Current" : isRestoring ? "Restoring…" : "Restore this version"}
                     </button>
                   )}
                 </div>

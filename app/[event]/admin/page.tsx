@@ -3,10 +3,19 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import QRCode from "qrcode";
-import { GROUPS, TEMPLATES } from "../../templates";
+import { TEMPLATES } from "../../templates";
 import type { ConfigRevision, PublicEventConfig } from "../../event-config";
-import type { Template } from "../../frame-packs/types";
+import {
+  BoothKeyControls,
+  FrameProgrammeControls,
+  SaveConfigurationButton,
+} from "./admin-config-controls";
 import { ConfigHistoryPanel } from "./config-history-panel";
+import {
+  getOrCreateRestoreRequest,
+  shouldClearRestoreRequest,
+  type RestoreRequest,
+} from "./config-mutation";
 import styles from "./admin.module.css";
 
 type Photo = { key: string; url: string; uploadedAt: string };
@@ -20,27 +29,6 @@ type ConfigHistoryResponse = {
 };
 type FilePickerWindow = Window & { showSaveFilePicker?: (options: { suggestedName: string; types: { description: string; accept: Record<string, string[]> }[] }) => Promise<{ createWritable(): Promise<WritableStream<Uint8Array>> }> };
 const CONFIG_CONFLICT_MESSAGE = "Configuration changed; review the latest version before saving.";
-
-function FramePreview({ frame }: { frame: Template }) {
-  return (
-    <span className={styles.framePreview} style={{ aspectRatio: `${frame.canvas.w}/${frame.canvas.h}`, backgroundColor: frame.background || "#d8d5cc" }}>
-      {frame.bgImage && <img src={frame.bgImage} alt="" className={styles.frameLayer} />}
-      {frame.slots.map((slot, index) => (
-        <span
-          key={index}
-          className={styles.photoSlot}
-          style={{
-            left: `${slot.x / frame.canvas.w * 100}%`,
-            top: `${slot.y / frame.canvas.h * 100}%`,
-            width: `${slot.w / frame.canvas.w * 100}%`,
-            height: `${slot.h / frame.canvas.h * 100}%`,
-          }}
-        />
-      ))}
-      {frame.overlay && <img src={frame.overlay} alt="" className={styles.overlayLayer} />}
-    </span>
-  );
-}
 
 export default function Admin() {
   const { event } = useParams<{ event: string }>();
@@ -71,12 +59,14 @@ export default function Admin() {
   const [health, setHealth] = useState<Health | null>(null);
   const [checkingHealth, setCheckingHealth] = useState(false);
   const photoCursor = useRef<string | null>(null);
+  const configMutationBusy = useRef(false);
   const pendingSaveMutationId = useRef<string | null>(null);
-  const pendingRestoreMutationIds = useRef(new Map<string, string>());
+  const pendingRestoreRequests = useRef(new Map<string, RestoreRequest>());
 
   const boothUrl = `${origin}/${event}`;
   const liveUrl = `${boothUrl}/live`;
   const defaults = useMemo(() => Object.keys(TEMPLATES).filter((key) => !TEMPLATES[key].group), []);
+  const configBusy = saving || restoringRevisionId !== null;
   const clearPendingSave = () => {
     pendingSaveMutationId.current = null;
     setError((current) => current === CONFIG_CONFLICT_MESSAGE ? "" : current);
@@ -197,6 +187,7 @@ export default function Admin() {
   };
 
   const toggle = (key: string) => {
+    if (configMutationBusy.current) return;
     clearPendingSave();
     setFrames((current) => {
       const next = new Set(current);
@@ -207,6 +198,7 @@ export default function Admin() {
   };
 
   const setGroup = (group: string, enabled: boolean) => {
+    if (configMutationBusy.current) return;
     clearPendingSave();
     const keys = Object.keys(TEMPLATES).filter((key) => TEMPLATES[key].group === group);
     setFrames((current) => {
@@ -217,11 +209,27 @@ export default function Admin() {
   };
 
   const generateBoothKey = () => {
+    if (configMutationBusy.current) return;
     clearPendingSave();
     const bytes = crypto.getRandomValues(new Uint8Array(12));
     setBoothKey(Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""));
     setBoothKeySaved(false);
     setNotice("New key generated. Copy it now, then save the event.");
+  };
+
+  const changeBoothKey = (value: string) => {
+    if (configMutationBusy.current) return;
+    clearPendingSave();
+    setBoothKey(value);
+    setBoothKeySaved(false);
+  };
+
+  const clearBoothKey = () => {
+    if (configMutationBusy.current) return;
+    clearPendingSave();
+    setBoothKey("");
+    setBoothKeySaved(false);
+    setCopied("");
   };
 
   const copy = async (value: string, label: string) => {
@@ -235,11 +243,12 @@ export default function Admin() {
   };
 
   const save = async () => {
-    if (!configLoaded) return;
+    if (!configLoaded || configMutationBusy.current) return;
     if (boothKey && boothKey.length < 12) {
       setError("Booth keys need at least 12 characters.");
       return;
     }
+    configMutationBusy.current = true;
     setSaving(true); setError(""); setNotice("");
     const mutationId = pendingSaveMutationId.current ?? crypto.randomUUID();
     pendingSaveMutationId.current = mutationId;
@@ -270,14 +279,22 @@ export default function Admin() {
       setNotice(boothKey ? "Event saved. Keep the new booth key somewhere secure." : "Event configuration saved.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Event could not be saved");
-    } finally { setSaving(false); }
+    } finally {
+      configMutationBusy.current = false;
+      setSaving(false);
+    }
   };
 
   const restoreRevision = async (revisionId: string) => {
-    if (!configLoaded) return;
-    const pending = pendingRestoreMutationIds.current;
-    const mutationId = pending.get(revisionId) ?? crypto.randomUUID();
-    pending.set(revisionId, mutationId);
+    if (!configLoaded || configMutationBusy.current) return;
+    configMutationBusy.current = true;
+    const pending = pendingRestoreRequests.current;
+    const request = getOrCreateRestoreRequest(
+      pending,
+      revisionId,
+      currentRevisionId,
+      () => crypto.randomUUID()
+    );
     setRestoringRevisionId(revisionId);
     setError("");
     setNotice("");
@@ -285,13 +302,9 @@ export default function Admin() {
       const response = await fetch(`/api/config/revisions/restore?event=${encodeURIComponent(event)}`, {
         method: "POST",
         headers: { "x-booth-key": adminKey, "content-type": "application/json" },
-        body: JSON.stringify({
-          revisionId,
-          mutationId,
-          baseRevisionId: currentRevisionId,
-        }),
+        body: JSON.stringify(request),
       });
-      if ([400, 401, 404, 409].includes(response.status)) pending.delete(revisionId);
+      if (shouldClearRestoreRequest(response.status)) pending.delete(revisionId);
       if (response.status === 401) { invalidateAuth(); throw new Error("That admin key was rejected."); }
       if (response.status === 409) {
         await loadConfig();
@@ -300,7 +313,6 @@ export default function Admin() {
       }
       if (!response.ok) throw new Error(`Restore failed (${response.status})`);
       const data = await response.json() as PublicEventConfig & { currentRevisionId: string };
-      pending.delete(revisionId);
       pendingSaveMutationId.current = null;
       setFrames(new Set(Array.isArray(data.frames) ? data.frames : defaults));
       setHasBoothKey(Boolean(data.hasBoothKey));
@@ -313,6 +325,7 @@ export default function Admin() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Configuration could not be restored");
     } finally {
+      configMutationBusy.current = false;
       setRestoringRevisionId(null);
     }
   };
@@ -405,20 +418,13 @@ export default function Admin() {
           <section className={styles.section}>
             <div className={styles.sectionHead}><div><span>01</span><h2>Frame programme</h2></div><p>Choose what guests see at the booth. Previews follow the real background → photo → overlay composition.</p></div>
             {configError ? <div className={styles.failure}><strong>Config unavailable</strong><p>{configError}</p><button onClick={() => void loadConfig()}>Retry config</button></div> :
-            <div className={styles.frameGroups}>
-              <div className={styles.frameGroup}>
-                <div className={styles.groupHead}><h3>House frames</h3></div>
-                <div className={styles.filmRail}>{defaults.map((key) => <FrameCard key={key} frameKey={key} enabled={frames.has(key)} toggle={toggle} />)}</div>
-              </div>
-              {Object.entries(GROUPS).map(([group, label]) => {
-                const keys = Object.keys(TEMPLATES).filter((key) => TEMPLATES[key].group === group);
-                const allOn = keys.every((key) => frames.has(key));
-                return <div className={styles.frameGroup} key={group}>
-                  <div className={styles.groupHead}><h3>{label}</h3><button onClick={() => setGroup(group, !allOn)}>{allOn ? "Disable pack" : "Enable pack"}</button></div>
-                  <div className={styles.filmRail}>{keys.map((key) => <FrameCard key={key} frameKey={key} enabled={frames.has(key)} toggle={toggle} />)}</div>
-                </div>;
-              })}
-            </div>}
+            <FrameProgrammeControls
+              frames={frames}
+              defaults={defaults}
+              disabled={configBusy}
+              onToggle={toggle}
+              onSetGroup={setGroup}
+            />}
           </section>
 
           <ConfigHistoryPanel
@@ -427,6 +433,7 @@ export default function Admin() {
             revisions={revisions}
             loading={!configLoaded && !configError}
             restoringRevisionId={restoringRevisionId}
+            mutationBusy={configBusy}
             error={configError}
             onReload={() => void loadConfig()}
             onRestore={(revisionId) => void restoreRevision(revisionId)}
@@ -448,9 +455,17 @@ export default function Admin() {
           <section className={styles.sideCard}>
             <span className={styles.cardNumber}>04</span><h2>Booth credential</h2>
             <p>{hasBoothKey ? "A booth key is installed. Generate a replacement only when rotating iPad access." : "No booth key yet. Generate one before the booth can upload."}</p>
-            <div className={styles.keyRow}><input aria-label="New booth key" value={boothKey} onChange={(e) => { clearPendingSave(); setBoothKey(e.target.value.trim()); setBoothKeySaved(false); }} placeholder={hasBoothKey ? "Unchanged" : "Generate a key"} autoComplete="off" /><button onClick={generateBoothKey}>Generate</button></div>
-            {boothKey && <button className={styles.copyWide} onClick={() => void copy(boothKey, "key")}>{copied === "key" ? "Copied ✓" : "Copy generated key"}</button>}
-            {boothKey && boothKeySaved && <button className={styles.clearKey} onClick={() => { clearPendingSave(); setBoothKey(""); setBoothKeySaved(false); setCopied(""); }}>Stored safely — clear key</button>}
+            <BoothKeyControls
+              value={boothKey}
+              saved={boothKeySaved}
+              copied={copied === "key"}
+              disabled={configBusy}
+              placeholder={hasBoothKey ? "Unchanged" : "Generate a key"}
+              onChange={changeBoothKey}
+              onGenerate={generateBoothKey}
+              onCopy={() => void copy(boothKey, "key")}
+              onClear={clearBoothKey}
+            />
           </section>
 
           <LinkCard label="Booth / iPad" url={boothUrl} qr={boothQr} copied={copied === "booth"} copy={() => void copy(boothUrl, "booth")} />
@@ -458,23 +473,17 @@ export default function Admin() {
 
           <section className={styles.sideCard}>
             <span className={styles.cardNumber}>06</span><h2>Ship the event</h2>
-            <button className={styles.saveButton} onClick={() => void save()} disabled={!configLoaded || saving}>{saving ? "Saving event…" : "Save configuration"}</button>
+            <SaveConfigurationButton
+              disabled={!configLoaded || configBusy}
+              saving={saving}
+              onSave={() => void save()}
+            />
             <button className={styles.exportButton} onClick={() => void exportZip()} disabled={exporting}>{exporting ? "Building archive…" : `Export ${photos.length} photos (.zip)`}</button>
           </section>
         </aside>
       </div>
     </main>
   );
-}
-
-function FrameCard({ frameKey, enabled, toggle }: { frameKey: string; enabled: boolean; toggle: (key: string) => void }) {
-  const frame = TEMPLATES[frameKey];
-  return <label className={styles.frameCard} data-enabled={enabled}>
-    <input type="checkbox" checked={enabled} onChange={() => toggle(frameKey)} />
-    <FramePreview frame={frame} />
-    <span className={styles.frameMeta}><strong>{frame.label}</strong><small>{frame.shots} shot{frame.shots === 1 ? "" : "s"} / {frame.canvas.w}×{frame.canvas.h}</small></span>
-    <span className={styles.frameCheck}>{enabled ? "ON" : "OFF"}</span>
-  </label>;
 }
 
 function LinkCard({ label, url, qr, copied, copy }: { label: string; url: string; qr: string; copied: boolean; copy: () => void }) {
