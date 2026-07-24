@@ -23,9 +23,11 @@ export type CaptureFlowState = {
 };
 
 export type CaptureFlowAction =
+  | { type: "reset" }
   | { type: "select-frame"; frameKey: string }
   | { type: "start-capture"; attemptId: string }
   | { type: "start-fallback-capture"; attemptId: string }
+  | { type: "capture-failed"; attemptId: string; error: string }
   | {
       type: "capture-complete";
       attemptId: string;
@@ -53,6 +55,9 @@ export function reduceCaptureFlow(
   action: CaptureFlowAction
 ): CaptureFlowState {
   switch (action.type) {
+    case "reset":
+      return INITIAL_CAPTURE_FLOW_STATE;
+
     case "select-frame":
       if (state.phase !== "picker") return state;
       return {
@@ -87,6 +92,22 @@ export function reduceCaptureFlow(
         candidate: null,
         autoAcceptPending: false,
         error: null,
+      };
+
+    case "capture-failed":
+      if (
+        state.phase !== "capturing"
+        || state.captureAttemptId !== action.attemptId
+      ) {
+        return state;
+      }
+      return {
+        phase: "ready",
+        frameKey: state.frameKey,
+        captureAttemptId: null,
+        candidate: null,
+        autoAcceptPending: false,
+        error: action.error,
       };
 
     case "capture-complete":

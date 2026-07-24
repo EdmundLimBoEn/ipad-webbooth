@@ -27,6 +27,21 @@ function capturing(
 }
 
 describe("reduceCaptureFlow", () => {
+  test("an Event or pause reset releases every candidate and Frame", () => {
+    const reviewing: CaptureFlowState = {
+      phase: "reviewing",
+      frameKey: "lighthouse",
+      captureAttemptId: null,
+      candidate,
+      autoAcceptPending: true,
+      error: null,
+    };
+
+    expect(reduceCaptureFlow(reviewing, { type: "reset" })).toBe(
+      INITIAL_CAPTURE_FLOW_STATE,
+    );
+  });
+
   test("a fresh Frame choice moves from picker through ready to capturing", () => {
     const ready = reduceCaptureFlow(INITIAL_CAPTURE_FLOW_STATE, {
       type: "select-frame",
@@ -66,6 +81,21 @@ describe("reduceCaptureFlow", () => {
       candidate,
       autoAcceptPending: true,
       error: null,
+    });
+  });
+
+  test("capture failure returns to camera-ready with the same Frame", () => {
+    expect(reduceCaptureFlow(capturing(), {
+      type: "capture-failed",
+      attemptId: "attempt-current",
+      error: "Could not compose photo",
+    })).toEqual({
+      phase: "ready",
+      frameKey: "lighthouse",
+      captureAttemptId: null,
+      candidate: null,
+      autoAcceptPending: false,
+      error: "Could not compose photo",
     });
   });
 

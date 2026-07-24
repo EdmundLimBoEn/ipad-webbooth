@@ -126,6 +126,44 @@ function activeCandidate(
 const photo = (name: string) => new Blob([name], { type: "image/jpeg" });
 
 describe("Booth lifecycle coordination", () => {
+  test("preflight preserves the validated capture and locale experience for the Booth", () => {
+    const operationalState = parseBoothOperationalState({
+      paused: false,
+      messages: {},
+      version: 1,
+      updatedAt: "2026-07-24T00:00:00.000Z",
+    });
+    const result = boothPreflightResultFromPayload({
+      experience: {
+        frames: ["square"],
+        locales: ["en", "zh-SG"],
+        defaultLocale: "zh-SG",
+        capture: {
+          reviewEnabled: false,
+          autoAcceptSeconds: 8,
+          countdownAudioDefault: true,
+        },
+      },
+      operationalState,
+    });
+
+    expect(result).toEqual({
+      kind: "ready",
+      frames: ["square"],
+      experience: {
+        frames: ["square"],
+        locales: ["en", "zh-SG"],
+        defaultLocale: "zh-SG",
+        capture: {
+          reviewEnabled: false,
+          autoAcceptSeconds: 8,
+          countdownAudioDefault: true,
+        },
+      },
+      operationalState,
+    });
+  });
+
   test("completes Outbox recovery before reading a stored credential or preflighting", async () => {
     const recovery = deferred<void>();
     const calls: string[] = [];
@@ -514,6 +552,7 @@ describe("preflight operational-state validation", () => {
     })).toEqual({
       kind: "ready",
       frames: ["square"],
+      experience: { frames: ["square"] },
       operationalState: validState,
     });
   });

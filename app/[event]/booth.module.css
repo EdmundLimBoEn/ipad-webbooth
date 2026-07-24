@@ -74,6 +74,24 @@
   font-weight: 800;
 }
 
+.localePicker {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+}
+
+.localePicker select {
+  min-height: 44px;
+  padding: 0 38px 0 12px;
+  border: 2px solid rgba(255, 255, 255, 0.55);
+  border-radius: 10px;
+  background: #111119;
+  color: #fff;
+  font: inherit;
+}
+
 .choices {
   display: flex;
   gap: 20px;
@@ -102,7 +120,13 @@
 .shutter:focus-visible,
 .change:focus-visible,
 .liveLink:focus-visible,
-.fileBtn:focus-within {
+.fileBtn:focus-within,
+.localePicker select:focus-visible,
+.reviewActions button:focus-visible,
+.handoffLink:focus-visible,
+.handoffContinue:focus-visible,
+.error:focus-visible,
+.handoffPanel h1:focus-visible {
   outline: 3px solid #fff;
   outline-offset: 4px;
 }
@@ -240,6 +264,7 @@
   font-weight: 700;
   cursor: pointer;
   z-index: 5;
+  min-height: 44px;
 }
 .retry:disabled {
   cursor: default;
@@ -256,6 +281,143 @@
   border-radius: 12px;
   font-size: 15px;
   max-width: 80vw;
+  min-height: 44px;
+  border: 2px solid rgba(255, 255, 255, 0.8);
+  color: #fff;
+  cursor: pointer;
+  z-index: 8;
+}
+
+.review,
+.handoff {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding:
+    max(24px, env(safe-area-inset-top, 0px))
+    max(24px, env(safe-area-inset-right, 0px))
+    max(24px, env(safe-area-inset-bottom, 0px))
+    max(24px, env(safe-area-inset-left, 0px));
+  background: rgba(5, 5, 10, 0.92);
+  color: #fff;
+}
+
+.review {
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  gap: 20px;
+}
+
+.reviewPreview {
+  display: grid;
+  width: 100%;
+  min-height: 0;
+  place-items: center;
+  overflow: hidden;
+}
+
+.reviewCanvas {
+  display: block;
+  max-width: 100%;
+  max-height: min(68dvh, 760px);
+  width: auto;
+  height: auto;
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+}
+
+.reviewActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+}
+
+.reviewActions button,
+.handoffContinue,
+.handoffLink {
+  display: inline-flex;
+  min-width: 132px;
+  min-height: 52px;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 20px;
+  border: 2px solid rgba(255, 255, 255, 0.55);
+  border-radius: 14px;
+  background: #242431;
+  color: #fff;
+  font: 800 17px/1.2 system-ui, sans-serif;
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.reviewActions .reviewPrimary,
+.handoffContinue {
+  border-color: #ff65aa;
+  background: #ff2d8b;
+}
+
+.reviewActions button:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
+.reviewAnnouncement {
+  min-height: 44px;
+  max-width: 680px;
+  text-align: center;
+}
+
+.reviewAnnouncement p {
+  margin: 0;
+  padding: 10px;
+}
+
+.reviewAnnouncement [role="alert"] {
+  border-radius: 10px;
+  background: #a7192f;
+}
+
+.handoffPanel {
+  display: flex;
+  width: min(560px, 100%);
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  padding: clamp(26px, 5vw, 48px);
+  border: 1px solid #535263;
+  border-radius: 28px;
+  background: #111119;
+  text-align: center;
+  box-shadow: 0 26px 80px rgba(0, 0, 0, 0.5);
+}
+
+.handoffPanel h1 {
+  margin: 0;
+  border-radius: 8px;
+  font: 850 clamp(34px, 6vw, 54px)/1 ui-rounded, system-ui, sans-serif;
+}
+
+.handoffPanel p {
+  margin: 0;
+  color: #d1cfda;
+  font-size: 18px;
+  line-height: 1.45;
+}
+
+.handoffQr {
+  width: min(320px, 72vw);
+  height: auto;
+  border: 10px solid #fff;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.handoffLink {
+  overflow-wrap: anywhere;
 }
 
 .storageWarning {
@@ -269,7 +431,19 @@
   color: #fff;
   font-size: 13px;
   font-weight: 650;
-  z-index: 6;
+  z-index: 12;
+}
+
+.uploadError {
+  position: absolute;
+  left: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  z-index: 12;
+  max-width: min(420px, 75vw);
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: #a7192f;
+  color: #fff;
 }
 
 /* Public operational state is deliberately simple: paused/disconnected only.
@@ -784,6 +958,14 @@
   .unlockRetry {
     width: 100%;
   }
+
+  .reviewActions {
+    width: 100%;
+  }
+
+  .reviewActions button {
+    flex: 1 1 140px;
+  }
 }
 
 @media (forced-colors: active) {
@@ -794,7 +976,15 @@
   .connectivity,
   .readinessRail,
   .readinessRail > div,
-  .unlockForm > input {
+  .unlockForm > input,
+  .review,
+  .handoff,
+  .handoffPanel,
+  .reviewActions button,
+  .handoffContinue,
+  .handoffLink,
+  .localePicker select,
+  .error {
     border-color: CanvasText;
     background: Canvas;
     color: CanvasText;
@@ -811,7 +1001,13 @@
   .shutter:focus-visible,
   .change:focus-visible,
   .liveLink:focus-visible,
-  .remember:focus-within {
+  .remember:focus-within,
+  .reviewActions button:focus-visible,
+  .handoffLink:focus-visible,
+  .handoffContinue:focus-visible,
+  .localePicker select:focus-visible,
+  .error:focus-visible,
+  .handoffPanel h1:focus-visible {
     outline: 3px solid Highlight;
     outline-offset: 4px;
   }

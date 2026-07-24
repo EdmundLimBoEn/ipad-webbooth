@@ -39,6 +39,17 @@ export const englishMessages = {
   nextGuest: "Next guest",
   pausedTitle: "Booth paused",
   countdownShot: "Photo {shot} of {total}",
+  language: "Language",
+  continue: "Continue",
+  dismissError: "Dismiss error",
+  eventOperator: "Event operator",
+  pausedBody:
+    "Finishing any photo already in progress. This Booth will resume when the Event is ready.",
+  checkingConnection:
+    "Checking Event connection. The last pause state stays in effect.",
+  captureFailed: "We couldn’t prepare this photo. Please try again.",
+  saveFailed: "We couldn’t safely save this photo. Choose Use Photo to retry or Retake.",
+  decodeFailed: "We couldn’t read this photo. Please take another one.",
 } satisfies Record<string, string>;
 
 export type MessageKey = keyof typeof englishMessages;
@@ -79,6 +90,15 @@ export const chineseSingaporeMessages: Record<MessageKey, string> = {
   nextGuest: "下一位来宾",
   pausedTitle: "拍照亭已暂停",
   countdownShot: "第 {shot} 张，共 {total} 张",
+  language: "语言",
+  continue: "继续",
+  dismissError: "关闭错误提示",
+  eventOperator: "活动管理员",
+  pausedBody: "正在完成已开始的照片。活动准备就绪后，拍照亭将恢复。",
+  checkingConnection: "正在检查活动连接。当前暂停状态保持不变。",
+  captureFailed: "无法准备这张照片。请重试。",
+  saveFailed: "无法安全保存这张照片。请选择“使用照片”重试或重拍。",
+  decodeFailed: "无法读取这张照片。请重新拍摄。",
 };
 
 export const arabicMessages: Record<MessageKey, string> = {
@@ -118,6 +138,18 @@ export const arabicMessages: Record<MessageKey, string> = {
   nextGuest: "الضيف التالي",
   pausedTitle: "كشك التصوير متوقف مؤقتًا",
   countdownShot: "الصورة {shot} من {total}",
+  language: "اللغة",
+  continue: "متابعة",
+  dismissError: "إغلاق الخطأ",
+  eventOperator: "منظّم الفعالية",
+  pausedBody:
+    "جارٍ إكمال أي صورة بدأ التقاطها. سيُستأنف الكشك عندما تصبح الفعالية جاهزة.",
+  checkingConnection:
+    "جارٍ التحقق من اتصال الفعالية. ستبقى حالة الإيقاف المؤقت الأخيرة سارية.",
+  captureFailed: "تعذر تجهيز هذه الصورة. حاول مرة أخرى.",
+  saveFailed:
+    "تعذر حفظ هذه الصورة بأمان. اختر استخدام الصورة للمحاولة مجددًا أو أعد الالتقاط.",
+  decodeFailed: "تعذرت قراءة هذه الصورة. التقط صورة أخرى.",
 };
 
 const catalogs: Record<SupportedLocale, Record<MessageKey, string>> = {

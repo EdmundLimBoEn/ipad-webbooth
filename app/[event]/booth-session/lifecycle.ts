@@ -1,5 +1,10 @@
 import { availableTemplates } from "../../templates";
 import { parseBoothOperationalState } from "../../booth-control";
+import {
+  parseEventConfig,
+  projectEventExperience,
+  type EventExperience,
+} from "../../event-config";
 import type { BoothAccessState } from "./access";
 
 export type BoothAccessFeedback =
@@ -12,7 +17,12 @@ export type BoothAccessFeedback =
   | "ready";
 
 export type BoothPreflightResult =
-  | { kind: "ready"; frames: unknown; operationalState?: unknown }
+  | {
+      kind: "ready";
+      frames: unknown;
+      experience?: EventExperience;
+      operationalState?: unknown;
+    }
   | { kind: "unauthorized" }
   | { kind: "unavailable" }
   | { kind: "recovery-only" };
@@ -54,6 +64,7 @@ type BoothLifecycleDependencies<Result> = {
   onOutboxRecovered: () => void;
   onAccess: (state: BoothAccessState, feedback: BoothAccessFeedback) => void;
   onFrames: (frames: string[] | null) => void;
+  onExperience?: (experience: EventExperience | null) => void;
   onOperationalState: (state: unknown) => void;
   onCameraStart: () => void;
   onCameraStop: () => void;
@@ -79,10 +90,19 @@ export function boothPreflightResultFromPayload(value: unknown): BoothPreflightR
   const operationalState = parseBoothOperationalState(payload.operationalState);
   if (!operationalState) return { kind: "recovery-only" };
   const experience = payload.experience;
-  const frames = experience && typeof experience === "object" && !Array.isArray(experience)
-    ? (experience as { frames?: unknown }).frames
-    : undefined;
-  return { kind: "ready", frames, operationalState };
+  const config = parseEventConfig(
+    experience && typeof experience === "object" && !Array.isArray(experience)
+      ? { ...experience, version: 1 }
+      : null,
+  );
+  if (!config) return { kind: "recovery-only" };
+  const validatedExperience = projectEventExperience(config);
+  return {
+    kind: "ready",
+    frames: validatedExperience.frames,
+    experience: validatedExperience,
+    operationalState,
+  };
 }
 
 export class BoothLifecycleCoordinator<Result> {
@@ -123,6 +143,7 @@ export class BoothLifecycleCoordinator<Result> {
     this.active = active;
     this.deps.onReset(event);
     this.deps.onFrames(null);
+    this.deps.onExperience?.(null);
     this.deps.onAccess("locked", "recovering");
 
     let recovery: BoothSessionRecovery;
@@ -206,6 +227,7 @@ export class BoothLifecycleCoordinator<Result> {
     active.credential.key = "";
     this.deps.clearCredential(active.event);
     this.deps.onFrames(null);
+    this.deps.onExperience?.(null);
     this.deps.onCameraStop();
     this.deps.onAccess("locked", "rejected-key");
     return this.ensureStopped(active);
@@ -260,6 +282,7 @@ export class BoothLifecycleCoordinator<Result> {
       this.deps.onOperationalState(result.operationalState);
     }
     this.deps.onFrames(frames);
+    this.deps.onExperience?.(result.experience ?? { frames });
     this.deps.onAccess("ready", "ready");
     let startWork: Promise<void> | void;
     try {

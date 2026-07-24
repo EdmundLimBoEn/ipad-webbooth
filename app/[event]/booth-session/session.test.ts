@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { createOutboxStore, MemoryOutboxStore, type OutboxItem } from "./outbox";
-import { BoothSession, runCaptureSequence, type UploadState } from "./session";
+import {
+  BoothSession,
+  runCaptureSequence,
+  type UploadAcknowledgement,
+  type UploadState,
+} from "./session";
 import { outboxUploadHeaders } from "./upload";
 import { HttpUploadError } from "./retry-policy";
 
@@ -112,6 +117,124 @@ function versionOneIndexedDb(rows: OutboxItem[]) {
 }
 
 describe("BoothSession outbox", () => {
+  test("acknowledges the exact stored item and response only after exact-row removal", async () => {
+    const itemWasRemoved: boolean[] = [];
+    const acknowledgements: UploadAcknowledgement[] = [];
+    class ObservedStore extends MemoryOutboxStore {
+      override async remove(id: string) {
+        await super.remove(id);
+        itemWasRemoved.push((await this.list("party")).every((item) => item.id !== id));
+      }
+    }
+    const store = new ObservedStore();
+    const result = {
+      url: "https://photos.example/current.jpg",
+      key: "party/current.jpg",
+      duplicate: true,
+    };
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => result,
+      (acknowledgement) => acknowledgements.push(acknowledgement),
+      () => "current",
+      () => 1,
+    );
+    const queued = await session.enqueueCapture(async () => photo("current"), {
+      metadata: { source: "framed", frameKey: "square" },
+    });
+
+    await session.process();
+
+    expect(itemWasRemoved).toEqual([true]);
+    expect(acknowledgements).toEqual([{ item: queued, result }]);
+  });
+
+  test("does not acknowledge when exact-row removal fails", async () => {
+    class RemoveFailureStore extends MemoryOutboxStore {
+      override async remove() {
+        throw new Error("cleanup failed");
+      }
+    }
+    const acknowledgements: UploadAcknowledgement[] = [];
+    const session = new BoothSession(
+      "party",
+      new RemoveFailureStore(),
+      async () => ({ url: "/photo", key: "party/current.jpg" }),
+      (acknowledgement) => acknowledgements.push(acknowledgement),
+    );
+    await session.enqueueCapture(async () => photo("current"), {
+      metadata: { source: "camera-fallback" },
+    });
+
+    await session.process();
+
+    expect(acknowledgements).toEqual([]);
+  });
+
+  test("lets the caller establish current handoff after enqueue before upload processing", async () => {
+    let handoffCaptureId: string | null = null;
+    const seenDuringAcknowledgement: Array<string | null> = [];
+    const session = new BoothSession(
+      "party",
+      new MemoryOutboxStore(),
+      async () => ({
+        url: "https://photos.example/current.jpg",
+        key: "party/current.jpg",
+      }),
+      ({ item }) => {
+        seenDuringAcknowledgement.push(handoffCaptureId);
+        expect(item.id).toBe(handoffCaptureId ?? "handoff-not-established");
+      },
+      () => "current",
+      () => 1,
+    );
+    await session.start();
+
+    const queued = await session.enqueueCapture(async () => photo("current"), {
+      metadata: { source: "framed", frameKey: "square" },
+    });
+    handoffCaptureId = queued.id;
+    await session.process();
+
+    expect(seenDuringAcknowledgement).toEqual(["current"]);
+    await session.stop();
+  });
+
+  test("durable enqueue does not depend on a second fallible Outbox list", async () => {
+    class PostPutListFailureStore extends MemoryOutboxStore {
+      failNextList = false;
+
+      override async put(item: OutboxItem) {
+        await super.put(item);
+        this.failNextList = true;
+      }
+
+      override async list(event: string) {
+        if (this.failNextList) {
+          this.failNextList = false;
+          throw new Error("post-put list failed");
+        }
+        return super.list(event);
+      }
+    }
+    const store = new PostPutListFailureStore();
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => ({ url: "/photo" }),
+      () => {},
+      () => "current",
+      () => 1,
+    );
+
+    await expect(session.enqueueCapture(async () => photo("current"), {
+      metadata: { source: "camera-fallback" },
+    })).resolves.toMatchObject({ id: "current" });
+    await expect(store.list("party")).rejects.toThrow("post-put list failed");
+    expect((await store.list("party")).map((item) => item.id)).toEqual(["current"]);
+  });
+
   test("reserves strictly increasing FIFO order across concurrent durable puts", async () => {
     let releasePuts!: () => void;
     const putBarrier = new Promise<void>((resolve) => {
@@ -204,7 +327,7 @@ describe("BoothSession outbox", () => {
       attempted.push(await text(item.blob));
       uploadIdentities.push({ id: item.id, headers: outboxUploadHeaders(item) });
       return { url: `/photos/${await text(item.blob)}` };
-    }, ({ url }) => recoveredUrls.push(url));
+    }, ({ result: { url } }) => recoveredUrls.push(url));
     const states: string[] = [];
     recovered.subscribe((state) => states.push(`${state.status}:${state.pendingCount}:${state.error ?? ""}`));
     await recovered.recover();

@@ -1,13 +1,27 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { useParams } from "next/navigation";
 import styles from "./booth.module.css";
-import { TEMPLATES, availableTemplates, composite } from "../templates";
+import {
+  TEMPLATES,
+  availableTemplates,
+  composeToCanvas,
+  encodeCanvas,
+} from "../templates";
+import { frameLabel } from "../frame-packs/catalog";
 import { createOutboxStore, type OutboxItem } from "./booth-session/outbox";
 import {
   BoothSession,
   runCaptureSequence,
+  type UploadAcknowledgement,
   type UploadResult,
   type UploadState,
 } from "./booth-session/session";
@@ -53,6 +67,32 @@ import {
   performVerifiedOperatorExit,
   type OperatorExitResult,
 } from "./operator-controls";
+import { CaptureReview } from "./capture-review";
+import { CountdownToneController } from "./booth-session/countdown-audio";
+import {
+  INITIAL_CAPTURE_FLOW_STATE,
+  reduceCaptureFlow,
+  type ReviewCandidate,
+} from "./booth-session/capture-flow";
+import { decodePhotoFileToCanvas } from "./booth-session/capture-candidate";
+import {
+  applyAcknowledgement,
+  beginHandoff,
+  type CurrentHandoff,
+} from "./booth-session/handoff";
+import { HandoffPanel } from "./handoff-panel";
+import {
+  applyDocumentLocale,
+  deviceLocaleStorageKey,
+  resolveDeviceLocale,
+  resolveEnabledLocales,
+  saveDeviceLocale,
+} from "../i18n/locale";
+import {
+  message,
+  type SupportedLocale,
+} from "../i18n/catalog";
+import type { EventExperience } from "../event-config";
 
 type Status = "starting" | "picking" | "ready" | "denied" | "running";
 type OperationalState = BoothOperationalClientState;
@@ -120,6 +160,7 @@ async function requestBoothPreflight(
 export default function Booth() {
   const { event } = useParams<{ event: string }>();
   const videoRef = useRef<HTMLVideoElement>(null);
+  const shutterRef = useRef<HTMLButtonElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<BoothSession | null>(null);
   const statePollerRef = useRef<BoothStatePoller | null>(null);
@@ -139,12 +180,23 @@ export default function Booth() {
     }).wakeLock;
     return new ScreenWakeController(provider);
   }, []);
+  const captureFlowRef = useRef(INITIAL_CAPTURE_FLOW_STATE);
+  const acceptingCandidatesRef = useRef(new Set<string>());
+  const tonesRef = useRef(new CountdownToneController());
   const [status, setStatus] = useState<Status>("starting");
   const [accessState, setAccessState] = useState<BoothAccessState>("locked");
   const [accessFeedback, setAccessFeedback] =
     useState<BoothAccessFeedback>("recovering");
   const [outboxRecovered, setOutboxRecovered] = useState(false);
   const [mode, setMode] = useState<keyof typeof TEMPLATES | null>(null);
+  const [captureFlow, dispatchCapture] = useReducer(
+    reduceCaptureFlow,
+    INITIAL_CAPTURE_FLOW_STATE,
+  );
+  captureFlowRef.current = captureFlow;
+  const [handoff, setHandoff] = useState<CurrentHandoff | null>(null);
+  const [experience, setExperience] = useState<EventExperience | null>(null);
+  const [locale, setLocale] = useState<SupportedLocale>("en");
   const [count, setCount] = useState(0);
   const [shot, setShot] = useState(0); // e.g. 2 of 3
   const [flash, setFlash] = useState(false);
@@ -167,6 +219,20 @@ export default function Booth() {
   // Frames remain unavailable until authenticated preflight returns the safe
   // Event experience. `null` is never shown while the Booth is locked.
   const [enabled, setEnabled] = useState<string[] | null>(null);
+
+  const enabledLocales = useMemo(
+    () => resolveEnabledLocales(experience?.locales),
+    [experience?.locales],
+  );
+  const reviewEnabled = experience?.capture?.reviewEnabled ?? true;
+  const autoAcceptSeconds = experience?.capture?.autoAcceptSeconds ?? 5;
+  const countdownAudioEnabled =
+    experience?.capture?.countdownAudioDefault ?? false;
+  const label = useCallback(
+    (key: Parameters<typeof message>[1], values?: Record<string, string | number>) =>
+      message(locale, key, values),
+    [locale],
+  );
 
   const startCamera = useCallback(async () => {
     if (operationalRef.current.paused || unmountedRef.current) return;
@@ -233,6 +299,14 @@ export default function Booth() {
   }, [wakeController]);
 
   const clearFrame = useCallback(() => {
+    const candidate = captureFlowRef.current.candidate;
+    if (candidate) {
+      candidate.canvas.width = 0;
+      candidate.canvas.height = 0;
+      acceptingCandidatesRef.current.delete(candidate.id);
+    }
+    dispatchCapture({ type: "reset" });
+    setHandoff(null);
     setMode(null);
     setShot(0);
     setCount(0);
@@ -275,12 +349,14 @@ export default function Booth() {
       onReset: () => {
         const initial = createBoothOperationalSessionState(Date.now());
         pauseBoundary.reset();
+        clearFrame();
         operationalRef.current = initial.operational;
         uploadStateRef.current = INITIAL_UPLOAD_STATE;
         deviceIdRef.current = loadOrCreateDeviceId(window.localStorage);
         sessionStartedAtRef.current = initial.sessionStartedAt;
         setStatus("starting");
-        setMode(null);
+        setExperience(null);
+        acceptingCandidatesRef.current.clear();
         setLastUrl(null);
         setError(null);
         setCount(0);
@@ -297,17 +373,35 @@ export default function Booth() {
       onOutboxRecovered: () => setOutboxRecovered(true),
       onAccess: (state, feedback) => {
         if (state === "locked" && feedback === "rejected-key") {
+          clearFrame();
           setStatus("starting");
-          setMode(null);
           setError(null);
-          setCount(0);
-          setShot(0);
-          setFlash(false);
         }
         setAccessState(state);
         setAccessFeedback(feedback);
       },
       onFrames: setEnabled,
+      onExperience: (nextExperience) => {
+        setExperience(nextExperience);
+        if (!nextExperience) return;
+        let storedLocale: string | null = null;
+        try {
+          storedLocale = window.localStorage.getItem(
+            deviceLocaleStorageKey(event),
+          );
+        } catch {
+          // Locale persistence is best-effort.
+        }
+        const nextLocale = resolveDeviceLocale({
+          event,
+          configured: nextExperience.locales,
+          defaultLocale: nextExperience.defaultLocale,
+          storedLocale,
+          navigatorLanguages: navigator.languages,
+        });
+        setLocale(nextLocale);
+        applyDocumentLocale(document.documentElement, nextLocale);
+      },
       onOperationalState: (value) => {
         const state = parseBoothOperationalState(value);
         if (state) {
@@ -359,6 +453,8 @@ export default function Booth() {
     }),
     [
       applyOperationalState,
+      clearFrame,
+      event,
       pauseBoundary,
       requestWake,
       startCamera,
@@ -369,9 +465,12 @@ export default function Booth() {
 
   useEffect(() => {
     unmountedRef.current = false;
+    const tones = new CountdownToneController();
+    tonesRef.current = tones;
     return () => {
       unmountedRef.current = true;
       stopCamera();
+      void tones.dispose();
     };
   }, [stopCamera]);
 
@@ -437,11 +536,22 @@ export default function Booth() {
       return res.json() as Promise<{ url: string; key?: string; duplicate?: boolean }>;
     };
     let session!: BoothSession;
+    const acknowledge = (acknowledgement: UploadAcknowledgement) => {
+      if (!lifecycle.isActive(session)) return;
+      lifecycle.acceptUploaded(session, acknowledgement.result);
+      setHandoff((current) =>
+        applyAcknowledgement(
+          current,
+          acknowledgement,
+          window.location.origin,
+        )
+      );
+    };
     session = new BoothSession(
       event,
       createOutboxStore(),
       uploadOne,
-      (result) => lifecycle.acceptUploaded(session, result),
+      acknowledge,
       undefined,
       undefined,
       {
@@ -544,7 +654,98 @@ export default function Booth() {
     void sessionRef.current?.retry();
   }, [accessState, uploadState.pendingCount]);
 
-  // take the whole sequence for the chosen mode, composite, upload
+  const acceptCandidate = useCallback(async (
+    candidate: ReviewCandidate,
+    fromReview = true,
+  ) => {
+    // This identity guard runs before any await, so an automatic timer and a
+    // button can never encode or enqueue the same candidate twice.
+    if (acceptingCandidatesRef.current.has(candidate.id)) return;
+    acceptingCandidatesRef.current.add(candidate.id);
+    if (fromReview) {
+      dispatchCapture({ type: "accept", candidateId: candidate.id });
+    }
+    const session = sessionRef.current;
+    const controller = captureRef.current;
+    try {
+      if (!session) throw new Error(label("queueStarting"));
+      const blob = await encodeCanvas(candidate.canvas);
+      const item = await session.enqueueCapture(
+        async () => blob,
+        {
+          signal: controller?.signal,
+          metadata: {
+            source: candidate.source,
+            ...(candidate.frameKey ? { frameKey: candidate.frameKey } : {}),
+          },
+        },
+      );
+      if (
+        controller?.signal.aborted
+        || unmountedRef.current
+        || !lifecycle.isActive(session)
+      ) {
+        return;
+      }
+
+      // Establish correlation before upload processing can acknowledge.
+      setHandoff(beginHandoff(item));
+      dispatchCapture({
+        type: "enqueue-succeeded",
+        candidateId: candidate.id,
+      });
+      setError(null);
+      setMode(null);
+      setStatus("picking");
+      setCount(0);
+      setShot(0);
+      setFlash(false);
+      candidate.canvas.width = 0;
+      candidate.canvas.height = 0;
+      if (captureRef.current === controller) captureRef.current = null;
+      pauseBoundary.completeOperation();
+      // Pause never interrupts this ordered Outbox drain.
+      void session.process();
+    } catch {
+      if (
+        controller?.signal.aborted
+        || unmountedRef.current
+        || !session
+        || !lifecycle.isActive(session)
+      ) {
+        return;
+      }
+      acceptingCandidatesRef.current.delete(candidate.id);
+      dispatchCapture({
+        type: "accept-failed",
+        candidateId: candidate.id,
+        error: label("saveFailed"),
+      });
+    }
+  }, [label, lifecycle, pauseBoundary]);
+
+  const retakeCandidate = useCallback((candidate: ReviewCandidate) => {
+    if (acceptingCandidatesRef.current.has(candidate.id)) return;
+    acceptingCandidatesRef.current.add(candidate.id);
+    dispatchCapture({ type: "retake", candidateId: candidate.id });
+    candidate.canvas.width = 0;
+    candidate.canvas.height = 0;
+    captureRef.current?.abort();
+    captureRef.current = null;
+    setError(null);
+    setCount(0);
+    setShot(0);
+    setFlash(false);
+    const pausedAtBoundary = pauseBoundary.completeOperation();
+    if (!pausedAtBoundary) {
+      setStatus(candidate.frameKey ? "ready" : "denied");
+      if (candidate.frameKey) {
+        requestAnimationFrame(() => shutterRef.current?.focus());
+      }
+    }
+  }, [pauseBoundary]);
+
+  // Take the whole sequence, then keep the exact unencoded composite for review.
   const run = useCallback(async () => {
     if (
       accessState !== "ready"
@@ -553,59 +754,71 @@ export default function Booth() {
       || !mode
       || !pauseBoundary.beginOperation()
     ) return;
+    const toneActivation = countdownAudioEnabled
+      ? tonesRef.current.activate()
+      : Promise.resolve(false);
     const t = TEMPLATES[mode];
+    const attemptId = crypto.randomUUID();
+    dispatchCapture({ type: "start-capture", attemptId });
     setStatus("running");
     const controller = new AbortController();
     captureRef.current = controller;
     const session = sessionRef.current;
     try {
-      if (!session) throw new Error("Photo queue is still starting — please try again");
-      setDurableHandoffActive(true);
-      await session.enqueueCapture(
-        async (signal) => {
-          const frames = await runCaptureSequence({
-            shots: t.shots,
-            intervalMs: t.intervalMs,
-            signal,
-            captureFrame: grabFrame,
-            onCountdown: (nextCount, nextShot) => {
-              setCount(nextCount);
-              setShot(nextShot);
-            },
-            onFlash: setFlash,
-          });
-          return composite(frames, frames.map((f) => ({ w: f.width, h: f.height })), t);
+      if (!session) throw new Error(label("queueStarting"));
+      await toneActivation;
+      const frames = await runCaptureSequence({
+        shots: t.shots,
+        intervalMs: t.intervalMs,
+        signal: controller.signal,
+        captureFrame: grabFrame,
+        onCountdown: (nextCount, nextShot) => {
+          setCount(nextCount);
+          setShot(nextShot);
+          tonesRef.current.tick(nextCount);
         },
-        {
-          signal: controller.signal,
-          metadata: {
-            source: "framed",
-            frameKey: mode,
-          },
-        }
+        onFlash: (visible) => {
+          setFlash(visible);
+          if (visible) tonesRef.current.captured();
+        },
+      });
+      const canvas = await composeToCanvas(
+        frames,
+        frames.map((frame) => ({ w: frame.width, h: frame.height })),
+        t,
       );
       setDurableHandoffActive(false);
       if (controller.signal.aborted || !lifecycle.isActive(session)) return;
-      // Durable handoff is complete. Return to the picker before uploading so
-      // the next guest is never trapped on the previous guest's frame.
+      const candidate: ReviewCandidate = {
+        id: crypto.randomUUID(),
+        source: "framed",
+        frameKey: mode,
+        canvas,
+      };
+      dispatchCapture({
+        type: "capture-complete",
+        attemptId,
+        candidate,
+        reviewEnabled,
+      });
       setError(null);
-      if (!pauseBoundary.completeOperation()) clearFrame();
-      // Pause gates new capture only. It never interrupts the ordered Outbox.
-      void session.process();
-    } catch (e) {
+      setCount(0);
+      setShot(0);
+      setFlash(false);
+      if (!reviewEnabled) void acceptCandidate(candidate, false);
+    } catch {
       if (controller.signal.aborted || !session || !lifecycle.isActive(session)) return;
-      // composite (frame art fetch, toBlob) failed — surface it and recover
-      // instead of leaving the booth stuck in "running" until a reload
-      setError(e instanceof Error ? e.message : String(e));
+      const captureMessage = label("captureFailed");
+      dispatchCapture({
+        type: "capture-failed",
+        attemptId,
+        error: captureMessage,
+      });
+      setError(captureMessage);
       setShot(0);
       setCount(0);
       setFlash(false);
-      if (!pauseBoundary.completeOperation()) {
-        setMode(null);
-        setStatus(streamRef.current ? "picking" : "denied");
-      }
-    } finally {
-      setDurableHandoffActive(false);
+      if (!pauseBoundary.completeOperation()) setStatus("ready");
       if (captureRef.current === controller) captureRef.current = null;
     }
   }, [
@@ -613,15 +826,15 @@ export default function Booth() {
     status,
     mode,
     grabFrame,
+    label,
     lifecycle,
-    clearFrame,
     pauseBoundary,
+    reviewEnabled,
+    acceptCandidate,
+    countdownAudioEnabled,
   ]);
 
-  // fallback: native file input (camera) when getUserMedia is blocked.
-  // Re-encode to a real JPEG first — iPhones hand back HEIC, and the stored
-  // key/content-type is always .jpg / image/jpeg.
-  // ponytail: fallback photos stay frameless; compositing needs the live capture flow.
+  // File-camera fallback decodes to a canvas and joins the same exact review.
   const onFile = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       if (accessState !== "ready" || operationalRef.current.paused) {
@@ -631,54 +844,57 @@ export default function Booth() {
       const file = e.target.files?.[0];
       e.target.value = "";
       if (!file || !pauseBoundary.beginOperation()) return;
+      const attemptId = crypto.randomUUID();
+      dispatchCapture({ type: "start-fallback-capture", attemptId });
+      setStatus("running");
       const controller = new AbortController();
       captureRef.current = controller;
       const session = sessionRef.current;
       try {
-        if (!session) throw new Error("Photo queue is still starting — please try again");
-        setDurableHandoffActive(true);
-        await session.enqueueCapture(async (signal) => {
-          if (signal?.aborted) throw new DOMException("Capture aborted", "AbortError");
-          let blob: Blob = file;
-          try {
-            const bmp = await createImageBitmap(file);
-            const c = document.createElement("canvas");
-            c.width = bmp.width;
-            c.height = bmp.height;
-            c.getContext("2d")!.drawImage(bmp, 0, 0);
-            blob = await new Promise<Blob>((res, rej) =>
-              c.toBlob((b) => (b ? res(b) : rej(new Error("re-encode failed"))), "image/jpeg", 0.9)
-            );
-          } catch {
-            // Undecodable file: preserve it; the server signature check decides.
-          }
-          return blob;
-        }, {
-          signal: controller.signal,
-          metadata: {
-            source: "camera-fallback",
-          },
-        });
-        setDurableHandoffActive(false);
+        if (!session) throw new Error(label("queueStarting"));
+        const canvas = await decodePhotoFileToCanvas(file);
         if (controller.signal.aborted || !lifecycle.isActive(session)) return;
+        const candidate: ReviewCandidate = {
+          id: crypto.randomUUID(),
+          source: "camera-fallback",
+          canvas,
+        };
+        dispatchCapture({
+          type: "capture-complete",
+          attemptId,
+          candidate,
+          reviewEnabled,
+        });
         setError(null);
-        pauseBoundary.completeOperation();
-        void session.process();
-      } catch (uploadError) {
+        if (!reviewEnabled) void acceptCandidate(candidate, false);
+      } catch {
         if (controller.signal.aborted || !session || !lifecycle.isActive(session)) return;
-        setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
-        pauseBoundary.completeOperation();
-      } finally {
-        setDurableHandoffActive(false);
+        const captureMessage = label("decodeFailed");
+        dispatchCapture({
+          type: "capture-failed",
+          attemptId,
+          error: captureMessage,
+        });
+        setError(captureMessage);
+        if (!pauseBoundary.completeOperation()) setStatus("denied");
         if (captureRef.current === controller) captureRef.current = null;
       }
     },
-    [accessState, lifecycle, pauseBoundary]
+    [
+      acceptCandidate,
+      accessState,
+      label,
+      lifecycle,
+      pauseBoundary,
+      reviewEnabled,
+    ]
   );
 
   const pick = (m: keyof typeof TEMPLATES) => {
     if (accessState !== "ready" || operationalRef.current.paused) return;
+    dispatchCapture({ type: "select-frame", frameKey: m });
     setMode(m);
+    setError(null);
     setStatus("ready");
   };
 
@@ -723,6 +939,31 @@ export default function Booth() {
     },
   }), [event, lifecycle, pauseBoundary, stopCamera, wakeController]);
 
+  const changeLocale = (nextLocale: SupportedLocale) => {
+    if (!enabledLocales.includes(nextLocale)) return;
+    setLocale(nextLocale);
+    try {
+      saveDeviceLocale(event, nextLocale, window.localStorage);
+    } catch {
+      // Accessing storage itself can be denied in a restricted browser.
+    }
+    applyDocumentLocale(document.documentElement, nextLocale);
+  };
+
+  const changeFrame = () => {
+    dispatchCapture({ type: "reset" });
+    setMode(null);
+    setError(null);
+    setStatus("picking");
+  };
+
+  const continueFromHandoff = () => {
+    setHandoff(null);
+    dispatchCapture({ type: "handoff-complete" });
+    setError(null);
+    setStatus(streamRef.current ? "picking" : "denied");
+  };
+
   // preview crops to the chosen frame's photo aspect (w/h of its first slot),
   // so guests see exactly what will be captured. Fullscreen until a mode is set.
   const previewAspect = mode ? TEMPLATES[mode].slots[0].w / TEMPLATES[mode].slots[0].h : null;
@@ -747,21 +988,53 @@ export default function Booth() {
       />
       {flash && <div className={styles.flash} />}
       {count > 0 && (
-        <div className={styles.count}>
+        <div
+          className={styles.count}
+          role="status"
+          aria-live="assertive"
+          aria-atomic="true"
+        >
           {count}
-          {shot > 0 && <span className={styles.shot}>{shot} / {mode && TEMPLATES[mode].shots}</span>}
+          {shot > 0 && (
+            <span className={styles.shot}>
+              {label("countdownShot", {
+                shot,
+                total: mode ? TEMPLATES[mode].shots : shot,
+              })}
+            </span>
+          )}
         </div>
       )}
 
-      {accessState === "ready" && status === "picking" && (
+      {accessState === "ready" && status === "picking" && !handoff && (
         <div className={styles.picker}>
           {lastUrl && (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={lastUrl} alt="Last photo" className={styles.thumb} />
+            <img src={lastUrl} alt={label("lastPhoto")} className={styles.thumb} />
           )}
-          <h1>Pick a style</h1>
+          {enabledLocales.length > 1 && (
+            <label className={styles.localePicker}>
+              <span>{label("language")}</span>
+              <select
+                value={locale}
+                onChange={(event) =>
+                  changeLocale(event.target.value as SupportedLocale)}
+              >
+                {enabledLocales.map((availableLocale) => (
+                  <option key={availableLocale} value={availableLocale}>
+                    {availableLocale === "en"
+                      ? "English"
+                      : availableLocale === "zh-SG"
+                        ? "简体中文"
+                        : "العربية"}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <h1>{label("pickStyle")}</h1>
           {availableTemplates(enabled).length === 0 && (
-            <p>No frames are enabled for this event yet.</p>
+            <p>{label("noFrames")}</p>
           )}
           <div className={styles.choices}>
             {availableTemplates(enabled).map((k) => {
@@ -779,8 +1052,12 @@ export default function Booth() {
                   ) : (
                     <span className={`${styles.icon} ${styles.iconSquare}`} />
                   )}
-                  {t.label}
-                  <small>{t.shots === 1 ? "1 photo" : `${t.shots} photos`}</small>
+                  {frameLabel(t, locale)}
+                  <small>
+                    {t.shots === 1
+                      ? label("onePhoto")
+                      : label("photoCount", { count: t.shots })}
+                  </small>
                 </button>
               );
             })}
@@ -788,11 +1065,11 @@ export default function Booth() {
         </div>
       )}
 
-      {accessState === "ready" && status === "denied" && (
+      {accessState === "ready" && status === "denied" && !handoff && (
         <div className={styles.picker}>
-          <p>Camera unavailable. Use your device camera instead:</p>
+          <p>{label("cameraUnavailable")}</p>
           <label className={styles.fileBtn}>
-            Take a photo
+            {label("takePhoto")}
             <input
               type="file"
               accept="image/*"
@@ -805,34 +1082,81 @@ export default function Booth() {
         </div>
       )}
 
-      {accessState === "ready" && (status === "ready" || status === "running") && (
+      {accessState === "ready"
+        && !captureFlow.candidate
+        && (status === "ready" || status === "running") && (
         <div className={styles.bottom}>
           {lastUrl && (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={lastUrl} alt="Last photo" className={styles.thumb} />
+            <img src={lastUrl} alt={label("lastPhoto")} className={styles.thumb} />
           )}
           <button
+            ref={shutterRef}
             className={styles.shutter}
             onClick={run}
             disabled={accessState !== "ready" || operational.paused || status !== "ready"}
-            aria-label="Start"
+            aria-label={label("startCapture")}
           >
             {status === "running" ? "" : mode && TEMPLATES[mode].shots > 1 ? "▶" : ""}
           </button>
           <button
             className={styles.change}
-            onClick={() => setStatus("picking")}
+            onClick={changeFrame}
             disabled={accessState !== "ready" || operational.paused || status !== "ready"}
           >
-            {mode && TEMPLATES[mode].label} · change
+            {mode && label("changeFrame", {
+              frame: frameLabel(TEMPLATES[mode], locale),
+            })}
           </button>
           <a className={styles.liveLink} href={`/${event}/live`} target="_blank" rel="noreferrer">
-            Live →
+            {label("liveGallery")} →
           </a>
         </div>
       )}
 
-      {accessState === "ready" && uploadState.pendingCount > 0 && status !== "running" && (
+      {accessState === "ready"
+        && captureFlow.candidate
+        && (captureFlow.phase === "reviewing"
+          || captureFlow.phase === "accepting") && (
+        <CaptureReview
+          canvas={captureFlow.candidate.canvas}
+          autoAcceptSeconds={autoAcceptSeconds}
+          accepting={captureFlow.phase === "accepting"}
+          error={captureFlow.error}
+          labels={{
+            usePhoto: label("usePhoto"),
+            retake: label("retake"),
+            moreTime: label("moreTime"),
+            accepting: label("accepting"),
+            preview: label("preview"),
+          }}
+          onAccept={() => void acceptCandidate(captureFlow.candidate!)}
+          onRetake={() => retakeCandidate(captureFlow.candidate!)}
+          onMoreTime={() => dispatchCapture({
+            type: "more-time",
+            candidateId: captureFlow.candidate!.id,
+          })}
+        />
+      )}
+
+      {accessState === "ready" && handoff && (
+        <HandoffPanel
+          handoff={handoff}
+          labels={{
+            queued: label("queued"),
+            title: label("handoffTitle"),
+            body: label("handoffBody"),
+            viewPhoto: label("viewPhoto"),
+            continue: label("continue"),
+          }}
+          onContinue={continueFromHandoff}
+        />
+      )}
+
+      {accessState === "ready"
+        && uploadState.pendingCount > 0
+        && status !== "running"
+        && !handoff && (
         <button
           className={styles.retry}
           onClick={retryUpload}
@@ -840,8 +1164,8 @@ export default function Booth() {
           aria-live="polite"
         >
           {uploadState.status === "uploading"
-            ? `Uploading ${uploadState.pendingCount}…`
-            : `⟳ Retry ${uploadState.pendingCount} pending`}
+            ? label("uploading", { count: uploadState.pendingCount })
+            : `⟳ ${label("retryPending", { count: uploadState.pendingCount })}`}
         </button>
       )}
       {accessState !== "ready" && accessState !== "exited" && (
@@ -857,27 +1181,39 @@ export default function Booth() {
           onRetry={retryPreflight}
         />
       )}
-      {accessState === "ready" && (error || uploadState.error) && (
-        <div className={styles.error} onClick={() => setError(null)}>
-          {error || uploadState.error}
+      {accessState === "ready" && !captureFlow.candidate && error && (
+        <button
+          type="button"
+          className={styles.error}
+          onClick={() => setError(null)}
+          aria-label={label("dismissError")}
+        >
+          {error}
+        </button>
+      )}
+      {accessState === "ready" && uploadState.error && (
+        <div className={styles.uploadError} role="alert">
+          {uploadState.error}
         </div>
       )}
       {accessState === "ready" && !uploadState.durable && (
         <div className={styles.storageWarning} role="status">
-          Offline photo storage is unavailable. Pending photos may be lost if this page reloads.
+          {label("offlineStorageUnavailable")}
         </div>
       )}
       {accessState === "ready" && !operational.connected && (
         <div className={styles.connectivity} role="status" aria-live="polite">
-          Checking Event connection. The last pause state stays in effect.
+          {label("checkingConnection")}
         </div>
       )}
-      {accessState === "ready" && operational.paused && (
+      {accessState === "ready"
+        && operational.paused
+        && !(captureFlow.phase === "reviewing" && captureFlow.candidate) && (
         <section className={styles.operationalPause} aria-labelledby="booth-paused-title">
           <div className={styles.operationalPausePanel} role="status" aria-live="polite">
-            <p className={styles.operationalEyebrow}>Event operator</p>
-            <h1 id="booth-paused-title">Booth paused</h1>
-            <p>Finishing any photo already in progress. This Booth will resume when the Event is ready.</p>
+            <p className={styles.operationalEyebrow}>{label("eventOperator")}</p>
+            <h1 id="booth-paused-title">{label("pausedTitle")}</h1>
+            <p>{label("pausedBody")}</p>
           </div>
         </section>
       )}

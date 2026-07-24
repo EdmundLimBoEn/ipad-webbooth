@@ -11,6 +11,13 @@ export type UploadState = {
 
 export type UploadResult = { url: string; key?: string; duplicate?: boolean };
 export type Upload = (item: OutboxItem) => Promise<UploadResult>;
+export type UploadAcknowledgement = {
+  item: OutboxItem;
+  result: UploadResult;
+};
+export type OnAcknowledged = (
+  acknowledgement: UploadAcknowledgement,
+) => void;
 
 export type EnqueueCaptureOptions = {
   signal?: AbortSignal;
@@ -54,7 +61,7 @@ export class BoothSession {
     private readonly event: string,
     private readonly store: OutboxStore,
     private readonly upload: Upload,
-    private readonly onUploaded: (result: UploadResult) => void = () => {},
+    private readonly onAcknowledged: OnAcknowledged = () => {},
     private readonly makeId: () => string = () => crypto.randomUUID(),
     private readonly now: () => number = Date.now,
     options: BoothSessionOptions = {}
@@ -159,14 +166,12 @@ export class BoothSession {
       ...(options.rehearsalId === undefined ? {} : { rehearsalId: options.rehearsalId }),
     };
     await this.store.put(item);
-    const pending = await this.store.list(this.event);
     this.publish({
       status: this.state.status === "failed" ? "failed" : "idle",
-      pendingCount: pending.length,
+      pendingCount: this.state.pendingCount + 1,
       error: this.state.status === "failed" ? this.state.error : null,
       durable: this.store.isDurable(),
     });
-    if (this.started && !this.stopRequested) void this.process();
     return item;
   }
 
@@ -294,7 +299,7 @@ export class BoothSession {
       // item was removed. Post-ack failures may pause reconciliation, but can
       // never enter the retry path and recreate that item.
       try {
-        this.onUploaded(result);
+        this.onAcknowledged({ item, result });
       } catch {
         // The next state publication still reconciles the Booth UI.
       }
