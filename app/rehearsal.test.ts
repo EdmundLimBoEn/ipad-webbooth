@@ -67,6 +67,28 @@ describe("rehearsal schemas", () => {
     expect(parseRehearsalEvidence({ ...valid, photoKey: "other/1753315200000-a.jpg" }, "launch")).toBeNull();
     expect(parseRehearsalEvidence({ ...valid, error: "private stack" }, "launch")).toBeNull();
   });
+
+  test("accepts deterministic server upload evidence IDs only for acknowledgements", () => {
+    const acknowledged = evidence(2, {
+      kind: "photo-acknowledged",
+      captureId: firstCapture,
+      capturedAt: 1_753_315_200_000,
+      photoKey: "launch/1753315200000-a.jpg",
+    });
+    expect(parseRehearsalEvidence({
+      ...acknowledged,
+      id: `upload-${firstCapture}`,
+    }, "launch")).not.toBeNull();
+    expect(parseRehearsalEvidence({
+      ...evidence(3, {
+        kind: "network-failure",
+        captureId: firstCapture,
+        bootId: firstBoot,
+        errorClass: "network",
+      }),
+      id: `upload-${firstCapture}`,
+    }, "launch")).toBeNull();
+  });
 });
 
 describe("rehearsal completion", () => {
@@ -170,5 +192,78 @@ describe("rehearsal completion", () => {
     expect(summary.status).toBe("abandoned");
     expect(summary.stale).toBeTrue();
     expect(summary.remainingExactKeys).toEqual(["launch/1753315200000-a.jpg"]);
+  });
+
+  test("requires each correlated proof to be recorded after its prerequisites", () => {
+    const key = "launch/1753315200000-a.jpg";
+    const summary = reduceRehearsal({
+      session,
+      evidence: [
+        evidence(1, {
+          kind: "outbox-recovered",
+          previousBootId: firstBoot,
+          bootId: secondBoot,
+          captureIds: [firstCapture, secondCapture],
+        }),
+        evidence(2, { kind: "ordered-drain", bootId: secondBoot, captureIds: [firstCapture, secondCapture] }),
+        evidence(3, { kind: "delivery-observed", photoKey: key, feedObserved: true, publicImageObserved: true }),
+        evidence(4, { kind: "canary-deleted", photoKey: key, cleanupPending: true }),
+        evidence(5, { kind: "network-failure", captureId: firstCapture, bootId: firstBoot, errorClass: "network" }),
+        evidence(6, { kind: "network-failure", captureId: secondCapture, bootId: firstBoot, errorClass: "timeout" }),
+        evidence(7, {
+          kind: "photo-acknowledged",
+          captureId: firstCapture,
+          capturedAt: 1_753_315_200_000,
+          frameKey: "square",
+          photoKey: key,
+        }),
+        evidence(8, {
+          kind: "photo-acknowledged",
+          captureId: secondCapture,
+          capturedAt: 1_753_315_200_001,
+          frameKey: "strip",
+          photoKey: "launch/1753315200001-b.jpg",
+        }),
+        evidence(9, { kind: "canary-designated", photoKey: key }),
+      ],
+      currentRevisionId: revisionId,
+    });
+
+    expect(summary.requirements["two-network-failures"].complete).toBeTrue();
+    expect(summary.requirements["reload-recovered"].complete).toBeFalse();
+    expect(summary.requirements["ordered-drain"].complete).toBeFalse();
+    expect(summary.requirements["public-delivery"].complete).toBeFalse();
+    expect(summary.requirements["canary-deleted"].complete).toBeFalse();
+  });
+
+  test("uses the latest server-recorded exact disposition for conflicting choices", () => {
+    const key = "launch/1753315200000-a.jpg";
+    const base = evidence(1, {
+      kind: "photo-acknowledged",
+      captureId: firstCapture,
+      capturedAt: 1_753_315_200_000,
+      photoKey: key,
+    });
+    const deletedLatest = reduceRehearsal({
+      session,
+      evidence: [
+        base,
+        evidence(2, { kind: "photo-retained", photoKey: key }),
+        evidence(3, { kind: "photo-deleted", photoKey: key }),
+      ],
+      currentRevisionId: revisionId,
+    });
+    const retainedLatest = reduceRehearsal({
+      session,
+      evidence: [
+        base,
+        evidence(2, { kind: "photo-deleted", photoKey: key }),
+        evidence(3, { kind: "photo-retained", photoKey: key }),
+      ],
+      currentRevisionId: revisionId,
+    });
+
+    expect(deletedLatest.trackedPhotos[0]?.disposition).toBe("deleted");
+    expect(retainedLatest.trackedPhotos[0]?.disposition).toBe("retained");
   });
 });

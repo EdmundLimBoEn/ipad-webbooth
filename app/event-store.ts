@@ -46,6 +46,14 @@ import {
   parseModerationPhotoRecord,
   type ModerationPhoto,
 } from "./moderation";
+import {
+  isRehearsalId,
+  parseRehearsalEvidence,
+  parseRehearsalSession,
+  type RehearsalEvidence,
+  type RehearsalEvidenceInput,
+  type RehearsalSession,
+} from "./rehearsal";
 export { canonicalEvent, InvalidEventSlugError, slugifyEvent };
 export { EVENT_CONFIG_VERSION };
 export type { EventConfig } from "./event-config";
@@ -310,6 +318,23 @@ export const eventPresetIndexKey = (
   }
   return `${eventPresetIndexPrefix()}${utf16Hex(label)}/${presetId}/${utf16Hex(updatedAt)}.json`;
 };
+export const rehearsalSessionKey = (event: string, rehearsalId: string) =>
+  `events/${canonicalEvent(event)}/rehearsals/${rehearsalId}/session.json`;
+export const rehearsalEvidencePrefix = (event: string, rehearsalId: string) =>
+  `events/${canonicalEvent(event)}/rehearsals/${rehearsalId}/evidence/`;
+export const rehearsalEvidenceKey = (
+  event: string,
+  rehearsalId: string,
+  observedAt: number,
+  evidenceId: string,
+) => `${rehearsalEvidencePrefix(event, rehearsalId)}${String(observedAt).padStart(13, "0")}-${evidenceId}.json`;
+export const latestRehearsalKey = (event: string) =>
+  `events/${canonicalEvent(event)}/rehearsals/latest.json`;
+const rehearsalEvidenceIdentityKey = (
+  event: string,
+  rehearsalId: string,
+  evidenceId: string,
+) => `events/${canonicalEvent(event)}/rehearsals/${rehearsalId}/evidence-identities/${evidenceId}.json`;
 export const legacyEventConfigKey = (event: string) => `_config/${event}.json`;
 export const eventPhotoPrefix = (event: string) => `${event}/`;
 export const stablePhotoKey = (event: string, id: StableCaptureIdentity) =>
@@ -488,6 +513,32 @@ export class PresetConflictError extends Error {
 export class EventPresetNotFoundError extends Error {
   constructor(readonly presetId: string) {
     super(`Event preset ${presetId} was not found`);
+  }
+}
+
+export class RehearsalNotFoundError extends Error {
+  constructor(readonly event: string, readonly rehearsalId?: string) {
+    super(`rehearsal${rehearsalId ? ` ${rehearsalId}` : ""} was not found for ${event}`);
+  }
+}
+
+export class InvalidStoredRehearsalError extends Error {
+  constructor(readonly event: string, readonly rehearsalId?: string) {
+    super(`stored rehearsal${rehearsalId ? ` ${rehearsalId}` : ""} for ${event} is corrupt or uses an unsupported version`);
+  }
+}
+
+export class RehearsalConflictError extends Error {
+  constructor(readonly evidenceId?: string) {
+    super(evidenceId
+      ? `rehearsal evidence ${evidenceId} was already used for different evidence`
+      : "rehearsal already exists");
+  }
+}
+
+export class RehearsalEvidenceLimitError extends Error {
+  constructor() {
+    super("rehearsal evidence limit reached");
   }
 }
 
@@ -845,6 +896,234 @@ export class EventStore {
       reason: "preset",
       sourcePresetId: preset.id,
     });
+  }
+
+  async startRehearsal(
+    event: string,
+    input: { rehearsalId: string },
+  ): Promise<RehearsalSession> {
+    const canonical = canonicalEvent(event);
+    if (!isRehearsalId(input.rehearsalId)) {
+      throw new TypeError("invalid rehearsal ID");
+    }
+    const key = rehearsalSessionKey(canonical, input.rehearsalId);
+    const existing = await this.state.get(key);
+    let session: RehearsalSession;
+    if (existing) {
+      session = await this.readRehearsalSessionObject(canonical, input.rehearsalId, existing);
+    } else {
+      const config = await this.readConfig(canonical);
+      const candidate: RehearsalSession = {
+        version: 1,
+        id: input.rehearsalId,
+        startedAt: this.now().toISOString(),
+        configRevisionId: config?.currentRevisionId ?? null,
+        frames: [...(config?.frames ?? [])],
+      };
+      const created = await this.state.compareAndSwap(
+        key,
+        null,
+        JSON.stringify(candidate),
+        jsonWriteOptions(),
+      );
+      if (created) {
+        session = candidate;
+      } else {
+        const raced = await this.state.get(key);
+        if (!raced) throw new RehearsalConflictError();
+        session = await this.readRehearsalSessionObject(canonical, input.rehearsalId, raced);
+      }
+    }
+    await this.state.put(
+      latestRehearsalKey(canonical),
+      JSON.stringify({ version: 1, rehearsalId: session.id }),
+      jsonWriteOptions(),
+    );
+    return session;
+  }
+
+  async readRehearsal(
+    event: string,
+    rehearsalId?: string,
+  ): Promise<{ session: RehearsalSession; evidence: RehearsalEvidence[] }> {
+    const canonical = canonicalEvent(event);
+    let exactId = rehearsalId;
+    if (exactId === undefined) {
+      const pointer = await this.state.get(latestRehearsalKey(canonical));
+      if (!pointer) throw new RehearsalNotFoundError(canonical);
+      let value: unknown;
+      try {
+        value = await pointer.json<unknown>();
+      } catch {
+        throw new InvalidStoredRehearsalError(canonical);
+      }
+      if (
+        !isRecord(value)
+        || Object.keys(value).length !== 2
+        || value.version !== 1
+        || !isRehearsalId(value.rehearsalId)
+      ) {
+        throw new InvalidStoredRehearsalError(canonical);
+      }
+      exactId = value.rehearsalId;
+    }
+    if (!isRehearsalId(exactId)) throw new TypeError("invalid rehearsal ID");
+    const sessionObject = await this.state.get(rehearsalSessionKey(canonical, exactId));
+    if (!sessionObject) throw new RehearsalNotFoundError(canonical, exactId);
+    const session = await this.readRehearsalSessionObject(canonical, exactId, sessionObject);
+    const evidence: RehearsalEvidence[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.state.list({
+        prefix: rehearsalEvidencePrefix(canonical, exactId),
+        ...(cursor ? { cursor } : {}),
+        limit: Math.min(PAGE_SIZE, 513 - evidence.length),
+      });
+      for (const listed of page.objects) {
+        if (evidence.length >= 512) throw new RehearsalEvidenceLimitError();
+        const object = await this.state.get(listed.key);
+        if (!object) throw new InvalidStoredRehearsalError(canonical, exactId);
+        let value: unknown;
+        try {
+          value = await object.json<unknown>();
+        } catch {
+          throw new InvalidStoredRehearsalError(canonical, exactId);
+        }
+        const parsed = parseRehearsalEvidence(value, canonical);
+        if (
+          !parsed
+          || parsed.rehearsalId !== exactId
+          || rehearsalEvidenceKey(canonical, exactId, parsed.observedAt, parsed.id) !== listed.key
+        ) {
+          throw new InvalidStoredRehearsalError(canonical, exactId);
+        }
+        evidence.push(parsed);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+      if (page.truncated && !cursor) throw new InvalidStoredRehearsalError(canonical, exactId);
+    } while (cursor);
+    evidence.sort((left, right) =>
+      left.recordedAt.localeCompare(right.recordedAt) || left.id.localeCompare(right.id)
+    );
+    return { session, evidence };
+  }
+
+  async appendRehearsalEvidence(
+    event: string,
+    rehearsalId: string,
+    input: RehearsalEvidenceInput,
+  ): Promise<{ evidence: RehearsalEvidence; idempotent: boolean }> {
+    const canonical = canonicalEvent(event);
+    if (!isRehearsalId(rehearsalId)) throw new TypeError("invalid rehearsal ID");
+    const record = parseRehearsalEvidence({
+      ...input,
+      recordedAt: this.now().toISOString(),
+    }, canonical);
+    if (!record || record.rehearsalId !== rehearsalId) {
+      throw new TypeError("invalid rehearsal evidence");
+    }
+    const key = rehearsalEvidenceKey(canonical, rehearsalId, record.observedAt, record.id);
+    const identityKey = rehearsalEvidenceIdentityKey(canonical, rehearsalId, record.id);
+    const semantic = rehearsalEvidenceSemantic(record);
+    const existingIdentity = await this.state.get(identityKey);
+    if (existingIdentity) {
+      return this.finishExistingRehearsalEvidence(
+        canonical,
+        rehearsalId,
+        record.id,
+        key,
+        semantic,
+        existingIdentity,
+      );
+    }
+    const current = await this.readRehearsal(canonical, rehearsalId);
+    if (current.evidence.length >= 512) throw new RehearsalEvidenceLimitError();
+    const claimed = await this.state.compareAndSwap(
+      identityKey,
+      null,
+      JSON.stringify({ version: 1, key, semantic }),
+      jsonWriteOptions(),
+    );
+    if (!claimed) {
+      const raced = await this.state.get(identityKey);
+      if (!raced) throw new RehearsalConflictError(record.id);
+      return this.finishExistingRehearsalEvidence(
+        canonical,
+        rehearsalId,
+        record.id,
+        key,
+        semantic,
+        raced,
+      );
+    }
+    const created = await this.state.compareAndSwap(
+      key,
+      null,
+      JSON.stringify(record),
+      jsonWriteOptions(),
+    );
+    if (!created) throw new RehearsalConflictError(record.id);
+    return { evidence: record, idempotent: false };
+  }
+
+  private async finishExistingRehearsalEvidence(
+    event: string,
+    rehearsalId: string,
+    evidenceId: string,
+    key: string,
+    semantic: string,
+    identity: StoredObjectBody,
+  ): Promise<{ evidence: RehearsalEvidence; idempotent: boolean }> {
+    let marker: unknown;
+    try {
+      marker = await identity.json<unknown>();
+    } catch {
+      throw new InvalidStoredRehearsalError(event, rehearsalId);
+    }
+    if (
+      !isRecord(marker)
+      || Object.keys(marker).length !== 3
+      || marker.version !== 1
+      || marker.key !== key
+      || marker.semantic !== semantic
+    ) {
+      throw new RehearsalConflictError(evidenceId);
+    }
+    const object = await this.state.get(key);
+    if (!object) throw new InvalidStoredRehearsalError(event, rehearsalId);
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredRehearsalError(event, rehearsalId);
+    }
+    const evidence = parseRehearsalEvidence(value, event);
+    if (
+      !evidence
+      || evidence.rehearsalId !== rehearsalId
+      || rehearsalEvidenceSemantic(evidence) !== semantic
+    ) {
+      throw new RehearsalConflictError(evidenceId);
+    }
+    return { evidence, idempotent: true };
+  }
+
+  private async readRehearsalSessionObject(
+    event: string,
+    rehearsalId: string,
+    object: StoredObjectBody,
+  ): Promise<RehearsalSession> {
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredRehearsalError(event, rehearsalId);
+    }
+    const session = parseRehearsalSession(value);
+    if (!session || session.id !== rehearsalId) {
+      throw new InvalidStoredRehearsalError(event, rehearsalId);
+    }
+    return session;
   }
 
   private async appendConfigRevision(
@@ -2225,6 +2504,11 @@ function memoryBytes(value: ArrayBuffer | ArrayBufferView | string): Uint8Array 
   if (typeof value === "string") return new TextEncoder().encode(value);
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
   return new Uint8Array(value.slice(0));
+}
+
+function rehearsalEvidenceSemantic(evidence: RehearsalEvidence): string {
+  const { recordedAt: _recordedAt, ...semantic } = evidence;
+  return JSON.stringify(semantic);
 }
 
 function configExperience(config: EventConfig): EventExperience {

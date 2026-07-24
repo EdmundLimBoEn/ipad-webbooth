@@ -157,6 +157,10 @@ function isUuid(value: unknown): value is string {
   return typeof value === "string" && UUID_V4.test(value);
 }
 
+export function isRehearsalId(value: unknown): value is string {
+  return isUuid(value);
+}
+
 function isTimestamp(value: unknown): value is number {
   return typeof value === "number"
     && Number.isSafeInteger(value)
@@ -237,7 +241,15 @@ export function parseRehearsalEvidence(
   const common = ["version", "id", "rehearsalId", "observedAt", "recordedAt", "kind"];
   if (
     value.version !== 1
-    || !isUuid(value.id)
+    || (
+      !isUuid(value.id)
+      && !(
+        value.kind === "photo-acknowledged"
+        && typeof value.id === "string"
+        && value.id.startsWith("upload-")
+        && isUuid(value.id.slice("upload-".length))
+      )
+    )
     || !isUuid(value.rehearsalId)
     || !isTimestamp(value.observedAt)
     || !isStoredInstant(value.recordedAt)
@@ -354,14 +366,16 @@ function sameOrder(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function evidenceOrder(left: RehearsalEvidence, right: RehearsalEvidence): number {
+  return left.recordedAt.localeCompare(right.recordedAt) || left.id.localeCompare(right.id);
+}
+
 export function reduceRehearsal(input: {
   session: RehearsalSession;
   evidence: readonly RehearsalEvidence[];
   currentRevisionId: string | null;
 }): RehearsalSummary {
-  const records = [...input.evidence].sort((left, right) =>
-    left.recordedAt.localeCompare(right.recordedAt) || left.id.localeCompare(right.id)
-  );
+  const records = [...input.evidence].sort(evidenceOrder);
   const requirements = Object.fromEntries(REQUIREMENTS.map((requirement) => [
     requirement,
     { complete: false, evidenceIds: [] as string[] },
@@ -422,18 +436,25 @@ export function reduceRehearsal(input: {
     (record): record is Extract<RehearsalEvidence, { kind: "outbox-recovered" }> =>
       record.kind === "outbox-recovered",
   );
-  const validRecovery = recovered.find((record) =>
-    distinctFailures.length >= 2
-    && distinctFailures.every((failure) =>
-      record.captureIds.includes(failure.captureId)
-      && record.bootId !== failure.bootId
-    )
-  );
+  let recoveryFailures: typeof failures = [];
+  const validRecovery = recovered.find((record) => {
+    const correlated = record.captureIds
+      .map((captureId) => failuresByCapture.get(captureId))
+      .filter((failure): failure is typeof failures[number] => Boolean(failure));
+    const valid = correlated.length >= 2
+      && correlated.every((failure) =>
+        failure.bootId === record.previousBootId
+        && record.bootId !== record.previousBootId
+        && evidenceOrder(failure, record) < 0
+      );
+    if (valid) recoveryFailures = correlated;
+    return valid;
+  });
   if (validRecovery) {
     requirements["reload-recovered"] = {
       complete: true,
       evidenceIds: [
-        ...distinctFailures.map(({ id }) => id),
+        ...recoveryFailures.map(({ id }) => id),
         validRecovery.id,
       ],
     };
@@ -446,7 +467,11 @@ export function reduceRehearsal(input: {
   const validDrain = validRecovery && drains.find((record) =>
     record.bootId === validRecovery.bootId
     && sameOrder(record.captureIds, validRecovery.captureIds)
-    && record.captureIds.every((captureId) => acknowledgementsByCapture.has(captureId))
+    && evidenceOrder(validRecovery, record) < 0
+    && record.captureIds.every((captureId) => {
+      const acknowledged = acknowledgementsByCapture.get(captureId);
+      return acknowledged !== undefined && evidenceOrder(acknowledged, record) < 0;
+    })
   );
   if (validRecovery && validDrain) {
     requirements["ordered-drain"] = {
@@ -461,7 +486,11 @@ export function reduceRehearsal(input: {
 
   const delivery = records.find(
     (record): record is Extract<RehearsalEvidence, { kind: "delivery-observed" }> =>
-      record.kind === "delivery-observed" && acknowledgementsByKey.has(record.photoKey),
+      record.kind === "delivery-observed"
+      && (
+        acknowledgementsByKey.has(record.photoKey)
+        && evidenceOrder(acknowledgementsByKey.get(record.photoKey)!, record) < 0
+      ),
   );
   if (delivery) {
     requirements["public-delivery"] = {
@@ -472,15 +501,23 @@ export function reduceRehearsal(input: {
 
   const designations = records.filter(
     (record): record is Extract<RehearsalEvidence, { kind: "canary-designated" }> =>
-      record.kind === "canary-designated" && acknowledgementsByKey.has(record.photoKey),
+      record.kind === "canary-designated"
+      && acknowledgementsByKey.has(record.photoKey)
+      && evidenceOrder(acknowledgementsByKey.get(record.photoKey)!, record) < 0,
   );
   const deletedCanary = records.find(
     (record): record is Extract<RehearsalEvidence, { kind: "canary-deleted" }> =>
       record.kind === "canary-deleted"
-      && designations.some((designation) => designation.photoKey === record.photoKey),
+      && designations.some((designation) =>
+        designation.photoKey === record.photoKey
+        && evidenceOrder(designation, record) < 0
+      ),
   );
   if (deletedCanary) {
-    const designation = designations.find(({ photoKey }) => photoKey === deletedCanary.photoKey)!;
+    const designation = designations.find((candidate) =>
+      candidate.photoKey === deletedCanary.photoKey
+      && evidenceOrder(candidate, deletedCanary) < 0
+    )!;
     requirements["canary-deleted"] = {
       complete: true,
       evidenceIds: [
@@ -502,20 +539,15 @@ export function reduceRehearsal(input: {
     if (record.kind === "manual-check") manualChecks[record.check] = true;
   }
 
-  const retained = new Set(records.flatMap((record) =>
-    record.kind === "photo-retained" ? [record.photoKey] : []
-  ));
-  const deleted = new Set(records.flatMap((record) =>
-    record.kind === "photo-deleted" ? [record.photoKey] : []
-  ));
+  const dispositionByKey = new Map<string, "retained" | "deleted">();
+  for (const record of records) {
+    if (record.kind === "photo-retained") dispositionByKey.set(record.photoKey, "retained");
+    if (record.kind === "photo-deleted") dispositionByKey.set(record.photoKey, "deleted");
+  }
   const trackedPhotos = [...acknowledgementsByCapture.values()].map((record) => {
     const disposition = deletedCanary?.photoKey === record.photoKey
       ? "canary-deleted" as const
-      : retained.has(record.photoKey)
-        ? "retained" as const
-        : deleted.has(record.photoKey)
-          ? "deleted" as const
-          : "pending" as const;
+      : dispositionByKey.get(record.photoKey) ?? "pending" as const;
     return {
       captureId: record.captureId,
       ...(record.frameKey ? { frameKey: record.frameKey } : {}),

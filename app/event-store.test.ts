@@ -13,7 +13,10 @@ import {
   InvalidPhotoCursorError,
   InvalidStoredConfigRevisionError,
   InvalidStoredEventPresetError,
+  InvalidStoredRehearsalError,
   PresetConflictError,
+  RehearsalConflictError,
+  RehearsalNotFoundError,
   eventConfigKey,
   eventConfigMutationKey,
   eventConfigRevisionKey,
@@ -31,6 +34,10 @@ import {
   eventPresetKey,
   eventPresetIndexKey,
   eventPresetPrefix,
+  latestRehearsalKey,
+  rehearsalEvidenceKey,
+  rehearsalEvidencePrefix,
+  rehearsalSessionKey,
   type ListOptions,
   type ListResult,
   type StoredObjectBody,
@@ -491,6 +498,134 @@ describe("ObjectStore", () => {
     expect(await state.compareAndSwap("head", first!.etag, "two")).toBe(true);
     expect(await first!.text()).toBe("one");
     expect(await (await state.get("head"))!.text()).toBe("two");
+  });
+});
+
+describe("private rehearsal storage", () => {
+  const rehearsalId = "018f0000-0000-4000-8000-000000000501";
+  const evidenceId = "018f0000-0000-4000-8000-000000000502";
+  const captureId = "018f0000-0000-4000-8000-000000000503";
+  const bootId = "018f0000-0000-4000-8000-000000000504";
+
+  test("snapshots the exact config head and frames, then completes a lost start retry", async () => {
+    const photos = new RecordingDeleteStore();
+    const state = new InMemoryObjectStore();
+    let now = new Date("2026-07-24T00:00:00.000Z");
+    const store = new EventStore(photos, state, "https://photos.example", () => now);
+    const config = await store.saveConfigRevision("launch", {
+      config: { frames: ["square", "strip"] },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-4000-8000-000000000510",
+    });
+
+    const started = await store.startRehearsal("launch", { rehearsalId });
+    now = new Date("2026-07-24T00:01:00.000Z");
+    await store.saveConfigRevision("launch", {
+      config: { frames: ["new-frame"] },
+      baseRevisionId: config.revision.id,
+      mutationId: "018f0000-0000-4000-8000-000000000511",
+    });
+    const retried = await store.startRehearsal("launch", { rehearsalId });
+
+    expect(started).toEqual({
+      version: 1,
+      id: rehearsalId,
+      startedAt: "2026-07-24T00:00:00.000Z",
+      configRevisionId: config.revision.id,
+      frames: ["square", "strip"],
+    });
+    expect(retried).toEqual(started);
+    expect(await store.readRehearsal("launch")).toEqual({
+      session: started,
+      evidence: [],
+    });
+    expect(state.has(rehearsalSessionKey("launch", rehearsalId))).toBeTrue();
+    expect(state.has(latestRehearsalKey("launch"))).toBeTrue();
+    expect((await photos.list()).objects).toHaveLength(0);
+    expect(photos.deletes).toEqual([]);
+  });
+
+  test("appends strict evidence with server time and exact idempotency", async () => {
+    const state = new CappedListStore(1);
+    let now = new Date("2026-07-24T00:00:00.000Z");
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example", () => now);
+    await store.startRehearsal("launch", { rehearsalId });
+    const input = {
+      version: 1 as const,
+      id: evidenceId,
+      rehearsalId,
+      observedAt: 1_753_315_200_000,
+      kind: "network-failure" as const,
+      captureId,
+      bootId,
+      errorClass: "network" as const,
+    };
+
+    const first = await store.appendRehearsalEvidence("launch", rehearsalId, input);
+    now = new Date("2026-07-24T00:05:00.000Z");
+    const retry = await store.appendRehearsalEvidence("launch", rehearsalId, input);
+
+    expect(first.idempotent).toBeFalse();
+    expect(first.evidence.recordedAt).toBe("2026-07-24T00:00:00.000Z");
+    expect(retry).toEqual({ evidence: first.evidence, idempotent: true });
+    expect(state.has(rehearsalEvidenceKey(
+      "launch",
+      rehearsalId,
+      input.observedAt,
+      evidenceId,
+    ))).toBeTrue();
+    expect((await store.readRehearsal("launch", rehearsalId)).evidence).toEqual([
+      first.evidence,
+    ]);
+
+    await expect(store.appendRehearsalEvidence("launch", rehearsalId, {
+      ...input,
+      errorClass: "timeout",
+    })).rejects.toBeInstanceOf(RehearsalConflictError);
+  });
+
+  test("isolates Events and fails explicitly for missing or corrupt private records", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    await store.startRehearsal("launch", { rehearsalId });
+    await expect(store.readRehearsal("other", rehearsalId))
+      .rejects.toBeInstanceOf(RehearsalNotFoundError);
+    await expect(store.appendRehearsalEvidence("other", rehearsalId, {
+      version: 1,
+      id: evidenceId,
+      rehearsalId,
+      observedAt: 1_753_315_200_000,
+      kind: "network-failure",
+      captureId,
+      bootId,
+      errorClass: "network",
+    })).rejects.toBeInstanceOf(RehearsalNotFoundError);
+    await expect(store.appendRehearsalEvidence("launch", rehearsalId, {
+      version: 1,
+      id: evidenceId,
+      rehearsalId,
+      observedAt: 1_753_315_200_000,
+      kind: "photo-deleted",
+      photoKey: "other/1753315200000-a.jpg",
+    })).rejects.toBeInstanceOf(TypeError);
+
+    state.set(rehearsalSessionKey("launch", rehearsalId), JSON.stringify({
+      version: 2,
+      id: rehearsalId,
+    }));
+    await expect(store.readRehearsal("launch", rehearsalId))
+      .rejects.toBeInstanceOf(InvalidStoredRehearsalError);
+  });
+
+  test("exposes only exact private key constructors and no cleanup method", () => {
+    expect(rehearsalSessionKey("launch", rehearsalId))
+      .toBe(`events/launch/rehearsals/${rehearsalId}/session.json`);
+    expect(rehearsalEvidencePrefix("launch", rehearsalId))
+      .toBe(`events/launch/rehearsals/${rehearsalId}/evidence/`);
+    expect(rehearsalEvidenceKey("launch", rehearsalId, 1_753_315_200_000, evidenceId))
+      .toBe(`events/launch/rehearsals/${rehearsalId}/evidence/1753315200000-${evidenceId}.json`);
+    expect(latestRehearsalKey("launch")).toBe("events/launch/rehearsals/latest.json");
+    expect("deleteRehearsal" in EventStore.prototype).toBeFalse();
   });
 });
 
