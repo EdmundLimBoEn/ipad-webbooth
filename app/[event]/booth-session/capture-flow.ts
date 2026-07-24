@@ -16,6 +16,7 @@ export type ReviewCandidate = {
 export type CaptureFlowState = {
   phase: CapturePhase;
   frameKey: string | null;
+  captureAttemptId: string | null;
   candidate: ReviewCandidate | null;
   autoAcceptPending: boolean;
   error: string | null;
@@ -23,9 +24,11 @@ export type CaptureFlowState = {
 
 export type CaptureFlowAction =
   | { type: "select-frame"; frameKey: string }
-  | { type: "start-capture" }
+  | { type: "start-capture"; attemptId: string }
+  | { type: "start-fallback-capture"; attemptId: string }
   | {
       type: "capture-complete";
+      attemptId: string;
       candidate: ReviewCandidate;
       reviewEnabled: boolean;
     }
@@ -39,6 +42,7 @@ export type CaptureFlowAction =
 export const INITIAL_CAPTURE_FLOW_STATE: CaptureFlowState = {
   phase: "picker",
   frameKey: null,
+  captureAttemptId: null,
   candidate: null,
   autoAcceptPending: false,
   error: null,
@@ -54,6 +58,7 @@ export function reduceCaptureFlow(
       return {
         phase: "ready",
         frameKey: action.frameKey,
+        captureAttemptId: null,
         candidate: null,
         autoAcceptPending: false,
         error: null,
@@ -61,13 +66,40 @@ export function reduceCaptureFlow(
 
     case "start-capture":
       if (state.phase !== "ready" || !state.frameKey) return state;
-      return { ...state, phase: "capturing", error: null };
+      return {
+        ...state,
+        phase: "capturing",
+        captureAttemptId: action.attemptId,
+        error: null,
+      };
+
+    case "start-fallback-capture":
+      if (
+        state.phase !== "picker"
+        && !(state.phase === "ready" && state.frameKey === null)
+      ) {
+        return state;
+      }
+      return {
+        phase: "capturing",
+        frameKey: null,
+        captureAttemptId: action.attemptId,
+        candidate: null,
+        autoAcceptPending: false,
+        error: null,
+      };
 
     case "capture-complete":
-      if (state.phase !== "capturing") return state;
+      if (
+        state.phase !== "capturing"
+        || state.captureAttemptId !== action.attemptId
+      ) {
+        return state;
+      }
       return {
         ...state,
         phase: action.reviewEnabled ? "reviewing" : "accepting",
+        captureAttemptId: null,
         candidate: action.candidate,
         autoAcceptPending: action.reviewEnabled,
         error: null,
@@ -87,6 +119,7 @@ export function reduceCaptureFlow(
       return {
         phase: "ready",
         frameKey: state.frameKey,
+        captureAttemptId: null,
         candidate: null,
         autoAcceptPending: false,
         error: null,
@@ -121,6 +154,7 @@ export function reduceCaptureFlow(
       return {
         phase: "handoff",
         frameKey: null,
+        captureAttemptId: null,
         candidate: null,
         autoAcceptPending: false,
         error: null,

@@ -14,11 +14,15 @@ const candidate: ReviewCandidate = {
   canvas,
 };
 
-function capturing(frameKey = "lighthouse"): CaptureFlowState {
+function capturing(
+  frameKey = "lighthouse",
+  captureAttemptId = "attempt-current",
+): CaptureFlowState {
   return {
     ...INITIAL_CAPTURE_FLOW_STATE,
     phase: "capturing",
     frameKey,
+    captureAttemptId,
   };
 }
 
@@ -31,20 +35,26 @@ describe("reduceCaptureFlow", () => {
     expect(ready).toEqual({
       phase: "ready",
       frameKey: "beacon",
+      captureAttemptId: null,
       candidate: null,
       autoAcceptPending: false,
       error: null,
     });
 
-    expect(reduceCaptureFlow(ready, { type: "start-capture" })).toEqual({
+    expect(reduceCaptureFlow(ready, {
+      type: "start-capture",
+      attemptId: "attempt-framed",
+    })).toEqual({
       ...ready,
       phase: "capturing",
+      captureAttemptId: "attempt-framed",
     });
   });
 
   test("capture completion retains the selected Frame and enters timed review", () => {
     const next = reduceCaptureFlow(capturing(), {
       type: "capture-complete",
+      attemptId: "attempt-current",
       candidate,
       reviewEnabled: true,
     });
@@ -52,6 +62,7 @@ describe("reduceCaptureFlow", () => {
     expect(next).toEqual({
       phase: "reviewing",
       frameKey: "lighthouse",
+      captureAttemptId: null,
       candidate,
       autoAcceptPending: true,
       error: null,
@@ -61,6 +72,7 @@ describe("reduceCaptureFlow", () => {
   test("Retake returns to ready with the same Frame", () => {
     const reviewing = reduceCaptureFlow(capturing(), {
       type: "capture-complete",
+      attemptId: "attempt-current",
       candidate,
       reviewEnabled: true,
     });
@@ -71,6 +83,7 @@ describe("reduceCaptureFlow", () => {
     })).toEqual({
       phase: "ready",
       frameKey: "lighthouse",
+      captureAttemptId: null,
       candidate: null,
       autoAcceptPending: false,
       error: null,
@@ -80,6 +93,7 @@ describe("reduceCaptureFlow", () => {
   test("acceptance synchronously enters accepting and disables automatic acceptance", () => {
     const reviewing = reduceCaptureFlow(capturing(), {
       type: "capture-complete",
+      attemptId: "attempt-current",
       candidate,
       reviewEnabled: true,
     });
@@ -98,6 +112,7 @@ describe("reduceCaptureFlow", () => {
     const accepting: CaptureFlowState = {
       phase: "accepting",
       frameKey: "lighthouse",
+      captureAttemptId: null,
       candidate,
       autoAcceptPending: false,
       error: null,
@@ -110,6 +125,7 @@ describe("reduceCaptureFlow", () => {
     })).toEqual({
       phase: "reviewing",
       frameKey: "lighthouse",
+      captureAttemptId: null,
       candidate,
       autoAcceptPending: false,
       error: "Could not save the photo",
@@ -120,6 +136,7 @@ describe("reduceCaptureFlow", () => {
     const accepting: CaptureFlowState = {
       phase: "accepting",
       frameKey: "lighthouse",
+      captureAttemptId: null,
       candidate,
       autoAcceptPending: false,
       error: null,
@@ -131,6 +148,7 @@ describe("reduceCaptureFlow", () => {
     })).toEqual({
       phase: "handoff",
       frameKey: null,
+      captureAttemptId: null,
       candidate: null,
       autoAcceptPending: false,
       error: null,
@@ -141,6 +159,7 @@ describe("reduceCaptureFlow", () => {
     const handoff: CaptureFlowState = {
       phase: "handoff",
       frameKey: null,
+      captureAttemptId: null,
       candidate: null,
       autoAcceptPending: false,
       error: null,
@@ -154,6 +173,7 @@ describe("reduceCaptureFlow", () => {
   test("review-disabled capture moves directly to accepting", () => {
     const next = reduceCaptureFlow(capturing(), {
       type: "capture-complete",
+      attemptId: "attempt-current",
       candidate,
       reviewEnabled: false,
     });
@@ -167,6 +187,7 @@ describe("reduceCaptureFlow", () => {
   test("More Time cancels only the current candidate's timer", () => {
     const reviewing = reduceCaptureFlow(capturing(), {
       type: "capture-complete",
+      attemptId: "attempt-current",
       candidate,
       reviewEnabled: true,
     });
@@ -184,6 +205,7 @@ describe("reduceCaptureFlow", () => {
   test("stale candidate callbacks and actions are identity no-ops", () => {
     const reviewing = reduceCaptureFlow(capturing(), {
       type: "capture-complete",
+      attemptId: "attempt-current",
       candidate,
       reviewEnabled: true,
     });
@@ -211,5 +233,104 @@ describe("reduceCaptureFlow", () => {
     for (const action of staleAcceptanceActions) {
       expect(reduceCaptureFlow(accepting, action)).toBe(accepting);
     }
+  });
+
+  test("camera fallback completes a legal frameless capture through handoff", () => {
+    const fallbackCandidate: ReviewCandidate = {
+      id: "candidate-fallback",
+      source: "camera-fallback",
+      canvas,
+    };
+    const capturingFallback = reduceCaptureFlow(INITIAL_CAPTURE_FLOW_STATE, {
+      type: "start-fallback-capture",
+      attemptId: "attempt-fallback",
+    });
+    expect(capturingFallback).toEqual({
+      phase: "capturing",
+      frameKey: null,
+      captureAttemptId: "attempt-fallback",
+      candidate: null,
+      autoAcceptPending: false,
+      error: null,
+    });
+
+    const reviewingFallback = reduceCaptureFlow(capturingFallback, {
+      type: "capture-complete",
+      attemptId: "attempt-fallback",
+      candidate: fallbackCandidate,
+      reviewEnabled: true,
+    });
+    expect(reviewingFallback).toEqual({
+      phase: "reviewing",
+      frameKey: null,
+      captureAttemptId: null,
+      candidate: fallbackCandidate,
+      autoAcceptPending: true,
+      error: null,
+    });
+
+    const acceptingFallback = reduceCaptureFlow(reviewingFallback, {
+      type: "accept",
+      candidateId: fallbackCandidate.id,
+    });
+    expect(acceptingFallback.phase).toBe("accepting");
+    expect(reduceCaptureFlow(acceptingFallback, {
+      type: "enqueue-succeeded",
+      candidateId: fallbackCandidate.id,
+    })).toEqual({
+      phase: "handoff",
+      frameKey: null,
+      captureAttemptId: null,
+      candidate: null,
+      autoAcceptPending: false,
+      error: null,
+    });
+  });
+
+  test("an old completion after Retake and a new start cannot install its candidate", () => {
+    const ready = reduceCaptureFlow(INITIAL_CAPTURE_FLOW_STATE, {
+      type: "select-frame",
+      frameKey: "lighthouse",
+    });
+    const firstCapture = reduceCaptureFlow(ready, {
+      type: "start-capture",
+      attemptId: "attempt-first",
+    });
+    const firstReview = reduceCaptureFlow(firstCapture, {
+      type: "capture-complete",
+      attemptId: "attempt-first",
+      candidate,
+      reviewEnabled: true,
+    });
+    const readyAgain = reduceCaptureFlow(firstReview, {
+      type: "retake",
+      candidateId: candidate.id,
+    });
+    const secondCapture = reduceCaptureFlow(readyAgain, {
+      type: "start-capture",
+      attemptId: "attempt-second",
+    });
+    const staleCandidate: ReviewCandidate = {
+      ...candidate,
+      id: "candidate-stale",
+    };
+
+    expect(reduceCaptureFlow(secondCapture, {
+      type: "capture-complete",
+      attemptId: "attempt-first",
+      candidate: staleCandidate,
+      reviewEnabled: true,
+    })).toBe(secondCapture);
+
+    const secondCandidate: ReviewCandidate = {
+      ...candidate,
+      id: "candidate-second",
+    };
+    expect(reduceCaptureFlow(secondCapture, {
+      type: "capture-complete",
+      attemptId: "attempt-second",
+      candidate: secondCandidate,
+      reviewEnabled: true,
+    }).candidate).toBe(secondCandidate);
   });
 });
