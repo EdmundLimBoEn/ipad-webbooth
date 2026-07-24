@@ -17,7 +17,7 @@ import {
   encodeCanvas,
 } from "../templates";
 import { frameLabel } from "../frame-packs/catalog";
-import { createOutboxStore, type OutboxItem } from "./booth-session/outbox";
+import { createOutboxStore, type OutboxItem, type OutboxStore } from "./booth-session/outbox";
 import {
   BoothSession,
   runCaptureSequence,
@@ -93,6 +93,11 @@ import {
   type SupportedLocale,
 } from "../i18n/catalog";
 import type { EventExperience } from "../event-config";
+import {
+  RehearsalClient,
+  type RehearsalClientState,
+} from "./booth-session/rehearsal-client";
+import { RehearsalStatus } from "./rehearsal-status";
 
 type Status = "starting" | "picking" | "ready" | "denied" | "running";
 type OperationalState = BoothOperationalClientState;
@@ -102,6 +107,13 @@ const INITIAL_UPLOAD_STATE: UploadState = {
   pendingCount: 0,
   error: null,
   durable: true,
+};
+
+const INITIAL_REHEARSAL_STATE: RehearsalClientState = {
+  rehearsal: null,
+  pendingEvidence: 0,
+  durable: true,
+  error: null,
 };
 
 function uploadErrorClass(status: number): UploadErrorClass {
@@ -163,6 +175,8 @@ export default function Booth() {
   const shutterRef = useRef<HTMLButtonElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<BoothSession | null>(null);
+  const photoOutboxRef = useRef<OutboxStore | null>(null);
+  const rehearsalClientRef = useRef<RehearsalClient | null>(null);
   const statePollerRef = useRef<BoothStatePoller | null>(null);
   const heartbeatReporterRef = useRef<BoothHeartbeatReporter | null>(null);
   const captureRef = useRef<AbortController | null>(null);
@@ -217,6 +231,9 @@ export default function Booth() {
   const [wakeState, setWakeState] =
     useState<WakeRequestState | "idle">("idle");
   const [durableHandoffActive, setDurableHandoffActive] = useState(false);
+  const [requestedRehearsalId, setRequestedRehearsalId] = useState<string | null>(null);
+  const [rehearsalState, setRehearsalState] =
+    useState<RehearsalClientState>(INITIAL_REHEARSAL_STATE);
   // Frames remain unavailable until authenticated preflight returns the safe
   // Event experience. `null` is never shown while the Booth is locked.
   const [enabled, setEnabled] = useState<string[] | null>(null);
@@ -234,6 +251,10 @@ export default function Booth() {
       message(locale, key, values),
     [locale],
   );
+
+  useEffect(() => {
+    setRequestedRehearsalId(new URL(window.location.href).searchParams.get("rehearsal"));
+  }, [event]);
 
   const startCamera = useCallback(async () => {
     if (operationalRef.current.paused || unmountedRef.current) return;
@@ -562,15 +583,30 @@ export default function Booth() {
         )
       );
     };
+    const photoOutbox = createOutboxStore();
+    photoOutboxRef.current = photoOutbox;
     session = new BoothSession(
       event,
-      createOutboxStore(),
+      photoOutbox,
       uploadOne,
       acknowledge,
       undefined,
       undefined,
       {
         onAuthRequired: (itemId) => lifecycle.authRequired(session, itemId),
+        observer: {
+          onAcknowledged: (item) => {
+            const client = rehearsalClientRef.current;
+            if (!client) return;
+            void client.recordAcknowledgement(item).then(async () => {
+              const remaining = await photoOutbox.list(event);
+              if (remaining.length === 0) await client.recordEmptyOutbox();
+            });
+          },
+          onUploadFailure: (item, failure) => {
+            void rehearsalClientRef.current?.recordUploadFailure(item, failure);
+          },
+        },
       }
     );
     sessionRef.current = session;
@@ -596,9 +632,13 @@ export default function Booth() {
     const reconsiderConnectivity = () => {
       setOnline(navigator.onLine);
       void session.reconsider("connectivity");
+      void rehearsalClientRef.current?.drainEvidence();
     };
     const reconsiderForeground = () => {
-      if (document.visibilityState === "visible") void session.reconsider("foreground");
+      if (document.visibilityState === "visible") {
+        void session.reconsider("foreground");
+        void rehearsalClientRef.current?.drainEvidence();
+      }
     };
     window.addEventListener("online", reconsiderConnectivity);
     window.addEventListener("offline", reconsiderConnectivity);
@@ -610,6 +650,7 @@ export default function Booth() {
       window.removeEventListener("offline", reconsiderConnectivity);
       document.removeEventListener("visibilitychange", reconsiderForeground);
       if (sessionRef.current === session) sessionRef.current = null;
+      if (photoOutboxRef.current === photoOutbox) photoOutboxRef.current = null;
       stopBoothOperationalClients(poller, reporter);
       if (credentialRef.current === credential) credentialRef.current = null;
       if (statePollerRef.current === poller) statePollerRef.current = null;
@@ -617,6 +658,63 @@ export default function Booth() {
       void lifecycle.leaveEvent(session);
     };
   }, [applyOperationalState, event, lifecycle]);
+
+  useEffect(() => {
+    if (
+      accessState !== "ready"
+      || !requestedRehearsalId
+      || !credentialRef.current?.key
+      || !photoOutboxRef.current
+    ) return;
+    let cancelled = false;
+    const storageKey = `webbooth:${event}:rehearsal:${requestedRehearsalId}:boot`;
+    let previousBootId: string | null = null;
+    try { previousBootId = window.sessionStorage.getItem(storageKey); } catch { /* restricted storage */ }
+    const client = new RehearsalClient({
+      event,
+      rehearsalId: requestedRehearsalId,
+      key: () => credentialRef.current?.key ?? "",
+      previousBootId,
+    });
+    rehearsalClientRef.current = client;
+    const unsubscribe = client.subscribe((next) => {
+      if (!cancelled) setRehearsalState(next);
+    });
+    void (async () => {
+      try {
+        await client.join();
+        if (cancelled) return;
+        try { window.sessionStorage.setItem(storageKey, client.bootId); } catch { /* restricted storage */ }
+        const recovered = await photoOutboxRef.current?.list(event) ?? [];
+        await client.recordRecovery(recovered);
+        await client.drainEvidence();
+      } catch (cause) {
+        if (!cancelled) {
+          setError(cause instanceof Error ? cause.message : label("rehearsalJoinError"));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unsubscribe();
+      client.stop();
+      if (rehearsalClientRef.current === client) rehearsalClientRef.current = null;
+      setRehearsalState(INITIAL_REHEARSAL_STATE);
+    };
+  }, [accessState, event, label, requestedRehearsalId]);
+
+  useEffect(() => {
+    if (
+      !rehearsalState.rehearsal
+      || (status !== "picking" && status !== "ready" && status !== "running")
+      || !deviceIdRef.current
+    ) return;
+    void rehearsalClientRef.current?.recordReadiness({
+      deviceId: deviceIdRef.current,
+      cameraReady: true,
+      durableStorage: uploadState.durable,
+    });
+  }, [rehearsalState.rehearsal, status, uploadState.durable]);
 
   useEffect(() => {
     const reporter = heartbeatReporterRef.current;
@@ -693,6 +791,7 @@ export default function Booth() {
             source: candidate.source,
             ...(candidate.frameKey ? { frameKey: candidate.frameKey } : {}),
           },
+          rehearsalId: rehearsalClientRef.current?.rehearsalIdForNewCapture(),
         },
       );
       if (
@@ -991,6 +1090,20 @@ export default function Booth() {
     <>
       <link rel="manifest" href={`/${event}/manifest.webmanifest`} />
       <main className={styles.booth}>
+      <RehearsalStatus
+        locale={locale}
+        state={rehearsalState}
+        currentFrame={mode}
+        onLeave={() => {
+          rehearsalClientRef.current?.stop();
+          rehearsalClientRef.current = null;
+          setRequestedRehearsalId(null);
+          setRehearsalState(INITIAL_REHEARSAL_STATE);
+          const url = new URL(window.location.href);
+          url.searchParams.delete("rehearsal");
+          window.history.replaceState(null, "", url);
+        }}
+      />
       {/* framed box is exactly the slot's aspect at the largest size that fits,
           so the cover-cropped preview is edge-to-edge what composite() captures */}
       <video

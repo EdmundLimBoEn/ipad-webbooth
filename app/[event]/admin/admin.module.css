@@ -188,3 +188,48 @@
 @media (max-width: 600px) { .experiencePanel { grid-template-columns: 1fr; }.localeOptions { grid-template-columns: 1fr; }.experienceField { grid-template-columns: 1fr; gap: 6px; } }
 @media (max-width: 700px) { .presetHeading, .presetWorkspace { grid-template-columns: 1fr; }.presetLibraryRow { grid-template-columns: 1fr; }.presetList { grid-template-columns: 1fr; }.presetList li { grid-template-columns: 1fr; }.presetList button { width: 100%; }.presetConfirm > div { display: grid; grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { .console *, .console *::before, .console *::after, .authPage *, .authPage *::before, .authPage *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; } }
+
+.rehearsalPanel { border-block: 3px solid var(--ink); padding-block: 20px; }
+.rehearsalHead { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.rehearsalHead span { color: var(--pink); font: 800 10px/1 ui-monospace, monospace; text-transform: uppercase; }
+.rehearsalHead h2 { margin-top: 8px; font: 900 clamp(30px, 4vw, 52px)/.9 Impact, "Arial Narrow", sans-serif; text-transform: uppercase; }
+.rehearsalHead p { max-width: 60ch; margin-top: 8px; font-size: 13px; line-height: 1.4; }
+.rehearsalHead button, .rehearsalPanel button { min-height: 44px; border: 2px solid var(--ink); padding: 10px 12px; color: var(--ink); background: var(--amber); font: 800 11px/1.15 system-ui, sans-serif; cursor: pointer; }
+.rehearsalPanel button:disabled { cursor: wait; opacity: .55; }
+.rehearsalConfirm { max-width: 260px; border: 2px solid var(--ink); padding: 10px; background: #fff; }
+.rehearsalConfirm button { margin: 7px 7px 0 0; }
+.rehearsalLive { min-height: 20px; margin-top: 9px; color: #8f1239; font-weight: 800; }
+.rehearsalIdentity { display: grid; grid-template-columns: minmax(0, 1fr) 120px; gap: 14px; margin-top: 10px; border: 2px solid var(--ink); padding: 13px; color: #fff; background: var(--ink); }
+.rehearsalIdentity strong, .rehearsalIdentity code, .rehearsalIdentity a { display: block; overflow-wrap: anywhere; }
+.rehearsalIdentity code { margin-block: 8px; color: var(--amber); font-size: 10px; }
+.rehearsalIdentity a { color: #fff; font-size: 12px; }
+.rehearsalIdentity img { width: 120px; height: 120px; padding: 5px; background: #fff; }
+.rehearsalRequirements { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 12px 0; padding: 0; list-style: none; }
+.rehearsalRequirements li { border-inline-start: 7px solid var(--pink); padding: 10px; background: #fff; font-weight: 800; }
+.rehearsalRequirements li[data-complete="true"] { border-color: var(--green); }
+.rehearsalRequirements li span { margin-inline-end: 8px; }
+.rehearsalManual { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; border: 2px solid var(--ink); padding: 12px; }
+.rehearsalManual legend { padding-inline: 7px; font-weight: 900; }
+.rehearsalManual label { display: flex; min-height: 44px; align-items: center; gap: 9px; padding: 7px; background: #fff; font-size: 12px; font-weight: 700; }
+.rehearsalManual input { inline-size: 22px; block-size: 22px; }
+.rehearsalPhotos { margin-top: 14px; }
+.rehearsalPhotos h3 { font: 900 22px/1 Impact, sans-serif; text-transform: uppercase; }
+.rehearsalPhotos ul { display: grid; gap: 8px; margin-top: 8px; padding: 0; list-style: none; }
+.rehearsalPhotos li { position: relative; border: 2px solid var(--ink); padding: 11px; background: #fff; }
+.rehearsalPhotos li > bdi, .rehearsalPhotos li > span { display: block; }
+.rehearsalPhotos code { overflow-wrap: anywhere; font-size: 10px; }
+.rehearsalPhotos li > div { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.rehearsalDeleteConfirm { border: 2px solid var(--pink); padding: 12px; color: #fff; background: var(--ink); }
+.rehearsalDeleteConfirm strong, .rehearsalDeleteConfirm span, .rehearsalDeleteConfirm bdi { flex-basis: 100%; }
+.rehearsalDeleteConfirm code { color: var(--amber); }
+.rehearsalAbandon { width: 100%; margin-top: 10px; border-style: dashed !important; background: #fff !important; }
+
+@media (forced-colors: active) {
+  .rehearsalPanel button:focus-visible, .rehearsalPanel input:focus-visible, .rehearsalPanel a:focus-visible { outline: 3px solid Highlight !important; outline-offset: 3px; }
+  .rehearsalIdentity, .rehearsalDeleteConfirm { border-color: CanvasText; background: Canvas; color: CanvasText; }
+}
+@media (max-width: 600px) {
+  .rehearsalHead { flex-direction: column; }
+  .rehearsalIdentity { grid-template-columns: 1fr; }
+  .rehearsalRequirements, .rehearsalManual { grid-template-columns: 1fr; }
+}

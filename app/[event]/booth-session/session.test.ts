@@ -117,6 +117,74 @@ function versionOneIndexedDb(rows: OutboxItem[]) {
 }
 
 describe("BoothSession outbox", () => {
+  test("isolates observer callbacks after durable acknowledgement and failure writes", async () => {
+    const events: string[] = [];
+    class ObservedStore extends MemoryOutboxStore {
+      override async remove(id: string) {
+        await super.remove(id);
+        events.push(`removed:${id}`);
+      }
+      override async markFailure(item: OutboxItem, ownerId: string, now: number) {
+        const saved = await super.markFailure(item, ownerId, now);
+        if (saved) events.push(`failed:${item.id}:${item.attempts}`);
+        return saved;
+      }
+    }
+    const successStore = new ObservedStore();
+    const success = new BoothSession(
+      "party",
+      successStore,
+      async () => ({ url: "/photo", key: "party/current.jpg" }),
+      undefined,
+      () => "018f0000-0000-4000-8000-000000000501",
+      () => 1_753_315_200_000,
+      {
+        observer: {
+          onAcknowledged: (item) => {
+            events.push(`observed:${item.id}`);
+            throw new Error("observer is isolated");
+          },
+        },
+      },
+    );
+    await success.enqueueCapture(async () => photo("current"), {
+      metadata: { source: "framed", frameKey: "square" },
+    });
+    await success.process();
+
+    const failureStore = new ObservedStore();
+    const failure = new BoothSession(
+      "party",
+      failureStore,
+      async () => { throw new TypeError("offline"); },
+      undefined,
+      () => "018f0000-0000-4000-8000-000000000502",
+      () => 1_753_315_200_100,
+      {
+        ownerId: "observer-owner",
+        observer: {
+          onUploadFailure: (item, classified) => {
+            events.push(`observed-failure:${item.id}:${classified.kind}`);
+            throw new Error("observer is isolated");
+          },
+        },
+      },
+    );
+    await failure.enqueueCapture(async () => photo("offline"), {
+      metadata: { source: "camera-fallback" },
+    });
+    await failure.process();
+
+    expect(events).toEqual([
+      "removed:018f0000-0000-4000-8000-000000000501",
+      "observed:018f0000-0000-4000-8000-000000000501",
+      "failed:018f0000-0000-4000-8000-000000000502:1",
+      "observed-failure:018f0000-0000-4000-8000-000000000502:retryable",
+    ]);
+    expect(await successStore.list("party")).toEqual([]);
+    expect((await failureStore.list("party"))[0].attempts).toBe(1);
+  });
+
   test("acknowledges the exact stored item and response only after exact-row removal", async () => {
     const itemWasRemoved: boolean[] = [];
     const acknowledgements: UploadAcknowledgement[] = [];

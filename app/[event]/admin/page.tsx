@@ -35,6 +35,7 @@ import {
 import { BoothOperationsPanel } from "./booth-operations-panel";
 import { ConfigHistoryPanel } from "./config-history-panel";
 import { ExportPanel } from "./export-panel";
+import { RehearsalPanel } from "./rehearsal-panel";
 import { ModerationDialog } from "./moderation-dialog";
 import {
   ModerationPanel,
@@ -1259,6 +1260,14 @@ export default function Admin() {
             onLoadMore={() => void loadMoreBooths()}
             onPause={() => void updateBoothOperationalState(true)}
             onResume={() => void updateBoothOperationalState(false)}
+          />
+
+          <RehearsalPanel
+            event={event}
+            adminKey={adminKey}
+            locale={uiLocale}
+            origin={origin}
+            onUnauthorized={invalidateAuth}
           />
 
           <ModerationPanel

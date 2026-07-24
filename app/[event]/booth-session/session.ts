@@ -19,6 +19,16 @@ export type OnAcknowledged = (
   acknowledgement: UploadAcknowledgement,
 ) => void;
 
+export type ClassifiedFailure = {
+  kind: "retryable" | "permanent" | "auth";
+  errorClass: import("./retry-policy").UploadErrorClass;
+};
+
+export type BoothSessionObserver = {
+  onAcknowledged?: (item: OutboxItem, result: UploadResult) => void | Promise<void>;
+  onUploadFailure?: (item: OutboxItem, failure: ClassifiedFailure) => void | Promise<void>;
+};
+
 export type EnqueueCaptureOptions = {
   signal?: AbortSignal;
   metadata: Omit<CaptureMetadata, "capturedAt">;
@@ -30,6 +40,7 @@ export type BoothSessionOptions = {
   leaseTtlMs?: number;
   random?: () => number;
   onAuthRequired?: (itemId: string) => void | Promise<void>;
+  observer?: BoothSessionObserver;
   setTimer?: (callback: () => void, delayMs: number) => unknown;
   clearTimer?: (timer: unknown) => void;
 };
@@ -54,6 +65,7 @@ export class BoothSession {
   private readonly leaseTtlMs: number;
   private readonly random: () => number;
   private readonly onAuthRequired: (itemId: string) => void | Promise<void>;
+  private readonly observer: BoothSessionObserver;
   private readonly setTimer: (callback: () => void, delayMs: number) => unknown;
   private readonly clearTimer: (timer: unknown) => void;
 
@@ -70,6 +82,7 @@ export class BoothSession {
     this.leaseTtlMs = options.leaseTtlMs ?? 30_000;
     this.random = options.random ?? Math.random;
     this.onAuthRequired = options.onAuthRequired ?? (() => {});
+    this.observer = options.observer ?? {};
     this.setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
     this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
   }
@@ -303,6 +316,11 @@ export class BoothSession {
       } catch {
         // The next state publication still reconciles the Booth UI.
       }
+      try {
+        this.observer.onAcknowledged?.(item, result);
+      } catch {
+        // Operational evidence cannot affect an acknowledged photo queue row.
+      }
 
       if (this.stopRequested) return;
 
@@ -369,6 +387,14 @@ export class BoothSession {
         this.scheduleWake();
       }
       return;
+    }
+    try {
+      await this.observer.onUploadFailure?.(failed, {
+        kind: failed.failureKind ?? "permanent",
+        errorClass: failed.errorClass ?? "unknown",
+      });
+    } catch {
+      // Operational evidence cannot affect the already-persisted failure row.
     }
     this.retryAt = disposition.kind === "retryable" ? failed.nextAttemptAt ?? null : null;
     this.publish({

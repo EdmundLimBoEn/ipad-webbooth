@@ -1041,3 +1041,41 @@
     transform: none;
   }
 }
+
+.rehearsalStatus {
+  position: fixed;
+  inset-block-start: 12px;
+  inset-inline-start: 12px;
+  z-index: 35;
+  width: min(390px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  overflow: auto;
+  border: 3px solid #fff;
+  padding: 14px;
+  color: #fff;
+  background: rgba(12, 12, 12, .94);
+  box-shadow: 7px 7px 0 #c51651;
+}
+.rehearsalStatus > div:first-child p {
+  color: #ffd544;
+  font: 800 10px/1 ui-monospace, monospace;
+  text-transform: uppercase;
+}
+.rehearsalStatus h2 { margin-block: 6px; font: 900 25px/1 system-ui, sans-serif; }
+.rehearsalStatus code { overflow-wrap: anywhere; font-size: 10px; }
+.rehearsalStatus dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-block: 12px; }
+.rehearsalStatus dl div { border: 1px solid #777; padding: 8px; }
+.rehearsalStatus dt { color: #bbb; font-size: 10px; }
+.rehearsalStatus dd { margin-top: 4px; font-weight: 800; }
+.rehearsalStatus > p { margin-block: 10px; font-size: 12px; line-height: 1.4; }
+.rehearsalStatus .rehearsalWarning { border-inline-start: 5px solid #ffd544; padding: 9px; color: #111; background: #ffd544; }
+.rehearsalStatus button { min-width: 44px; min-height: 44px; width: 100%; border: 2px solid #fff; color: #fff; background: #c51651; font-weight: 900; cursor: pointer; }
+.rehearsalStatus button:focus-visible { outline: 3px solid #ffd544; outline-offset: 3px; }
+
+@media (forced-colors: active) {
+  .rehearsalStatus { border-color: CanvasText; background: Canvas; color: CanvasText; box-shadow: none; }
+  .rehearsalStatus button:focus-visible { outline-color: Highlight; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rehearsalStatus, .rehearsalStatus * { animation: none !important; transition: none !important; }
+}
