@@ -27,6 +27,63 @@ staging HTTPS before production promotion:
 9. Confirm Screen Wake Lock remains active across foreground return. If the target iPadOS denies or lacks it, follow the displayed instructions and set **Settings → Display & Brightness → Auto-Lock → Never** for the event.
 10. Queue one pending photo, use the discoverable Operator control, reject one wrong fresh key, then exit with a valid fresh Booth or Admin Key. Confirm the camera and wake lock release, heartbeat/poller/session activity stops, stored credentials clear, and the pending count remains intact after relaunch.
 
+### Release 2 guest capture and handoff
+
+Continue on the same throwaway staging Event, target iPad, and staging HTTPS
+hostname. The mocked WebKit journey is a repeatable regression check; it does
+not replace any check in this section.
+
+1. Capture every enabled Frame with the real iPad camera. Inspect the final
+   canvas at its configured resolution for crop, orientation, background and
+   overlay order, color, and memory stability. Exercise both one-shot and
+   multi-shot Frames.
+2. Confirm the review shows the exact completed composite. Retake and verify
+   the same Frame remains selected. Accept and verify the Frame clears only
+   after the photo is durably in the Photo Outbox.
+3. Let auto-accept win once, cancel it with **More Time** once, and rapidly
+   alternate **Use Photo** and **Retake** near the timeout. Each candidate must
+   create at most one Outbox row and one capture identity.
+4. Exercise an encoding failure on staging or a diagnostic build. Confirm no
+   Outbox row is created, the error is announced, and **Use Photo** can retry
+   or **Retake** can recover without reloading.
+5. Deny or disable in-browser camera access and use the file-camera fallback
+   with a real HEIC photo. Confirm decode, orientation, exact review, acceptance,
+   and the accessible decode-error recovery path.
+6. Pause the Event while a guest is reviewing, then while acceptance is
+   persisting. Review must remain safe; acceptance must either reach durable
+   handoff exactly once or report a recoverable error before the camera stops.
+7. Disable the venue network, accept a photo, and confirm the queued handoff
+   lets the next guest continue without inventing a QR. Restore connectivity
+   and verify ordered upload with no duplicate object.
+8. Queue two guests. Keep the older upload acknowledgement delayed until the
+   newer handoff has begun. The older acknowledgement must not replace, reopen,
+   or produce a QR for the current guest.
+9. When the current acknowledgement arrives, compare the visible text link
+   with the QR target. Scan the QR using a second physical phone and verify the
+   staging Gallery opens the exact complete Event-owned key and photo. A
+   localhost QR is not valid evidence.
+10. With VoiceOver on the iPad and second phone, traverse Frame selection,
+    countdown status, review actions, queued/ready handoff, direct-photo status,
+    and save/share. Confirm logical focus order, visible focus, concise
+    announcements, and no repeated or stale announcement.
+11. Select Arabic and confirm right-to-left document direction, then `zh-SG`.
+    Exercise an unavailable device/config locale and an absent localized Frame
+    label; both must fall back to English/default Frame text without a blank
+    control. Relaunch and confirm the supported Event-scoped locale persists.
+12. Enable countdown audio after a guest gesture and confirm bounded countdown
+    and shutter tones. Repeat with audio denied or unavailable: the visual
+    countdown and capture must continue without an error.
+13. Repeat the changed guest screens in installed landscape mode with Larger
+    Text, Reduce Motion, and Increase Contrast/high-contrast settings. Confirm
+    review controls, QR text link, and next-guest action remain visible and
+    keyboard/Switch Control operable.
+
+Record the Event slug, build revision, iPad/iPadOS model, second-phone model,
+enabled Frames, and pass/fail result for every item. Release 2 is not complete
+and production must not be promoted until every real-device item passes. Never
+remove test photos by prefix; copy and delete only each complete Event-owned
+image key intended for cleanup.
+
 Then capture one photo with every enabled Frame and check crop, draw order,
 orientation, color, and final resolution. Confirm each photo appears once in
 the Live Gallery without a full-page refresh, exercise Save/Share on a phone,

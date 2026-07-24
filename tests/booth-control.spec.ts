@@ -184,7 +184,16 @@ async function installBrowserMocks(context: BrowserContext, fixture: ApiFixture)
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({
-          experience: { frames: ["square", "beacon"] },
+          experience: {
+            frames: ["square", "beacon"],
+            locales: ["en"],
+            defaultLocale: "en",
+            capture: {
+              reviewEnabled: false,
+              autoAcceptSeconds: 5,
+              countdownAudioDefault: false,
+            },
+          },
           operationalState: {
             version: 1,
             paused: fixture.paused,
@@ -463,6 +472,8 @@ test("WebKit keeps Booth control credential-free and Outbox-safe", async ({
   await page.getByRole("button", { name: /Square 1 photo/ }).click();
   await page.getByRole("button", { name: "Start" }).click();
 
+  await expect(page.getByRole("heading", { name: "Photo safely queued." })).toBeVisible();
+  await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByRole("button", { name: /Retry 1 pending/ })).toBeVisible();
   await expect.poll(() => fixture.uploadAttempts.length).toBeGreaterThan(0);
 

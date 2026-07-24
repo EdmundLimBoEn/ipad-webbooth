@@ -42,6 +42,21 @@ bun run test:browser
 bun run deploy:staging
 ```
 
+The full WebKit command includes `tests/guest-capture.spec.ts`. To diagnose
+only the Release 2 journey without contacting a deployed environment, run:
+
+```bash
+bun run test:browser -- tests/guest-capture.spec.ts
+```
+
+It must cover exact reviewed-canvas encoding for one-shot and multi-shot
+Frames, Retake and More Time, auto-accept, encode recovery, one-identity
+button/timer races, queued next-guest continuation, stale acknowledgement
+fencing, matching QR/text targets, direct-photo lookup, Event-scoped locale
+persistence and fallback, keyboard focus, reduced motion, forced colors,
+camera-file fallback, and optional-audio failure. Any request outside the
+local test origin is a test failure.
+
 Run the complete real-iPad section in `pre-event-readiness.md` with a
 throwaway canonical staging Event that is distinct from production. The
 automated WebKit journey does not prove real Safari camera permission,
@@ -49,13 +64,17 @@ orientation/crop, camera-indicator shutdown, Add-to-Home-Screen launch,
 standalone background/foreground behavior, Screen Wake Lock, IndexedDB
 survival across relaunch, Safari cross-tab leases, venue-network reconnect
 timing, real multi-shot pause timing, or camera/wake release during Operator
-exit.
+exit. It also cannot certify full-resolution canvas memory, Safari HEIC
+decode/orientation, Web Audio activation or silent-mode behavior, physical QR
+readability, VoiceOver timing, iOS suspension/eviction, Larger Text, or actual
+high-contrast rendering.
 
 Confirm staging photos do not appear in production and staging config does not
 affect production. For smoke-test moderation, delete only one complete
 Event-owned throwaway image key. Stop promotion on any failed real-device
-check. Only after recording a passing iPad rehearsal should you promote
-explicitly:
+check. For Release 2, retain the rehearsal record named in
+`pre-event-readiness.md`, including the second-phone exact-photo QR result.
+Only after recording a passing iPad rehearsal should you promote explicitly:
 
 ```bash
 bun run deploy:production
