@@ -14,6 +14,14 @@ import {
   type EventExperience,
 } from "./event-config";
 import {
+  EVENT_PRESET_VERSION,
+  isPresetId,
+  parseEventPreset,
+  serializePresetExperience,
+  validatePresetLabel,
+  type EventPreset,
+} from "./event-preset";
+import {
   BOOTH_STALE_AFTER_MS,
   parseBoothHeartbeat,
   parseBoothHeartbeatRecord,
@@ -254,6 +262,11 @@ export const boothHeartbeatKey = (event: string, deviceId: string) =>
 export const boothHeartbeatPrefix = (event: string) => `events/${event}/booths/`;
 export const boothOperationalStateKey = (event: string) =>
   `events/${event}/booth-state.json`;
+export const eventPresetKey = (presetId: string) => {
+  if (!isPresetId(presetId)) throw new TypeError("invalid preset ID");
+  return `presets/${presetId}.json`;
+};
+export const eventPresetPrefix = () => "presets/";
 export const legacyEventConfigKey = (event: string) => `_config/${event}.json`;
 export const eventPhotoPrefix = (event: string) => `${event}/`;
 export const stablePhotoKey = (event: string, id: StableCaptureIdentity) =>
@@ -331,6 +344,13 @@ export type PhotoIndexRebuildResult = {
   indexed: number;
   checkpoint: string | null;
 };
+export type EventPresetListOptions = { cursor?: string; limit?: number };
+export type EventPresetPage = { presets: EventPreset[]; cursor: string | null };
+export type PutEventPresetInput = {
+  label: string;
+  config: EventExperience;
+  expectedUpdatedAt: string | null;
+};
 
 export class ConfigConflictError extends Error {
   constructor(readonly expectedRevisionId: string | null, readonly currentRevisionId: string | null) {
@@ -359,6 +379,22 @@ export class InvalidStoredConfigRevisionError extends Error {
 export class InvalidStoredEventConfigError extends Error {
   constructor(readonly event: string) {
     super(`stored config for ${event} is corrupt or uses an unsupported version`);
+  }
+}
+
+export class InvalidStoredEventPresetError extends Error {
+  constructor(readonly presetId: string) {
+    super(`stored Event preset ${presetId} is corrupt or uses an unsupported version`);
+  }
+}
+
+export class PresetConflictError extends Error {
+  constructor(
+    readonly presetId: string,
+    readonly expectedUpdatedAt: string | null,
+    readonly currentUpdatedAt: string | null,
+  ) {
+    super("Event preset changed");
   }
 }
 
@@ -468,6 +504,137 @@ export class EventStore {
     await this.state.put(eventConfigKey(event), JSON.stringify(stored), {
       httpMetadata: { contentType: "application/json", cacheControl: "no-store" },
     });
+  }
+
+  async getEventPreset(presetId: string): Promise<EventPreset | null> {
+    const key = eventPresetKey(presetId);
+    const object = await this.state.get(key);
+    if (!object) return null;
+    return this.readEventPresetObject(presetId, object);
+  }
+
+  async listEventPresets(
+    options: EventPresetListOptions = {},
+  ): Promise<EventPresetPage> {
+    const limit = options.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new TypeError("preset limit must be an integer from 1 to 100");
+    }
+    if (
+      options.cursor !== undefined
+      && (typeof options.cursor !== "string" || options.cursor.length === 0)
+    ) {
+      throw new TypeError("preset cursor is invalid");
+    }
+    const page = await this.state.list({
+      prefix: eventPresetPrefix(),
+      ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
+      limit,
+    });
+    const presets = await Promise.all(page.objects.map(async (listed) => {
+      const match = /^presets\/([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.json$/.exec(
+        listed.key,
+      );
+      if (!match) throw new InvalidStoredEventPresetError(listed.key);
+      const object = await this.state.get(listed.key);
+      if (!object) throw new InvalidStoredEventPresetError(match[1]!);
+      return this.readEventPresetObject(match[1]!, object);
+    }));
+    presets.sort((left, right) => {
+      if (left.label < right.label) return -1;
+      if (left.label > right.label) return 1;
+      if (left.id < right.id) return -1;
+      if (left.id > right.id) return 1;
+      return 0;
+    });
+    return {
+      presets,
+      cursor: page.truncated ? page.cursor ?? null : null,
+    };
+  }
+
+  async putEventPreset(
+    presetId: string,
+    input: PutEventPresetInput,
+  ): Promise<EventPreset> {
+    const key = eventPresetKey(presetId);
+    const label = validatePresetLabel(input.label);
+    const config = serializePresetExperience(input.config);
+    if (
+      input.expectedUpdatedAt !== null
+      && (
+        typeof input.expectedUpdatedAt !== "string"
+        || !Number.isFinite(Date.parse(input.expectedUpdatedAt))
+      )
+    ) {
+      throw new TypeError("expected preset timestamp is invalid");
+    }
+
+    const currentObject = await this.state.get(key);
+    const current = currentObject
+      ? await this.readEventPresetObject(presetId, currentObject)
+      : null;
+    if (
+      (input.expectedUpdatedAt === null && current !== null)
+      || (
+        input.expectedUpdatedAt !== null
+        && current?.updatedAt !== input.expectedUpdatedAt
+      )
+    ) {
+      throw new PresetConflictError(
+        presetId,
+        input.expectedUpdatedAt,
+        current?.updatedAt ?? null,
+      );
+    }
+
+    const serverTime = this.nextPresetTimestamp(current?.updatedAt ?? null);
+    const preset: EventPreset = {
+      version: EVENT_PRESET_VERSION,
+      id: presetId,
+      label,
+      createdAt: current?.createdAt ?? serverTime,
+      updatedAt: serverTime,
+      config,
+    };
+    const written = await this.state.compareAndSwap(
+      key,
+      currentObject?.etag ?? null,
+      JSON.stringify(preset),
+      jsonWriteOptions(),
+    );
+    if (!written) {
+      const raced = await this.getEventPreset(presetId);
+      throw new PresetConflictError(
+        presetId,
+        input.expectedUpdatedAt,
+        raced?.updatedAt ?? null,
+      );
+    }
+    return preset;
+  }
+
+  private async readEventPresetObject(
+    presetId: string,
+    object: StoredObjectBody,
+  ): Promise<EventPreset> {
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredEventPresetError(presetId);
+    }
+    const preset = parseEventPreset(value);
+    if (!preset || preset.id !== presetId) {
+      throw new InvalidStoredEventPresetError(presetId);
+    }
+    return preset;
+  }
+
+  private nextPresetTimestamp(previous: string | null): string {
+    const serverNow = this.now().getTime();
+    const previousTime = previous === null ? Number.NEGATIVE_INFINITY : Date.parse(previous);
+    return new Date(Math.max(serverNow, previousTime + 1)).toISOString();
   }
 
   async saveConfigRevision(

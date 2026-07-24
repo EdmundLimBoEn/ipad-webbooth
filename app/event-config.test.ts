@@ -3,6 +3,7 @@ import {
   isRevisionId,
   parseConfigRevision,
   parseEventConfig,
+  parseEventExperience,
   projectEventExperience,
   projectPublicConfig,
 } from "./event-config";
@@ -80,6 +81,18 @@ describe("event config schema", () => {
     expect(projected).toEqual({ frames: ["square"] });
     expect(JSON.stringify(projected)).not.toContain("boothKeyHash");
     expect(JSON.stringify(projected)).not.toContain("currentRevisionId");
+  });
+
+  test("exports the same explicit safe experience parser used by presets", () => {
+    expect(parseEventExperience({
+      frames: ["square"],
+      boothKeyHash: "ignored",
+      capture: { reviewEnabled: true, secret: "ignored" },
+    })).toEqual({
+      frames: ["square"],
+      capture: { reviewEnabled: true },
+    });
+    expect(parseEventExperience({ frames: ["bad/frame"] })).toBeNull();
   });
 
   test("revision parsing rejects credentials inside experience", () => {

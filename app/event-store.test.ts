@@ -11,6 +11,8 @@ import {
   InvalidPhotoIndexRebuildStateError,
   InvalidPhotoCursorError,
   InvalidStoredConfigRevisionError,
+  InvalidStoredEventPresetError,
+  PresetConflictError,
   eventConfigKey,
   eventConfigMutationKey,
   eventConfigRevisionKey,
@@ -25,6 +27,8 @@ import {
   photoIndexRebuildCheckpointKey,
   photoIndexRebuildCompleteKey,
   photoReceiptKey,
+  eventPresetKey,
+  eventPresetPrefix,
   type ListOptions,
   type ListResult,
   type StoredObjectBody,
@@ -2514,6 +2518,134 @@ describe("EventStore", () => {
           // no-op
         }
       }).toThrow("private STATE unavailable");
+    });
+  });
+
+  describe("Event presets", () => {
+    const experience = {
+      frames: ["square", "strip"],
+      locales: ["en", "zh-SG", "ar"],
+      defaultLocale: "en",
+      timeZone: "Asia/Singapore",
+      capture: {
+        reviewEnabled: true,
+        autoAcceptSeconds: 5,
+        countdownAudioDefault: false,
+      },
+      gallery: { title: "Launch Night", accentColor: "#c45f39" },
+    };
+
+    test("creates and updates one exact private preset with server timestamps", async () => {
+      let now = new Date("2026-07-24T00:00:00.000Z");
+      const photos = new InMemoryObjectStore();
+      const state = new InMemoryObjectStore();
+      const store = new EventStore(photos, state, "https://photos.example", () => now);
+
+      const created = await store.putEventPreset("launch", {
+        label: "Launch",
+        config: experience,
+        expectedUpdatedAt: null,
+      });
+      expect(created).toEqual({
+        version: 1,
+        id: "launch",
+        label: "Launch",
+        createdAt: "2026-07-24T00:00:00.000Z",
+        updatedAt: "2026-07-24T00:00:00.000Z",
+        config: experience,
+      });
+      expect(state.has(eventPresetKey("launch"))).toBeTrue();
+      expect((await state.list()).objects.map((object) => object.key)).toEqual([
+        "presets/launch.json",
+      ]);
+      expect((await photos.list()).objects).toEqual([]);
+
+      now = new Date("2026-07-24T01:00:00.000Z");
+      const updated = await store.putEventPreset("launch", {
+        label: "Launch updated",
+        config: { ...experience, frames: ["strip"] },
+        expectedUpdatedAt: created.updatedAt,
+      });
+      expect(updated.createdAt).toBe(created.createdAt);
+      expect(updated.updatedAt).toBe(now.toISOString());
+      expect(updated.config.frames).toEqual(["strip"]);
+      expect(await store.getEventPreset("launch")).toEqual(updated);
+    });
+
+    test("enforces create-only and exact observed update conflicts", async () => {
+      const state = new InMemoryObjectStore();
+      const store = new EventStore(
+        new InMemoryObjectStore(),
+        state,
+        "https://photos.example",
+        () => new Date("2026-07-24T00:00:00.000Z"),
+      );
+      const created = await store.putEventPreset("launch", {
+        label: "Launch",
+        config: experience,
+        expectedUpdatedAt: null,
+      });
+
+      await expect(store.putEventPreset("launch", {
+        label: "Duplicate",
+        config: experience,
+        expectedUpdatedAt: null,
+      })).rejects.toBeInstanceOf(PresetConflictError);
+      await expect(store.putEventPreset("launch", {
+        label: "Stale",
+        config: experience,
+        expectedUpdatedAt: "2026-07-23T00:00:00.000Z",
+      })).rejects.toBeInstanceOf(PresetConflictError);
+
+      const exactObject = await state.get(eventPresetKey("launch"));
+      const won = await state.compareAndSwap(
+        eventPresetKey("launch"),
+        exactObject!.etag,
+        JSON.stringify({ ...created, label: "Concurrent", updatedAt: "2026-07-24T00:00:01.000Z" }),
+      );
+      expect(won).toBeTrue();
+      await expect(store.putEventPreset("launch", {
+        label: "Lost race",
+        config: experience,
+        expectedUpdatedAt: created.updatedAt,
+      })).rejects.toBeInstanceOf(PresetConflictError);
+    });
+
+    test("pages privately, passes opaque cursors, and sorts each page by label then ID", async () => {
+      const state = new InMemoryObjectStore();
+      const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+      for (const [id, label] of [["z", "Beta"], ["a", "Alpha"], ["b", "Alpha"]] as const) {
+        await store.putEventPreset(id, { label, config: experience, expectedUpdatedAt: null });
+      }
+
+      const page = await store.listEventPresets({ limit: 3 });
+      expect(page.presets.map(({ id }) => id)).toEqual(["a", "b", "z"]);
+      expect(page.cursor).toBeNull();
+      await expect(store.listEventPresets({ limit: 0 })).rejects.toThrow("1 to 100");
+      await expect(store.listEventPresets({ limit: 101 })).rejects.toThrow("1 to 100");
+      await expect(store.listEventPresets({ cursor: "" })).rejects.toThrow("cursor");
+      expect(eventPresetPrefix()).toBe("presets/");
+    });
+
+    test("fails explicitly for corrupt stored presets and never offers deletion", async () => {
+      const state = new InMemoryObjectStore({
+        [eventPresetKey("broken")]: JSON.stringify({
+          version: 2,
+          id: "broken",
+          label: "Broken",
+          createdAt: "2026-07-24T00:00:00.000Z",
+          updatedAt: "2026-07-24T00:00:00.000Z",
+          config: { frames: [] },
+        }),
+      });
+      const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+      await expect(store.getEventPreset("broken")).rejects.toBeInstanceOf(
+        InvalidStoredEventPresetError,
+      );
+      await expect(store.listEventPresets()).rejects.toBeInstanceOf(
+        InvalidStoredEventPresetError,
+      );
+      expect("deleteEventPreset" in store).toBeFalse();
     });
   });
 });

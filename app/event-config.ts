@@ -43,7 +43,7 @@ export type PublicEventConfig = Omit<EventExperience, "frames"> & {
 export const isRevisionId = (value: unknown): value is string =>
   typeof value === "string" && UUID.test(value);
 
-function parseExperience(value: unknown): EventExperience | null {
+export function parseEventExperience(value: unknown): EventExperience | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
   if (!Array.isArray(v.frames) || !v.frames.every((x) => typeof x === "string" && TOKEN.test(x))) return null;
@@ -86,7 +86,7 @@ export function parseEventConfig(value: unknown): EventConfig | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
   if (v.version !== undefined && v.version !== EVENT_CONFIG_VERSION) return null;
-  const experience = parseExperience({ ...v, frames: v.frames ?? [] });
+  const experience = parseEventExperience({ ...v, frames: v.frames ?? [] });
   if (!experience) return null;
   if (v.boothKeyHash !== undefined && typeof v.boothKeyHash !== "string") return null;
   if (v.currentRevisionId !== undefined && !isRevisionId(v.currentRevisionId)) return null;
@@ -106,7 +106,7 @@ export function parseConfigRevision(value: unknown): ConfigRevision | null {
   if (v.boothKeyHash !== undefined) return null;
   if (v.sourceRevisionId !== undefined && !isRevisionId(v.sourceRevisionId)) return null;
   if (v.sourcePresetId !== undefined && (typeof v.sourcePresetId !== "string" || !TOKEN.test(v.sourcePresetId))) return null;
-  const config = parseExperience(v.config);
+  const config = parseEventExperience(v.config);
   if (!config || (v.config as Record<string, unknown>).boothKeyHash !== undefined) return null;
   return {
     version: EVENT_CONFIG_VERSION,
