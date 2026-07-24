@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { parseBoothOperationalState } from "../../booth-control";
 import {
   boothPreflightResultFromPayload,
   BoothLifecycleCoordinator,
@@ -9,13 +10,16 @@ import {
 } from "./lifecycle";
 import { MemoryOutboxStore } from "./outbox";
 import { BoothSession } from "./session";
+import { BoothStatePoller } from "./operational-client";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((next) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((next, fail) => {
     resolve = next;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 class FakeSession implements BoothLifecycleSession {
@@ -56,6 +60,8 @@ function harness(options: {
     key: string,
     signal: AbortSignal
   ) => Promise<BoothPreflightResult>;
+  onOperationalState?: (state: unknown) => void;
+  onCameraStart?: () => void;
 } = {}) {
   const events: string[] = [];
   const access: string[] = [];
@@ -78,9 +84,13 @@ function harness(options: {
     onOutboxRecovered: () => events.push("outbox-recovered"),
     onAccess: (state, feedback) => access.push(`${state}:${feedback}`),
     onFrames: (next) => frames.push(next),
-    onOperationalState: (state) => operational.push(state),
+    onOperationalState: (state) => {
+      operational.push(state);
+      options.onOperationalState?.(state);
+    },
     onCameraStart: () => {
       cameraStarts++;
+      options.onCameraStart?.();
     },
     onCameraStop: () => {
       cameraStops++;
@@ -517,4 +527,44 @@ describe("preflight operational-state validation", () => {
     expect(session.actions).not.toContain("start");
     expect(h.cameraStarts()).toBe(0);
   });
+
+  test.each(["failed", "malformed"] as const)(
+    "paused preflight remains paused when the immediate first poll is %s",
+    async (outcome) => {
+      const firstPoll = deferred<Response>();
+      const polledStates: Array<{ paused: boolean; connected: boolean }> = [];
+      let preflightPaused = false;
+      const poller = new BoothStatePoller({
+        event: "launch",
+        initialPaused: () => preflightPaused,
+        fetch: () => firstPoll.promise,
+        onState: (state) => polledStates.push(state),
+      });
+      const h = harness({
+        stored: { launch: "stored-key" },
+        preflight: async () => boothPreflightResultFromPayload({
+          experience: { frames: ["square"] },
+          operationalState: validState,
+        }),
+        onOperationalState: (value) => {
+          const state = parseBoothOperationalState(value);
+          if (!state) throw new Error("expected strict preflight state");
+          preflightPaused = state.paused;
+        },
+        onCameraStart: () => poller.start(),
+      });
+
+      await h.coordinator.beginEvent("launch", new FakeSession(), credential());
+      const completion = poller.refresh();
+      if (outcome === "failed") {
+        firstPoll.reject(new TypeError("offline"));
+      } else {
+        firstPoll.resolve(new Response(JSON.stringify({ paused: false })));
+      }
+      await completion;
+      poller.stop();
+
+      expect(polledStates).toEqual([{ paused: true, connected: false }]);
+    }
+  );
 });

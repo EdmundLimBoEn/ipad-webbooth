@@ -34,6 +34,7 @@ export function createBoothOperationalSessionState(
 
 export type BoothStatePollerOptions = {
   event: string;
+  initialPaused?: () => boolean;
   fetch?: FetchLike;
   onState?: (state: BoothOperationalClientState) => void;
   setTimer?: SetTimer;
@@ -78,6 +79,7 @@ export class BoothStatePoller {
 
   start(): void {
     if (this.started) return;
+    this.paused = this.options.initialPaused?.() ?? this.paused;
     this.started = true;
     this.stopped = false;
     this.runEpoch++;

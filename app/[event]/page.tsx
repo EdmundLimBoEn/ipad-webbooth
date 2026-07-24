@@ -386,6 +386,7 @@ export default function Booth() {
     sessionRef.current = session;
     const poller = new BoothStatePoller({
       event,
+      initialPaused: () => operationalRef.current.paused,
       onState: applyOperationalState,
     });
     statePollerRef.current = poller;
