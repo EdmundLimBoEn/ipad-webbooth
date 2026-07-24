@@ -156,6 +156,67 @@ describe("BoothSession outbox", () => {
     expect(await store.list("party")).toEqual([]);
   });
 
+  test("does not resurrect an acknowledged item when a state subscriber throws", async () => {
+    const store = new MemoryOutboxStore();
+    let uploads = 0;
+    const session = new BoothSession("party", store, async () => {
+      uploads++;
+      return { url: "/photo" };
+    });
+    session.subscribe((state) => {
+      if (uploads === 1 && state.status === "idle" && state.pendingCount === 0) {
+        throw new Error("state render failed");
+      }
+    });
+    await session.enqueueCapture(async () => photo("one"), {
+      metadata: { source: "camera-fallback" },
+    });
+
+    await session.process();
+    await session.retry();
+
+    expect(uploads).toBe(1);
+    expect(await store.list("party")).toEqual([]);
+  });
+
+  test("a post-ack list failure stops safely and retry continues with the next item", async () => {
+    class FailingReconcileStore extends MemoryOutboxStore {
+      private failNextList = false;
+
+      override async remove(id: string) {
+        await super.remove(id);
+        this.failNextList = true;
+      }
+
+      override async list(event: string) {
+        if (this.failNextList) {
+          this.failNextList = false;
+          throw new Error("outbox reconciliation failed");
+        }
+        return super.list(event);
+      }
+    }
+
+    const store = new FailingReconcileStore();
+    const uploads: string[] = [];
+    const session = new BoothSession("party", store, async (item) => {
+      uploads.push(await text(item.blob));
+      return { url: "/photo" };
+    });
+    await session.enqueueCapture(async () => photo("first"), {
+      metadata: { source: "camera-fallback" },
+    });
+    await session.enqueueCapture(async () => photo("second"), {
+      metadata: { source: "camera-fallback" },
+    });
+
+    await session.process();
+    await session.retry();
+
+    expect(uploads).toEqual(["first", "second"]);
+    expect(await store.list("party")).toEqual([]);
+  });
+
   test("persists one identity and metadata before upload", async () => {
     const store = new MemoryOutboxStore();
     const seen: OutboxItem[] = [];

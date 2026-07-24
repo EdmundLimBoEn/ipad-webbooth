@@ -40,7 +40,13 @@ export class BoothSession {
 
   private publish(next: UploadState) {
     this.state = next;
-    this.listeners.forEach((listener) => listener(next));
+    for (const listener of this.listeners) {
+      try {
+        listener(next);
+      } catch {
+        // State observers are UI-only and cannot affect durable queue state.
+      }
+    }
   }
 
   async recover() {
@@ -110,24 +116,10 @@ export class BoothSession {
         error: null,
         durable: this.store.isDurable(),
       });
+      let result: UploadResult;
       try {
-        const result = await this.upload(item);
+        result = await this.upload(item);
         await this.store.remove(item.id);
-        // Notification is outside the durable retry boundary. Storage already
-        // acknowledged and the item is gone, so a UI callback failure must not
-        // resurrect a duplicate upload.
-        try {
-          this.onUploaded(result);
-        } catch {
-          // The next state publication still reconciles the Booth UI.
-        }
-        pending = await this.store.list(this.event);
-        this.publish({
-          status: "idle",
-          pendingCount: pending.length,
-          error: null,
-          durable: this.store.isDurable(),
-        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         await this.store.put({ ...item, attempts: item.attempts + 1, lastError: message });
@@ -139,6 +131,33 @@ export class BoothSession {
         });
         return;
       }
+
+      // Everything below runs after the upload was acknowledged and the exact
+      // item was removed. Post-ack failures may pause reconciliation, but can
+      // never enter the retry path and recreate that item.
+      try {
+        this.onUploaded(result);
+      } catch {
+        // The next state publication still reconciles the Booth UI.
+      }
+
+      try {
+        pending = await this.store.list(this.event);
+      } catch (error) {
+        this.publish({
+          status: "failed",
+          pendingCount: Math.max(0, pending.length - 1),
+          error: error instanceof Error ? error.message : String(error),
+          durable: this.store.isDurable(),
+        });
+        return;
+      }
+      this.publish({
+        status: "idle",
+        pendingCount: pending.length,
+        error: null,
+        durable: this.store.isDurable(),
+      });
     }
   }
 }
