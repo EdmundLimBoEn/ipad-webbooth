@@ -625,7 +625,7 @@ export class EventStore {
       throw new TypeError("booth heartbeat limit must be an integer from 1 to 100");
     }
     const cursor = options.cursor ?? undefined;
-    if (cursor !== undefined && (typeof cursor !== "string" || cursor.trim().length === 0)) {
+    if (cursor !== undefined && (typeof cursor !== "string" || cursor.length === 0)) {
       throw new TypeError("booth heartbeat cursor is invalid");
     }
     const page = await this.state.list({

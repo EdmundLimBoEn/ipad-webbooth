@@ -125,13 +125,15 @@ class BoothStateAccessStore extends InMemoryObjectStore {
 }
 
 class LongBoothCursorStore extends InMemoryObjectStore {
-  readonly opaqueCursor = `r2:${"x".repeat(3_000)}`;
+  readonly opaqueCursor: string;
 
   constructor(
     private readonly boothPrefix: string,
-    private readonly firstKey: string
+    private readonly firstKey: string,
+    opaqueCursor = `r2:${"x".repeat(3_000)}`
   ) {
     super();
+    this.opaqueCursor = opaqueCursor;
   }
 
   override async list(options: ListOptions = {}): Promise<ListResult> {
@@ -1843,6 +1845,30 @@ describe("EventStore", () => {
     const firstPage = await store.listBoothHeartbeats("launch", { limit: 1 });
     expect(firstPage.cursor).toBe(state.opaqueCursor);
     expect(firstPage.cursor!.length).toBeGreaterThan(2_048);
+
+    const secondPage = await store.listBoothHeartbeats("launch", {
+      limit: 1,
+      cursor: firstPage.cursor,
+    });
+    expect(secondPage.booths.map((record) => record.deviceId)).toEqual([secondDevice]);
+  });
+
+  test("passes a whitespace-only opaque storage cursor through unchanged", async () => {
+    const firstDevice = "018f0000-0000-4000-8000-000000000001";
+    const secondDevice = "018f0000-0000-4000-8000-000000000002";
+    const prefix = "events/launch/booths/";
+    const whitespaceCursor = " \t\n ";
+    const state = new LongBoothCursorStore(
+      prefix,
+      boothHeartbeatKey("launch", firstDevice),
+      whitespaceCursor
+    );
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    await store.writeBoothHeartbeat("launch", boothHeartbeat(firstDevice));
+    await store.writeBoothHeartbeat("launch", boothHeartbeat(secondDevice));
+
+    const firstPage = await store.listBoothHeartbeats("launch", { limit: 1 });
+    expect(firstPage.cursor).toBe(whitespaceCursor);
 
     const secondPage = await store.listBoothHeartbeats("launch", {
       limit: 1,
