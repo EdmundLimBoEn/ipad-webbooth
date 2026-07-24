@@ -1,6 +1,6 @@
 # Webbooth improvement program
 
-**Date:** 2026-07-24  
+**Date:** 2026-07-24
 **Status:** Draft for review
 
 ## Problem
