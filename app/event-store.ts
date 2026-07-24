@@ -6,6 +6,7 @@ import type {
 } from "@cloudflare/workers-types";
 import {
   EVENT_CONFIG_VERSION,
+  isRevisionId,
   parseConfigRevision,
   parseEventConfig,
   type ConfigRevision,
@@ -19,8 +20,19 @@ export const HEALTH_CANARY_KEY = "_health/canary";
 const HEALTH_STATE_KEY = "health/statuspage.json";
 const LEGACY_HEALTH_STATE_KEY = "_health/state.json";
 const PAGE_SIZE = 1000;
+const BOOTH_KEY_MUTATION_FINGERPRINT = /^[0-9a-f]{64}$/;
 
 type StoredEventConfig = EventConfig & { version: typeof EVENT_CONFIG_VERSION };
+type ConfigSaveInput = {
+  config: EventConfig;
+  baseRevisionId: string | null;
+  mutationId: string;
+  boothKeyMutationFingerprint?: string;
+};
+type ConfigMutationIntent = {
+  version: typeof EVENT_CONFIG_VERSION;
+  boothKeyMutationFingerprint: string | null;
+};
 
 export type StoredObject = {
   key: string;
@@ -189,6 +201,8 @@ export const eventConfigRevisionPrefix = (event: string) =>
   `events/${event}/config-revisions/`;
 export const eventConfigRevisionKey = (event: string, id: string) =>
   `${eventConfigRevisionPrefix(event)}${id}.json`;
+const eventConfigMutationKey = (event: string, mutationId: string) =>
+  `events/${event}/config-mutations/${mutationId}.json`;
 export const legacyEventConfigKey = (event: string) => `_config/${event}.json`;
 export const eventPhotoPrefix = (event: string) => `${event}/`;
 
@@ -248,18 +262,8 @@ export class EventStore {
 
   async readConfig(event: string): Promise<EventConfig | null> {
     try {
-      const object = await this.state.get(eventConfigKey(event));
-      if (object) {
-        let current: unknown;
-        try {
-          current = await object.json<unknown>();
-        } catch {
-          throw new InvalidStoredEventConfigError(event);
-        }
-        const parsed = parseEventConfig(current);
-        if (!parsed) throw new InvalidStoredEventConfigError(event);
-        return parsed;
-      }
+      const current = await this.readPrivateConfig(event);
+      if (current) return current;
     } catch (error) {
       if (error instanceof InvalidStoredEventConfigError) throw error;
       // During rollout, STATE may not exist yet. Legacy reads keep events live.
@@ -269,8 +273,17 @@ export class EventStore {
     const legacy = parseEventConfig(await this.readJson(this.photos, legacyEventConfigKey(event)));
     if (!legacy) return null;
     try {
-      await this.writeConfig(event, legacy);
-    } catch {
+      const migrated = await this.state.compareAndSwap(
+        eventConfigKey(event),
+        null,
+        JSON.stringify({ version: EVENT_CONFIG_VERSION, ...legacy }),
+        jsonWriteOptions()
+      );
+      if (migrated) return legacy;
+      const current = await this.readPrivateConfig(event);
+      if (current) return current;
+    } catch (error) {
+      if (error instanceof InvalidStoredEventConfigError) throw error;
       // Returning the legacy value is safer than failing an event while the
       // operator creates/binds STATE. A later read retries the migration.
     }
@@ -286,12 +299,9 @@ export class EventStore {
 
   async saveConfigRevision(
     event: string,
-    input: {
-      config: EventConfig;
-      baseRevisionId: string | null;
-      mutationId: string;
-    }
+    input: ConfigSaveInput
   ): Promise<ConfigMutationResult> {
+    const boothKeyMutationFingerprint = validateConfigMutationInput(input);
     const requested = parseEventConfig({
       version: EVENT_CONFIG_VERSION,
       ...input.config,
@@ -300,6 +310,7 @@ export class EventStore {
     if (!requested) throw new TypeError("invalid event configuration");
     const requestedExperience = configExperience(requested);
     const head = await this.readConfigHead(event);
+    await this.ensureConfigMutationIntent(event, input.mutationId, boothKeyMutationFingerprint);
     const existing = await this.readRevision(event, input.mutationId);
 
     if (existing) {
@@ -445,6 +456,20 @@ export class EventStore {
     }
   }
 
+  private async readPrivateConfig(event: string): Promise<EventConfig | null> {
+    const object = await this.state.get(eventConfigKey(event));
+    if (!object) return null;
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredEventConfigError(event);
+    }
+    const config = parseEventConfig(value);
+    if (!config) throw new InvalidStoredEventConfigError(event);
+    return config;
+  }
+
   private async readConfigHead(event: string): Promise<{ config: EventConfig | null; etag: string | null }> {
     const object = await this.state.get(eventConfigKey(event));
     if (object) {
@@ -460,6 +485,37 @@ export class EventStore {
     }
     const legacy = parseEventConfig(await this.readJson(this.photos, legacyEventConfigKey(event)));
     return { config: legacy, etag: null };
+  }
+
+  private async ensureConfigMutationIntent(
+    event: string,
+    mutationId: string,
+    boothKeyMutationFingerprint: string | null
+  ): Promise<void> {
+    const intent: ConfigMutationIntent = {
+      version: EVENT_CONFIG_VERSION,
+      boothKeyMutationFingerprint,
+    };
+    const key = eventConfigMutationKey(event, mutationId);
+    const created = await this.state.compareAndSwap(
+      key,
+      null,
+      JSON.stringify(intent),
+      jsonWriteOptions()
+    );
+    if (created) return;
+
+    const existing = await this.state.get(key);
+    if (!existing) throw new ConfigMutationConflictError();
+    let value: unknown;
+    try {
+      value = await existing.json<unknown>();
+    } catch {
+      throw new ConfigMutationConflictError();
+    }
+    if (!isConfigMutationIntent(value) || value.boothKeyMutationFingerprint !== boothKeyMutationFingerprint) {
+      throw new ConfigMutationConflictError();
+    }
   }
 
   private async readRevision(event: string, id: string): Promise<ConfigRevision | null> {
@@ -501,7 +557,7 @@ export class EventStore {
 
   private async finishExistingMutation(
     event: string,
-    input: { config: EventConfig; baseRevisionId: string | null; mutationId: string },
+    input: ConfigSaveInput,
     requested: EventConfig,
     head: { config: EventConfig | null; etag: string | null },
     revision: ConfigRevision
@@ -552,6 +608,36 @@ export class EventStore {
     }
     throw new ConfigConflictError(baseRevisionId, current.config?.currentRevisionId ?? null);
   }
+}
+
+function validateConfigMutationInput(input: ConfigSaveInput): string | null {
+  if (!isRevisionId(input.mutationId)) throw new TypeError("mutationId must be a revision ID");
+  const hasBoothKeyHash = input.config.boothKeyHash !== undefined;
+  const hasFingerprint = input.boothKeyMutationFingerprint !== undefined;
+  if (hasBoothKeyHash !== hasFingerprint) {
+    throw new TypeError("boothKeyMutationFingerprint must be supplied exactly when boothKeyHash is supplied");
+  }
+  if (
+    input.boothKeyMutationFingerprint !== undefined
+    && !BOOTH_KEY_MUTATION_FINGERPRINT.test(input.boothKeyMutationFingerprint)
+  ) {
+    throw new TypeError("boothKeyMutationFingerprint must be 64 lowercase hexadecimal characters");
+  }
+  return input.boothKeyMutationFingerprint ?? null;
+}
+
+function isConfigMutationIntent(value: unknown): value is ConfigMutationIntent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const intent = value as Record<string, unknown>;
+  return Object.keys(intent).length === 2
+    && intent.version === EVENT_CONFIG_VERSION
+    && (
+      intent.boothKeyMutationFingerprint === null
+      || (
+        typeof intent.boothKeyMutationFingerprint === "string"
+        && BOOTH_KEY_MUTATION_FINGERPRINT.test(intent.boothKeyMutationFingerprint)
+      )
+    );
 }
 
 function memoryBytes(value: ArrayBuffer | ArrayBufferView | string): Uint8Array {
