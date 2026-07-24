@@ -7,6 +7,161 @@
   background: radial-gradient(circle at top, #3b1730, #090509 58%);
 }
 
+.browse {
+  min-height: 100dvh;
+  padding: max(28px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(36px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  color: #f9edf4;
+  background:
+    linear-gradient(rgba(255, 117, 181, .07) 1px, transparent 1px) 0 0 / 100% 88px,
+    #100a0f;
+}
+
+.browseHeader {
+  width: min(100%, 1180px);
+  margin: 0 auto clamp(24px, 6vw, 52px);
+}
+
+.browseEyebrow {
+  margin-bottom: 6px;
+  color: #ff91c2;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .15em;
+  text-transform: uppercase;
+}
+
+.browseHeader h1 {
+  max-width: 12ch;
+  font-size: clamp(40px, 12vw, 92px);
+  font-weight: 850;
+  letter-spacing: -.055em;
+  line-height: .9;
+}
+
+.browseGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  width: min(100%, 1180px);
+  margin: 0 auto;
+  gap: 12px;
+}
+
+.browseTile {
+  min-width: 0;
+  min-height: 44px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .13);
+  border-radius: 14px;
+  background: #21131d;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .22);
+  cursor: zoom-in;
+  animation: browseAppear 240ms ease-out both;
+}
+
+.browseTile img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.browseTile:focus-visible,
+.inlineStatus button:focus-visible,
+.inlineError button:focus-visible,
+.newPhotoNotice button:focus-visible {
+  outline: 3px solid #fff;
+  outline-offset: 4px;
+}
+
+.browseEmpty,
+.inlineStatus,
+.inlineError {
+  display: grid;
+  justify-items: start;
+  width: min(100%, 1180px);
+  margin: 0 auto 20px;
+  gap: 10px;
+  padding: 18px;
+  border: 1px solid rgba(255, 255, 255, .16);
+  border-radius: 14px;
+  background: rgba(28, 17, 26, .92);
+}
+
+.browseEmpty {
+  justify-items: center;
+  min-height: 34dvh;
+  align-content: center;
+  text-align: center;
+}
+
+.browseEmpty h2 { font-size: clamp(24px, 6vw, 42px); }
+.browseEmpty p,
+.inlineStatus p,
+.inlineError p { max-width: 48rem; line-height: 1.55; }
+
+.inlineError {
+  border-color: #a75579;
+}
+
+.inlineStatus button,
+.inlineError button,
+.newPhotoNotice button {
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 2px solid currentColor;
+  border-radius: 999px;
+  color: #fff;
+  background: transparent;
+  font: inherit;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.browsePulse {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ff75b5;
+  animation: browsePulse 900ms ease-in-out infinite alternate;
+}
+
+.newPhotoNotice {
+  position: sticky;
+  top: max(10px, env(safe-area-inset-top));
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: min(100%, 560px);
+  margin: 0 auto 18px;
+  padding: 10px 10px 10px 16px;
+  border: 1px solid rgba(255, 255, 255, .22);
+  border-radius: 999px;
+  color: #fff;
+  background: rgba(54, 18, 40, .94);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, .35);
+  backdrop-filter: blur(14px);
+}
+
+@keyframes browseAppear {
+  from { opacity: 0; transform: translateY(8px); }
+}
+
+@keyframes browsePulse {
+  to { opacity: .3; transform: scale(.7); }
+}
+
+@media (min-width: 680px) {
+  .browse { padding-inline: 24px; }
+  .browseGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+}
+
+@media (min-width: 1040px) {
+  .browseGrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+
 .card {
   display: grid;
   width: min(100%, 680px);
@@ -94,10 +249,21 @@
   .gallery { background: Canvas; color: CanvasText; }
   .status, .photo { border: 1px solid CanvasText; }
   .primaryAction, .secondaryAction { color: ButtonText; background: ButtonFace; border-color: ButtonText; }
+  .browse { color: CanvasText; background: Canvas; }
+  .browseTile,
+  .browseEmpty,
+  .inlineStatus,
+  .inlineError,
+  .newPhotoNotice { color: CanvasText; background: Canvas; border-color: CanvasText; }
+  .inlineStatus button,
+  .inlineError button,
+  .newPhotoNotice button { color: ButtonText; background: ButtonFace; border-color: ButtonText; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .photo { animation: none; }
+  .photo,
+  .browseTile,
+  .browsePulse { animation: none; }
 }
 
 .lightbox {

@@ -1,6 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Ref,
+} from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import {
   localeDirection,
@@ -13,6 +21,12 @@ import {
   deviceLocaleStorageKey,
   resolveDeviceLocale,
 } from "@/app/i18n/locale";
+import { BROWSE_FEED_PROFILE } from "@/app/photo-feed/controller";
+import type { FeedPhoto } from "@/app/photo-feed/types";
+import { usePhotoFeed } from "@/app/photo-feed/use-photo-feed";
+import { exactGalleryUrl } from "./photo-actions";
+import { PhotoLightbox } from "./photo-lightbox";
+import { anchoredScrollTop, chooseScrollAnchor, type ScrollAnchor } from "./scroll-anchor";
 import styles from "./gallery.module.css";
 
 export type DirectPhoto = { key: string; url: string; uploadedAt: string };
@@ -278,88 +292,327 @@ export function HandoffGalleryView({
   );
 }
 
+type BrowseHistory = Pick<History, "pushState" | "replaceState">;
+
+export function browseGalleryUrl(origin: string, event: string): string {
+  return new URL(`/${encodeURIComponent(event)}/gallery`, origin).toString();
+}
+
+export function openBrowsePhoto(
+  history: BrowseHistory,
+  origin: string,
+  event: string,
+  completeKey: string,
+): string {
+  const url = exactGalleryUrl(origin, event, completeKey);
+  history.pushState(null, "", url);
+  return url;
+}
+
+export function restoreBrowseUrl(
+  history: BrowseHistory,
+  origin: string,
+  event: string,
+): string {
+  const url = browseGalleryUrl(origin, event);
+  history.replaceState(null, "", url);
+  return url;
+}
+
+export function mergeBrowsePhotos(
+  feedPhotos: readonly FeedPhoto[],
+  directPhoto: FeedPhoto | null,
+): FeedPhoto[] {
+  void directPhoto;
+  // The server feed is authoritative for newest-first browse ordering. A
+  // direct handoff may be older than the initial feed window, so it stays in
+  // the lightbox until its exact key naturally arrives in the feed.
+  return feedPhotos as FeedPhoto[];
+}
+
+export function correlateSelectedPhoto(
+  selected: FeedPhoto | null,
+  feedPhotos: readonly FeedPhoto[],
+): FeedPhoto | null {
+  if (!selected) return null;
+  return feedPhotos.find((photo) => photo.key === selected.key) ?? selected;
+}
+
+type BrowseGalleryViewProps = {
+  locale: SupportedLocale;
+  photos: readonly FeedPhoto[];
+  feedStatus: "loading" | "ready" | "error";
+  feedError: string | null;
+  directState: HandoffGalleryState | null;
+  newPhotoCount: number;
+  onOpen(photo: FeedPhoto): void;
+  onRetryFeed(): void;
+  onRetryDirect(): void;
+  onJumpLatest(): void;
+  gridRef?: Ref<HTMLDivElement>;
+};
+
+export function BrowseGalleryView({
+  locale,
+  photos,
+  feedStatus,
+  feedError,
+  directState,
+  newPhotoCount,
+  onOpen,
+  onRetryFeed,
+  onRetryDirect,
+  onJumpLatest,
+  gridRef,
+}: BrowseGalleryViewProps) {
+  const direction = localeDirection(locale);
+  const directFailure = directState
+    && directState.kind !== "ready"
+    && directState.kind !== "loading"
+    ? directState
+    : null;
+
+  return (
+    <main className={styles.browse} lang={locale} dir={direction}>
+      <header className={styles.browseHeader}>
+        <p className={styles.browseEyebrow}>{message(locale, "liveGallery")}</p>
+        <h1>{message(locale, "galleryBrowseTitle")}</h1>
+      </header>
+
+      {newPhotoCount > 0 ? (
+        <aside className={styles.newPhotoNotice} aria-live="polite">
+          <strong>{message(locale, "galleryNewPhotos", { count: newPhotoCount })}</strong>
+          <button type="button" onClick={onJumpLatest}>
+            {message(locale, "galleryJumpLatest")}
+          </button>
+        </aside>
+      ) : null}
+
+      {directState?.kind === "loading" ? (
+        <section className={styles.inlineStatus} role="status" aria-live="polite">
+          {message(locale, "galleryLoading")}
+        </section>
+      ) : null}
+      {directFailure ? (
+        <section className={styles.inlineError} role="alert">
+          <p>{stateMessage(locale, directFailure)}</p>
+          <button type="button" onClick={onRetryDirect}>
+            {message(locale, "galleryRetry")}
+          </button>
+        </section>
+      ) : null}
+
+      {photos.length === 0 && feedStatus === "loading" ? (
+        <section className={styles.browseEmpty} role="status" aria-live="polite">
+          <span className={styles.browsePulse} />
+          <p>{message(locale, "galleryBrowseLoading")}</p>
+        </section>
+      ) : null}
+      {photos.length === 0 && feedStatus === "ready" ? (
+        <section className={styles.browseEmpty}>
+          <h2>{message(locale, "galleryBrowseEmpty")}</h2>
+          <p>{message(locale, "galleryBrowseEmptyBody")}</p>
+        </section>
+      ) : null}
+      {feedStatus === "error" ? (
+        <section className={styles.inlineError} role="alert">
+          <strong>{message(locale, "galleryConnectionLost")}</strong>
+          {feedError ? <p>{feedError}</p> : null}
+          <button type="button" onClick={onRetryFeed}>
+            {message(locale, "galleryRetry")}
+          </button>
+        </section>
+      ) : null}
+
+      <div ref={gridRef} className={styles.browseGrid} aria-label={message(locale, "galleryBrowseTitle")}>
+        {photos.map((photo) => (
+          <button
+            key={photo.key}
+            className={styles.browseTile}
+            type="button"
+            data-photo-key={photo.key}
+            aria-label={message(locale, "galleryPhotoLabel")}
+            onClick={() => onOpen(photo)}
+          >
+            <img src={photo.url} alt="" loading="lazy" />
+          </button>
+        ))}
+      </div>
+    </main>
+  );
+}
+
 export default function HandoffGallery() {
   const { event } = useParams<{ event: string }>();
   const params = useSearchParams();
   const photoKey = params ? parseDirectPhotoQuery(params) : null;
-  const [state, setState] = useState<HandoffGalleryState>({ kind: "loading" });
+  const hasPhotoQuery = (params?.getAll("photo").length ?? 0) > 0;
+  const feed = usePhotoFeed(event, BROWSE_FEED_PROFILE);
+  const [directState, setDirectState] = useState<HandoffGalleryState | null>(
+    photoKey ? { kind: "loading" } : hasPhotoQuery ? { kind: "invalid" } : null
+  );
   const [locale, setLocale] = useState<SupportedLocale>("en");
-  const [saveError, setSaveError] = useState(false);
-  const statusRef = useRef<HTMLElement>(null);
-  const photoBlobRef = useRef<{ url: string; blob: Blob } | null>(null);
+  const [origin, setOrigin] = useState("");
+  const [newPhotoCount, setNewPhotoCount] = useState(0);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const anchorRef = useRef<(ScrollAnchor & { scrollTop: number }) | null>(null);
+  const selectedRef = useRef<FeedPhoto | null>(null);
   const controllerRef = useRef<HandoffGalleryController | null>(null);
   if (!controllerRef.current) {
     controllerRef.current = new HandoffGalleryController({
       fetchPhoto: (url, init) => fetch(url, init),
       isOnline: () => navigator.onLine,
-      onState: setState,
+      onState: (state) => {
+        if (state.kind === "ready") selectedRef.current = state.photo;
+        setDirectState(state);
+      },
     });
   }
-  const setStatusElement = useCallback((element: HTMLElement | null) => {
-    statusRef.current = element;
-  }, []);
 
   useEffect(() => {
     setLocale(initialLocale(event));
+    setOrigin(window.location.origin);
   }, [event]);
 
   useEffect(() => {
     applyDocumentLocale(document.documentElement, locale);
   }, [locale]);
 
-  const load = useCallback(async () => {
-    setSaveError(false);
+  const loadDirect = useCallback(async () => {
+    if (!photoKey) return;
     await controllerRef.current!.load(event, photoKey);
   }, [event, photoKey]);
 
   useEffect(() => {
-    void load();
-    return () => controllerRef.current?.cancel();
-  }, [load]);
-
-  useEffect(() => {
-    focusHandoffStatus(statusRef.current, state, saveError);
-  }, [saveError, state.kind]);
-
-  useEffect(() => {
-    photoBlobRef.current = null;
-    if (state.kind !== "ready") return;
-    const photo = state.photo;
-    const controller = new AbortController();
-    let active = true;
-    void prefetchPublicPhoto(
-      photo,
-      (url) => fetch(url, { signal: controller.signal })
-    ).then((blob) => {
-      if (active) photoBlobRef.current = { url: photo.url, blob };
-    }).catch(() => {});
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [state]);
-
-  const save = useCallback(async () => {
-    if (state.kind !== "ready") return;
-    setSaveError(false);
-    try {
-      const prefetched = photoBlobRef.current?.url === state.photo.url
-        ? photoBlobRef.current.blob
-        : null;
-      await transferPublicPhoto(state.photo, prefetched, browserTransferDeps());
-    } catch (error) {
-      if (!(error instanceof DOMException && error.name === "AbortError")) setSaveError(true);
+    if (!photoKey) {
+      controllerRef.current?.cancel();
+      selectedRef.current = null;
+      setDirectState(hasPhotoQuery ? { kind: "invalid" } : null);
+      return;
     }
-  }, [state]);
+    if (selectedRef.current?.key === photoKey) {
+      setDirectState({ kind: "ready", photo: selectedRef.current });
+      return;
+    }
+    void loadDirect();
+    return () => {
+      controllerRef.current?.cancel();
+    };
+  }, [hasPhotoQuery, loadDirect, photoKey]);
+
+  const captureAnchor = useCallback(() => {
+    if (window.scrollY <= 0 || !gridRef.current) {
+      anchorRef.current = null;
+      return;
+    }
+    const visible = Array.from(
+      gridRef.current.querySelectorAll<HTMLElement>("[data-photo-key]")
+    ).map((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        key: element.dataset.photoKey ?? "",
+        top: rect.top,
+        bottom: rect.bottom,
+      };
+    }).filter((item) => item.top < window.innerHeight);
+    const anchor = chooseScrollAnchor(visible);
+    anchorRef.current = anchor ? { ...anchor, scrollTop: window.scrollY } : null;
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("scroll", captureAnchor, { passive: true });
+    captureAnchor();
+    return () => window.removeEventListener("scroll", captureAnchor);
+  }, [captureAnchor]);
+
+  useLayoutEffect(() => {
+    const prior = anchorRef.current;
+    if (feed.inserted.length > 0 && prior && gridRef.current) {
+      const match = Array.from(
+        gridRef.current.querySelectorAll<HTMLElement>("[data-photo-key]")
+      ).find((element) => element.dataset.photoKey === prior.key);
+      if (match) {
+        window.scrollTo({
+          top: anchoredScrollTop({
+            previousScrollTop: prior.scrollTop,
+            beforeTop: prior.top,
+            afterTop: match.getBoundingClientRect().top,
+          }),
+          behavior: "auto",
+        });
+        setNewPhotoCount((count) => count + feed.inserted.length);
+      }
+    }
+    captureAnchor();
+  }, [captureAnchor, feed.inserted, feed.photos]);
+
+  const selected = useMemo(
+    () => correlateSelectedPhoto(
+      directState?.kind === "ready" ? directState.photo : null,
+      feed.photos
+    ),
+    [directState, feed.photos]
+  );
+
+  const photos = useMemo(
+    () => mergeBrowsePhotos(feed.photos, selected),
+    [feed.photos, selected]
+  );
+
+  const openPhoto = useCallback((photo: FeedPhoto) => {
+    selectedRef.current = photo;
+    setDirectState({ kind: "ready", photo });
+    openBrowsePhoto(window.history, window.location.origin, event, photo.key);
+  }, [event]);
+
+  const closePhoto = useCallback(() => {
+    controllerRef.current?.cancel();
+    selectedRef.current = null;
+    setDirectState(null);
+    restoreBrowseUrl(window.history, window.location.origin, event);
+  }, [event]);
+
+  const jumpLatest = useCallback(() => {
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    window.scrollTo({ top: 0, behavior: reduced ? "auto" : "smooth" });
+    setNewPhotoCount(0);
+    anchorRef.current = null;
+  }, []);
 
   return (
-    <HandoffGalleryView
-      state={state}
+    <>
+    <BrowseGalleryView
       locale={locale}
-      onRetry={() => { void load(); }}
-      onSave={() => { void save(); }}
-      saveError={saveError}
-      statusRef={setStatusElement}
+      photos={photos}
+      feedStatus={feed.status}
+      feedError={feed.error}
+      directState={directState}
+      newPhotoCount={newPhotoCount}
+      onOpen={openPhoto}
+      onRetryFeed={feed.refresh}
+      onRetryDirect={() => { void loadDirect(); }}
+      onJumpLatest={jumpLatest}
+      gridRef={gridRef}
     />
+    {selected && origin ? (
+      <PhotoLightbox
+        event={event}
+        photo={selected}
+        origin={origin}
+        labels={{
+          title: message(locale, "galleryLightboxTitle"),
+          photoAlt: message(locale, "galleryPhotoAlt"),
+          save: message(locale, "gallerySave"),
+          share: message(locale, "galleryShare"),
+          close: message(locale, "galleryClose"),
+          previous: message(locale, "galleryPrevious"),
+          next: message(locale, "galleryNext"),
+          working: message(locale, "galleryWorking"),
+          actionError: message(locale, "galleryActionError"),
+        }}
+        onClose={closePhoto}
+      />
+    ) : null}
+    </>
   );
 }
