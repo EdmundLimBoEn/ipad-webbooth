@@ -630,6 +630,9 @@ export class EventStore {
 
 function validateConfigMutationInput(input: ConfigSaveInput): string | null {
   if (!isRevisionId(input.mutationId)) throw new TypeError("mutationId must be a revision ID");
+  if (input.baseRevisionId !== null && !isRevisionId(input.baseRevisionId)) {
+    throw new TypeError("baseRevisionId must be a revision ID or null");
+  }
   const hasBoothKeyHash = input.config.boothKeyHash !== undefined;
   const hasFingerprint = input.boothKeyMutationFingerprint !== undefined;
   if (hasBoothKeyHash !== hasFingerprint) {

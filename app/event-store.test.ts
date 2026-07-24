@@ -433,6 +433,11 @@ describe("EventStore", () => {
         mutationId: "018f0000-0000-7000-8000-000000000026",
         boothKeyMutationFingerprint: "a".repeat(63),
       },
+      {
+        config: { frames: ["one"] },
+        baseRevisionId: "not-a-revision-id",
+        mutationId: "018f0000-0000-7000-8000-00000000002a",
+      },
     ];
 
     for (const input of invalidInputs) {
@@ -441,6 +446,27 @@ describe("EventStore", () => {
       await expect(store.saveConfigRevision("launch", input)).rejects.toBeInstanceOf(TypeError);
       expect((await state.list()).objects).toHaveLength(0);
     }
+  });
+
+  test("an invalid base does not poison a corrected retry of the same mutation", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const mutationId = "018f0000-0000-7000-8000-00000000002b";
+
+    await expect(store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: "not-a-revision-id",
+      mutationId,
+    })).rejects.toBeInstanceOf(TypeError);
+    expect((await state.list()).objects).toHaveLength(0);
+
+    const saved = await store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      mutationId,
+    });
+    expect(saved.revision.id).toBe(mutationId);
+    expect(saved.config.currentRevisionId).toBe(mutationId);
   });
 
   test("reusing a mutation ID with a different base revision conflicts", async () => {
