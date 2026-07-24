@@ -1,4 +1,13 @@
-import type { ConfigRevision, PublicEventConfig } from "../../event-config";
+import type {
+  ConfigRevision,
+  EventExperience,
+  PublicEventConfig,
+} from "../../event-config";
+import {
+  isSupportedLocale,
+  type SupportedLocale,
+} from "../../i18n/catalog";
+import { resolveEnabledLocales } from "../../i18n/locale";
 
 export type RestoreRequest = Readonly<{
   revisionId: string;
@@ -12,15 +21,78 @@ export type ConfigHistoryResponse = {
   revisions: ConfigRevision[];
 };
 
+export type EditableEventExperience = {
+  frames: string[];
+  locales: SupportedLocale[];
+  defaultLocale: SupportedLocale;
+  timeZone?: string;
+  reviewEnabled: boolean;
+  autoAcceptSeconds: number;
+  countdownAudioDefault: boolean;
+  gallery?: EventExperience["gallery"];
+};
+
+export type ConfigSaveInput = EditableEventExperience & {
+  mutationId: string;
+  baseRevisionId: string | null;
+  boothKey?: string;
+};
+
+export function editableExperienceFromConfig(
+  config: PublicEventConfig,
+  defaultFrames: readonly string[]
+): EditableEventExperience {
+  const locales = resolveEnabledLocales(config.locales);
+  return {
+    frames: Array.isArray(config.frames) ? [...config.frames] : [...defaultFrames],
+    locales,
+    defaultLocale:
+      isSupportedLocale(config.defaultLocale) && locales.includes(config.defaultLocale)
+        ? config.defaultLocale
+        : "en",
+    ...(config.timeZone ? { timeZone: config.timeZone } : {}),
+    reviewEnabled: config.capture?.reviewEnabled ?? true,
+    autoAcceptSeconds: config.capture?.autoAcceptSeconds ?? 5,
+    countdownAudioDefault: config.capture?.countdownAudioDefault ?? false,
+    ...(config.gallery ? { gallery: { ...config.gallery } } : {}),
+  };
+}
+
+export function buildConfigSaveBody(input: ConfigSaveInput) {
+  return {
+    frames: [...input.frames],
+    locales: [...input.locales],
+    defaultLocale: input.defaultLocale,
+    ...(input.timeZone ? { timeZone: input.timeZone } : {}),
+    capture: {
+      reviewEnabled: input.reviewEnabled,
+      autoAcceptSeconds: input.autoAcceptSeconds,
+      countdownAudioDefault: input.countdownAudioDefault,
+    },
+    ...(input.gallery
+      ? {
+        gallery: {
+          ...(input.gallery.title !== undefined ? { title: input.gallery.title } : {}),
+          ...(input.gallery.accentColor !== undefined
+            ? { accentColor: input.gallery.accentColor }
+            : {}),
+        },
+      }
+      : {}),
+    ...(input.boothKey ? { boothKey: input.boothKey } : {}),
+    mutationId: input.mutationId,
+    baseRevisionId: input.baseRevisionId,
+  };
+}
+
 export function rebaseConfigHistory(
   history: ConfigHistoryResponse,
   defaultFrames: readonly string[],
   pendingSaveMutationId: { current: string | null }
 ) {
+  const experience = editableExperienceFromConfig(history.config, defaultFrames);
   const rebased = {
-    frames: Array.isArray(history.config.frames)
-      ? [...history.config.frames]
-      : [...defaultFrames],
+    ...experience,
     hasBoothKey: Boolean(history.config.hasBoothKey),
     currentRevisionId: history.currentRevisionId,
     revisions: history.revisions,

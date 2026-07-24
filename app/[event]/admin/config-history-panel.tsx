@@ -1,11 +1,17 @@
 "use client";
 
 import { useState } from "react";
-import type { ConfigRevision } from "../../event-config";
+import type { ConfigRevision, EventExperience } from "../../event-config";
+import { resolveEnabledLocales } from "../../i18n/locale";
+import {
+  isSupportedLocale,
+  type SupportedLocale,
+} from "../../i18n/catalog";
 import styles from "./admin.module.css";
 
 export type ConfigHistoryPanelProps = {
   currentFrames: readonly string[];
+  currentExperience: EventExperience;
   currentRevisionId: string | null;
   revisions: readonly ConfigRevision[];
   loading: boolean;
@@ -15,6 +21,26 @@ export type ConfigHistoryPanelProps = {
   onReload: () => void;
   onRestore: (revisionId: string) => void;
 };
+
+const localeNames: Record<SupportedLocale, string> = {
+  en: "English",
+  "zh-SG": "简体中文",
+  ar: "العربية",
+};
+
+function experienceSettings(experience: EventExperience) {
+  const locales = resolveEnabledLocales(experience.locales);
+  return {
+    locales,
+    defaultLocale:
+      isSupportedLocale(experience.defaultLocale) && locales.includes(experience.defaultLocale)
+        ? experience.defaultLocale
+        : "en",
+    reviewEnabled: experience.capture?.reviewEnabled ?? true,
+    autoAcceptSeconds: experience.capture?.autoAcceptSeconds ?? 5,
+    countdownAudioDefault: experience.capture?.countdownAudioDefault ?? false,
+  };
+}
 
 export function diffFrameKeys(
   current: readonly string[],
@@ -35,6 +61,7 @@ const reasonLabel: Record<ConfigRevision["reason"], string> = {
 
 export function ConfigHistoryPanel({
   currentFrames,
+  currentExperience,
   currentRevisionId,
   revisions,
   loading,
@@ -45,12 +72,13 @@ export function ConfigHistoryPanel({
   onRestore,
 }: ConfigHistoryPanelProps) {
   const [confirmRevisionId, setConfirmRevisionId] = useState<string | null>(null);
+  const currentSettings = experienceSettings(currentExperience);
 
   return (
     <section className={styles.historySection} aria-labelledby="configuration-history-title">
       <div className={styles.sectionHead}>
         <div><span>02</span><h2 id="configuration-history-title">Configuration history</h2></div>
-        <p>Review each recorded exposure, or restore an earlier Frame selection.</p>
+        <p>Review each recorded exposure, or restore an earlier guest experience.</p>
       </div>
 
       {error ? (
@@ -73,6 +101,9 @@ export function ConfigHistoryPanel({
             const isRestoring = revision.id === restoringRevisionId;
             const isConfirming = revision.id === confirmRevisionId;
             const frameDiff = diffFrameKeys(currentFrames, revision.config.frames);
+            const settings = experienceSettings(revision.config);
+            const experienceChanged =
+              JSON.stringify(settings) !== JSON.stringify(currentSettings);
             const timestamp = new Date(revision.createdAt);
             const readableTime = timestamp.toLocaleString([], {
               dateStyle: "medium",
@@ -80,7 +111,12 @@ export function ConfigHistoryPanel({
             });
 
             return (
-              <li className={styles.revisionRecord} key={revision.id} data-current={isCurrent}>
+              <li
+                className={styles.revisionRecord}
+                key={revision.id}
+                data-current={isCurrent}
+                data-experience-changed={experienceChanged}
+              >
                 <div className={styles.revisionIndex} aria-hidden="true">
                   <span>R{String(revisions.length - index).padStart(2, "0")}</span>
                 </div>
@@ -98,6 +134,11 @@ export function ConfigHistoryPanel({
                     {!isCurrent && frameDiff.added.length === 0 && frameDiff.removed.length === 0 && (
                       <span data-delta="same">Same Frames</span>
                     )}
+                    <span>Languages: {settings.locales.map((locale) => localeNames[locale]).join(", ")}</span>
+                    <span>Default: {localeNames[settings.defaultLocale]}</span>
+                    <span>Review: {settings.reviewEnabled ? "on" : "off"}</span>
+                    <span>Auto-accept: {settings.autoAcceptSeconds}s</span>
+                    <span>Countdown audio: {settings.countdownAudioDefault ? "on" : "off"}</span>
                   </div>
                 </div>
                 <div className={styles.revisionAction}>

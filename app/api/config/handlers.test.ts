@@ -207,6 +207,94 @@ describe("config handlers", () => {
     expect(JSON.stringify(history.revisions)).not.toContain("existing-private-hash");
   });
 
+  test("a complete Admin save updates supported locale and capture settings while preserving other safe experience", async () => {
+    const d = deps();
+    await d.deps.store.writeConfig("launch", {
+      frames: ["birthday"],
+      boothKeyHash: "existing-private-hash",
+      locales: ["en"],
+      defaultLocale: "en",
+      timeZone: "Asia/Singapore",
+      capture: { reviewEnabled: true, autoAcceptSeconds: 5, countdownAudioDefault: false },
+      gallery: { title: "Launch Night", accentColor: "#ff3366" },
+    });
+
+    const response = await putConfig(
+      adminRequest("/api/config?event=launch", "PUT", saveBody({
+        locales: ["en", "zh-SG", "ar"],
+        defaultLocale: "ar",
+        timeZone: "Asia/Singapore",
+        capture: {
+          reviewEnabled: false,
+          autoAcceptSeconds: 9,
+          countdownAudioDefault: true,
+        },
+        gallery: { title: "Launch Night", accentColor: "#ff3366" },
+      })),
+      d.deps
+    );
+    const config = await d.deps.store.readConfig("launch");
+
+    expect(response.status).toBe(200);
+    expect(config).toEqual(expect.objectContaining({
+      frames: ["square"],
+      boothKeyHash: "existing-private-hash",
+      locales: ["en", "zh-SG", "ar"],
+      defaultLocale: "ar",
+      timeZone: "Asia/Singapore",
+      capture: {
+        reviewEnabled: false,
+        autoAcceptSeconds: 9,
+        countdownAudioDefault: true,
+      },
+      gallery: { title: "Launch Night", accentColor: "#ff3366" },
+    }));
+    expect(credentialFields(await response.json())).toEqual([]);
+  });
+
+  test("new saves reject unsupported or inconsistent locale and capture settings", async () => {
+    const invalidExperiences = [
+      { locales: [] },
+      { locales: ["en", "fr"], defaultLocale: "en" },
+      { locales: ["en"], defaultLocale: "ar" },
+      { locales: ["en"], defaultLocale: "en", capture: { reviewEnabled: "yes", autoAcceptSeconds: 5, countdownAudioDefault: false } },
+      { locales: ["en"], defaultLocale: "en", capture: { reviewEnabled: true, autoAcceptSeconds: 0, countdownAudioDefault: false } },
+      { locales: ["en"], defaultLocale: "en", capture: { reviewEnabled: true, autoAcceptSeconds: 31, countdownAudioDefault: false } },
+      { locales: ["en"], defaultLocale: "en", capture: { reviewEnabled: true, autoAcceptSeconds: 2.5, countdownAudioDefault: false } },
+      { locales: ["en"], defaultLocale: "en", capture: { reviewEnabled: true, autoAcceptSeconds: 5, countdownAudioDefault: false, boothKeyHash: "leak" } },
+    ];
+
+    for (const experience of invalidExperiences) {
+      const d = deps();
+      const response = await putConfig(
+        adminRequest("/api/config?event=launch", "PUT", saveBody(experience)),
+        d.deps
+      );
+      expect(response.status).toBe(400);
+      expect(await d.deps.store.readConfig("launch")).toBeNull();
+    }
+  });
+
+  test("complete saves construct only allowlisted safe experience fields", async () => {
+    const d = deps();
+    const response = await putConfig(
+      adminRequest("/api/config?event=launch", "PUT", saveBody({
+        locales: ["en"],
+        defaultLocale: "en",
+        capture: {
+          reviewEnabled: true,
+          autoAcceptSeconds: 5,
+          countdownAudioDefault: false,
+        },
+        boothKeyHash: "injected",
+      })),
+      d.deps
+    );
+
+    expect(response.status).toBe(400);
+    expect(await d.deps.store.readConfig("launch")).toBeNull();
+  });
+
   test("a stale normal Frames save conflicts without discarding preserved experience fields", async () => {
     const d = deps();
     await d.deps.store.writeConfig("launch", {

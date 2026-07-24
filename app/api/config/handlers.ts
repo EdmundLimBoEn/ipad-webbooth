@@ -14,10 +14,23 @@ import {
   type EventConfig,
 } from "@/app/event-config";
 import { TEMPLATES } from "@/app/templates";
+import { isSupportedLocale } from "@/app/i18n/catalog";
 import { adminOk } from "@/app/upload-auth";
 
 type SaveBody = {
   frames: string[];
+  locales?: string[];
+  defaultLocale?: string;
+  timeZone?: string;
+  capture?: {
+    reviewEnabled?: boolean;
+    autoAcceptSeconds?: number;
+    countdownAudioDefault?: boolean;
+  };
+  gallery?: {
+    title?: string;
+    accentColor?: string;
+  };
   boothKey?: string;
   mutationId: string;
   baseRevisionId: string | null;
@@ -92,6 +105,11 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[])
 function parseSaveBody(value: unknown): SaveBody | null {
   if (!isObject(value) || !hasOnlyKeys(value, [
     "frames",
+    "locales",
+    "defaultLocale",
+    "timeZone",
+    "capture",
+    "gallery",
     "boothKey",
     "mutationId",
     "baseRevisionId",
@@ -109,6 +127,82 @@ function parseSaveBody(value: unknown): SaveBody | null {
     return null;
   }
   if (
+    value.locales !== undefined
+    && (
+      !Array.isArray(value.locales)
+      || value.locales.length === 0
+      || !value.locales.every(isSupportedLocale)
+      || new Set(value.locales).size !== value.locales.length
+    )
+  ) {
+    return null;
+  }
+  if (
+    value.defaultLocale !== undefined
+    && (
+      !isSupportedLocale(value.defaultLocale)
+      || !Array.isArray(value.locales)
+      || !value.locales.includes(value.defaultLocale)
+    )
+  ) {
+    return null;
+  }
+  if (value.locales !== undefined && value.defaultLocale === undefined) return null;
+  if (
+    value.timeZone !== undefined
+    && (typeof value.timeZone !== "string" || value.timeZone.length > 128)
+  ) {
+    return null;
+  }
+  if (value.capture !== undefined) {
+    if (
+      !isObject(value.capture)
+      || !hasOnlyKeys(value.capture, [
+        "reviewEnabled",
+        "autoAcceptSeconds",
+        "countdownAudioDefault",
+      ])
+      || (
+        value.capture.reviewEnabled !== undefined
+        && typeof value.capture.reviewEnabled !== "boolean"
+      )
+      || (
+        value.capture.autoAcceptSeconds !== undefined
+        && (
+          typeof value.capture.autoAcceptSeconds !== "number"
+          || !Number.isInteger(value.capture.autoAcceptSeconds)
+          || value.capture.autoAcceptSeconds < 1
+          || value.capture.autoAcceptSeconds > 30
+        )
+      )
+      || (
+        value.capture.countdownAudioDefault !== undefined
+        && typeof value.capture.countdownAudioDefault !== "boolean"
+      )
+    ) {
+      return null;
+    }
+  }
+  if (value.gallery !== undefined) {
+    if (
+      !isObject(value.gallery)
+      || !hasOnlyKeys(value.gallery, ["title", "accentColor"])
+      || (
+        value.gallery.title !== undefined
+        && (typeof value.gallery.title !== "string" || value.gallery.title.length > 120)
+      )
+      || (
+        value.gallery.accentColor !== undefined
+        && (
+          typeof value.gallery.accentColor !== "string"
+          || !/^#[0-9a-f]{6}$/i.test(value.gallery.accentColor)
+        )
+      )
+    ) {
+      return null;
+    }
+  }
+  if (
     value.boothKey !== undefined
     && (
       typeof value.boothKey !== "string"
@@ -120,6 +214,38 @@ function parseSaveBody(value: unknown): SaveBody | null {
   }
   return {
     frames: [...value.frames],
+    ...(Array.isArray(value.locales) ? { locales: [...value.locales] } : {}),
+    ...(typeof value.defaultLocale === "string"
+      ? { defaultLocale: value.defaultLocale }
+      : {}),
+    ...(typeof value.timeZone === "string" ? { timeZone: value.timeZone } : {}),
+    ...(isObject(value.capture)
+      ? {
+        capture: {
+          ...(typeof value.capture.reviewEnabled === "boolean"
+            ? { reviewEnabled: value.capture.reviewEnabled }
+            : {}),
+          ...(typeof value.capture.autoAcceptSeconds === "number"
+            ? { autoAcceptSeconds: value.capture.autoAcceptSeconds }
+            : {}),
+          ...(typeof value.capture.countdownAudioDefault === "boolean"
+            ? { countdownAudioDefault: value.capture.countdownAudioDefault }
+            : {}),
+        },
+      }
+      : {}),
+    ...(isObject(value.gallery)
+      ? {
+        gallery: {
+          ...(typeof value.gallery.title === "string"
+            ? { title: value.gallery.title }
+            : {}),
+          ...(typeof value.gallery.accentColor === "string"
+            ? { accentColor: value.gallery.accentColor }
+            : {}),
+        },
+      }
+      : {}),
     ...(typeof value.boothKey === "string" ? { boothKey: value.boothKey } : {}),
     mutationId: value.mutationId,
     baseRevisionId: value.baseRevisionId,
@@ -160,29 +286,55 @@ function configForSave(
 ): EventConfig {
   return {
     frames: [...body.frames],
-    ...(current?.locales ? { locales: [...current.locales] } : {}),
-    ...(current?.defaultLocale ? { defaultLocale: current.defaultLocale } : {}),
-    ...(current?.timeZone ? { timeZone: current.timeZone } : {}),
-    ...(current?.capture
+    ...(body.locales
+      ? { locales: [...body.locales] }
+      : current?.locales
+        ? { locales: [...current.locales] }
+        : {}),
+    ...(body.defaultLocale
+      ? { defaultLocale: body.defaultLocale }
+      : current?.defaultLocale
+        ? { defaultLocale: current.defaultLocale }
+        : {}),
+    ...(body.timeZone
+      ? { timeZone: body.timeZone }
+      : current?.timeZone
+        ? { timeZone: current.timeZone }
+        : {}),
+    ...(body.capture || current?.capture
       ? {
         capture: {
-          ...(current.capture.reviewEnabled !== undefined
-            ? { reviewEnabled: current.capture.reviewEnabled }
+          ...(body.capture?.reviewEnabled !== undefined
+            ? { reviewEnabled: body.capture.reviewEnabled }
+            : current?.capture?.reviewEnabled !== undefined
+              ? { reviewEnabled: current.capture.reviewEnabled }
             : {}),
-          ...(current.capture.autoAcceptSeconds !== undefined
-            ? { autoAcceptSeconds: current.capture.autoAcceptSeconds }
+          ...(body.capture?.autoAcceptSeconds !== undefined
+            ? { autoAcceptSeconds: body.capture.autoAcceptSeconds }
+            : current?.capture?.autoAcceptSeconds !== undefined
+              ? { autoAcceptSeconds: current.capture.autoAcceptSeconds }
             : {}),
-          ...(current.capture.countdownAudioDefault !== undefined
-            ? { countdownAudioDefault: current.capture.countdownAudioDefault }
+          ...(body.capture?.countdownAudioDefault !== undefined
+            ? { countdownAudioDefault: body.capture.countdownAudioDefault }
+            : current?.capture?.countdownAudioDefault !== undefined
+              ? { countdownAudioDefault: current.capture.countdownAudioDefault }
             : {}),
         },
       }
       : {}),
-    ...(current?.gallery
+    ...(body.gallery || current?.gallery
       ? {
         gallery: {
-          ...(current.gallery.title !== undefined ? { title: current.gallery.title } : {}),
-          ...(current.gallery.accentColor !== undefined ? { accentColor: current.gallery.accentColor } : {}),
+          ...(body.gallery?.title !== undefined
+            ? { title: body.gallery.title }
+            : current?.gallery?.title !== undefined
+              ? { title: current.gallery.title }
+              : {}),
+          ...(body.gallery?.accentColor !== undefined
+            ? { accentColor: body.gallery.accentColor }
+            : current?.gallery?.accentColor !== undefined
+              ? { accentColor: current.gallery.accentColor }
+              : {}),
         },
       }
       : {}),

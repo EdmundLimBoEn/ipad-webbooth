@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  buildConfigSaveBody,
   clearRestoreRequestAfterReconciliation,
   getOrCreateRestoreRequest,
   rebaseConfigHistory,
@@ -83,7 +84,83 @@ test("a successful history rebase clears an ambiguous Save mutation ID", () => {
   expect(rebased.frames).toEqual(["one"]);
   expect(rebased.hasBoothKey).toBe(true);
   expect(rebased.currentRevisionId).toBe(LATER_BASE);
+  expect(rebased.locales).toEqual(["en"]);
+  expect(rebased.defaultLocale).toBe("en");
+  expect(rebased.reviewEnabled).toBe(true);
+  expect(rebased.autoAcceptSeconds).toBe(5);
+  expect(rebased.countdownAudioDefault).toBe(false);
   expect(pendingSave.current).toBeNull();
+});
+
+test("history rebase restores the complete safe editable experience", () => {
+  const pendingSave = { current: MUTATION_ID as string | null };
+  const gallery = { title: "Launch Night", accentColor: "#ff3366" };
+
+  const rebased = rebaseConfigHistory(
+    {
+      config: {
+        frames: ["one"],
+        hasBoothKey: true,
+        locales: ["zh-SG", "ar"],
+        defaultLocale: "ar",
+        timeZone: "Asia/Singapore",
+        capture: {
+          reviewEnabled: false,
+          autoAcceptSeconds: 12,
+          countdownAudioDefault: true,
+        },
+        gallery,
+      },
+      currentRevisionId: LATER_BASE,
+      revisions: [],
+    },
+    ["fallback"],
+    pendingSave
+  );
+
+  expect(rebased).toMatchObject({
+    frames: ["one"],
+    hasBoothKey: true,
+    locales: ["zh-SG", "ar", "en"],
+    defaultLocale: "ar",
+    timeZone: "Asia/Singapore",
+    reviewEnabled: false,
+    autoAcceptSeconds: 12,
+    countdownAudioDefault: true,
+    gallery,
+  });
+  expect(rebased.gallery).not.toBe(gallery);
+});
+
+test("save input carries the complete safe experience without unchanged Booth credentials", () => {
+  const body = buildConfigSaveBody({
+    frames: ["one"],
+    locales: ["en", "ar"],
+    defaultLocale: "ar",
+    timeZone: "Asia/Singapore",
+    reviewEnabled: false,
+    autoAcceptSeconds: 8,
+    countdownAudioDefault: true,
+    gallery: { title: "Launch Night", accentColor: "#ff3366" },
+    mutationId: MUTATION_ID,
+    baseRevisionId: FIRST_BASE,
+  });
+
+  expect(body).toEqual({
+    frames: ["one"],
+    locales: ["en", "ar"],
+    defaultLocale: "ar",
+    timeZone: "Asia/Singapore",
+    capture: {
+      reviewEnabled: false,
+      autoAcceptSeconds: 8,
+      countdownAudioDefault: true,
+    },
+    gallery: { title: "Launch Night", accentColor: "#ff3366" },
+    mutationId: MUTATION_ID,
+    baseRevisionId: FIRST_BASE,
+  });
+  expect(JSON.stringify(body)).not.toContain("boothKey");
 });
 
 test("a 2xx restore retains its exact tuple until parsing, apply, and history reload finish", async () => {

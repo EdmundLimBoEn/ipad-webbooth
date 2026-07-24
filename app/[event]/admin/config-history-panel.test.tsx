@@ -13,6 +13,7 @@ test("history renders reasons and disables restoring the current revision", () =
   const html = renderToStaticMarkup(
     <ConfigHistoryPanel
       currentFrames={["one"]}
+      currentExperience={{ frames: ["one"], locales: ["en"], defaultLocale: "en" }}
       currentRevisionId="018f0000-0000-7000-8000-000000000030"
       revisions={[{
         version: 1,
@@ -61,6 +62,7 @@ test("the active restore control says exactly Restoring after confirmation close
   const html = renderToStaticMarkup(
     <ConfigHistoryPanel
       currentFrames={["one"]}
+      currentExperience={{ frames: ["one"], locales: ["en"], defaultLocale: "en" }}
       currentRevisionId={revisions[0].id}
       revisions={revisions}
       loading={false}
@@ -81,6 +83,7 @@ test("saving disables every restore control", () => {
   const html = renderToStaticMarkup(
     <ConfigHistoryPanel
       currentFrames={["one"]}
+      currentExperience={{ frames: ["one"], locales: ["en"], defaultLocale: "en" }}
       currentRevisionId={revisions[0].id}
       revisions={revisions}
       loading={false}
@@ -93,4 +96,53 @@ test("saving disables every restore control", () => {
   );
 
   expect((html.match(/disabled=""/g) ?? []).length).toBe(2);
+});
+
+test("history summaries make locale and capture settings visible", () => {
+  const html = renderToStaticMarkup(
+    <ConfigHistoryPanel
+      currentFrames={["one"]}
+      currentExperience={{
+        frames: ["one"],
+        locales: ["en"],
+        defaultLocale: "en",
+        capture: {
+          reviewEnabled: true,
+          autoAcceptSeconds: 5,
+          countdownAudioDefault: false,
+        },
+      }}
+      currentRevisionId={null}
+      revisions={[{
+        version: 1,
+        id: "018f0000-0000-7000-8000-000000000030",
+        createdAt: "2026-07-24T00:00:00.000Z",
+        parentRevisionId: null,
+        reason: "save",
+        config: {
+          frames: ["one"],
+          locales: ["en", "ar"],
+          defaultLocale: "ar",
+          capture: {
+            reviewEnabled: false,
+            autoAcceptSeconds: 9,
+            countdownAudioDefault: true,
+          },
+        },
+      }]}
+      loading={false}
+      restoringRevisionId={null}
+      mutationBusy={false}
+      error=""
+      onReload={() => {}}
+      onRestore={() => {}}
+    />
+  );
+
+  expect(html).toContain("Languages: English, العربية");
+  expect(html).toContain("Default: العربية");
+  expect(html).toContain("Review: off");
+  expect(html).toContain("Auto-accept: 9s");
+  expect(html).toContain("Countdown audio: on");
+  expect(html).toContain('data-experience-changed="true"');
 });

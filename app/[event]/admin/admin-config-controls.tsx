@@ -2,6 +2,10 @@
 
 import { GROUPS, TEMPLATES } from "../../templates";
 import type { Template } from "../../frame-packs/types";
+import {
+  SUPPORTED_LOCALES,
+  type SupportedLocale,
+} from "../../i18n/catalog";
 import styles from "./admin.module.css";
 
 type FrameProgrammeControlsProps = {
@@ -22,6 +26,26 @@ type BoothKeyControlsProps = {
   onGenerate: () => void;
   onCopy: () => void;
   onClear: () => void;
+};
+
+type CaptureExperienceControlsProps = {
+  enabledLocales: ReadonlySet<SupportedLocale>;
+  defaultLocale: SupportedLocale;
+  reviewEnabled: boolean;
+  autoAcceptSeconds: number;
+  countdownAudioDefault: boolean;
+  disabled: boolean;
+  onToggleLocale: (locale: SupportedLocale) => void;
+  onDefaultLocaleChange: (locale: SupportedLocale) => void;
+  onReviewEnabledChange: (enabled: boolean) => void;
+  onAutoAcceptSecondsChange: (seconds: number) => void;
+  onCountdownAudioDefaultChange: (enabled: boolean) => void;
+};
+
+const localeNames: Record<SupportedLocale, string> = {
+  en: "English",
+  "zh-SG": "简体中文",
+  ar: "العربية",
 };
 
 function FramePreview({ frame }: { frame: Template }) {
@@ -166,6 +190,94 @@ export function BoothKeyControls({
         </button>
       )}
     </>
+  );
+}
+
+export function CaptureExperienceControls({
+  enabledLocales,
+  defaultLocale,
+  reviewEnabled,
+  autoAcceptSeconds,
+  countdownAudioDefault,
+  disabled,
+  onToggleLocale,
+  onDefaultLocaleChange,
+  onReviewEnabledChange,
+  onAutoAcceptSecondsChange,
+  onCountdownAudioDefaultChange,
+}: CaptureExperienceControlsProps) {
+  return (
+    <div className={styles.experienceControls}>
+      <fieldset>
+        <legend>Enabled guest languages</legend>
+        <div className={styles.localeOptions}>
+          {SUPPORTED_LOCALES.map((locale) => (
+            <label key={locale}>
+              <input
+                type="checkbox"
+                checked={enabledLocales.has(locale)}
+                disabled={disabled}
+                onChange={() => onToggleLocale(locale)}
+              />
+              <span lang={locale} dir={locale === "ar" ? "rtl" : "ltr"}>
+                {localeNames[locale]}
+              </span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+
+      <label className={styles.experienceField}>
+        <span>Default guest language</span>
+        <select
+          value={defaultLocale}
+          disabled={disabled}
+          onChange={(event) => onDefaultLocaleChange(event.target.value as SupportedLocale)}
+        >
+          {SUPPORTED_LOCALES.filter((locale) => enabledLocales.has(locale)).map((locale) => (
+            <option key={locale} value={locale} lang={locale} dir={locale === "ar" ? "rtl" : "ltr"}>
+              {localeNames[locale]}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label className={styles.experienceToggle}>
+        <input
+          type="checkbox"
+          checked={reviewEnabled}
+          disabled={disabled}
+          onChange={(event) => onReviewEnabledChange(event.target.checked)}
+        />
+        <span>Show photo review</span>
+      </label>
+
+      <label className={styles.experienceField}>
+        <span>Auto-accept after</span>
+        <span className={styles.secondsInput}>
+          <input
+            type="number"
+            min={1}
+            max={30}
+            step={1}
+            value={autoAcceptSeconds}
+            disabled={disabled}
+            onChange={(event) => onAutoAcceptSecondsChange(Number(event.target.value))}
+          />
+          <span>seconds</span>
+        </span>
+      </label>
+
+      <label className={styles.experienceToggle}>
+        <input
+          type="checkbox"
+          checked={countdownAudioDefault}
+          disabled={disabled}
+          onChange={(event) => onCountdownAudioDefaultChange(event.target.checked)}
+        />
+        <span>Countdown sounds on by default</span>
+      </label>
+    </div>
   );
 }
 

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { FRAME_PACKS } from "./catalog";
+import { FRAME_PACKS, frameLabel } from "./catalog";
 import type { FramePackManifest } from "./types";
 import { validateFramePacks } from "./validate";
 
@@ -71,4 +71,72 @@ test("requires a usable visual source and known local assets", () => {
   expect(messages).toContain("provide a background, bgImage, or overlay");
   expect(messages).toContain("frame has no usable preview source");
   expect(messages).toContain("asset does not exist: preview.png");
+});
+
+test("localized Frame labels fall back to the required default label", () => {
+  const frame = {
+    label: "Square",
+    labels: { "zh-SG": "方形" },
+  };
+
+  expect(frameLabel(frame, "zh-SG")).toBe("方形");
+  expect(frameLabel(frame, "ar")).toBe("Square");
+});
+
+test("rejects unsupported, blank, and overlong localized Frame labels", () => {
+  const broken: FramePackManifest = {
+    version: 1,
+    pack: { key: "party", label: "Party" },
+    templates: {
+      bad: {
+        label: "Bad",
+        labels: {
+          ar: " ",
+          "zh-SG": "好".repeat(81),
+          fr: "Mauvais",
+        },
+        shots: 1,
+        intervalMs: 3000,
+        canvas: { w: 100, h: 100 },
+        background: "#fff",
+        slots: [{ x: 0, y: 0, w: 100, h: 100 }],
+      },
+    },
+  } as FramePackManifest;
+
+  const issues = validateFramePacks([broken]);
+  expect(issues).toContainEqual({
+    path: "party.templates.bad.labels.ar",
+    message: "localized label is required",
+  });
+  expect(issues).toContainEqual({
+    path: "party.templates.bad.labels.zh-SG",
+    message: "localized label must be at most 80 characters",
+  });
+  expect(issues).toContainEqual({
+    path: "party.templates.bad.labels.fr",
+    message: "localized label locale is unsupported",
+  });
+});
+
+test("rejects a default Frame label longer than 80 characters", () => {
+  const broken: FramePackManifest = {
+    version: 1,
+    pack: { key: "party", label: "Party" },
+    templates: {
+      bad: {
+        label: "B".repeat(81),
+        shots: 1,
+        intervalMs: 3000,
+        canvas: { w: 100, h: 100 },
+        background: "#fff",
+        slots: [{ x: 0, y: 0, w: 100, h: 100 }],
+      },
+    },
+  };
+
+  expect(validateFramePacks([broken])).toContainEqual({
+    path: "party.templates.bad.label",
+    message: "label must be at most 80 characters",
+  });
 });

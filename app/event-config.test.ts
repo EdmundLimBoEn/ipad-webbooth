@@ -37,6 +37,19 @@ describe("event config schema", () => {
     expect(parseEventConfig({ version: 1, frames: [], gallery: { accentColor: "red<script>" } })).toBeNull();
   });
 
+  test("keeps legacy stored LocaleCode values readable", () => {
+    expect(parseEventConfig({
+      version: 1,
+      frames: ["square"],
+      locales: ["en", "future-locale"],
+      defaultLocale: "future-locale",
+    })).toEqual({
+      frames: ["square"],
+      locales: ["en", "future-locale"],
+      defaultLocale: "future-locale",
+    });
+  });
+
   test("projects only public allowlisted fields", () => {
     const projected = projectPublicConfig({
       frames: ["square"],

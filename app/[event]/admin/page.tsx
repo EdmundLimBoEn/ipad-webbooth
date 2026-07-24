@@ -5,9 +5,11 @@ import { useParams } from "next/navigation";
 import QRCode from "qrcode";
 import { TEMPLATES } from "../../templates";
 import type { ConfigRevision, PublicEventConfig } from "../../event-config";
+import type { SupportedLocale } from "../../i18n/catalog";
 import type { AdminBoothRecord, BoothOperationalState } from "../../booth-control";
 import {
   BoothKeyControls,
+  CaptureExperienceControls,
   FrameProgrammeControls,
   SaveConfigurationButton,
 } from "./admin-config-controls";
@@ -21,7 +23,9 @@ import {
 import { BoothOperationsPanel } from "./booth-operations-panel";
 import { ConfigHistoryPanel } from "./config-history-panel";
 import {
+  buildConfigSaveBody,
   clearRestoreRequestAfterReconciliation,
+  editableExperienceFromConfig,
   getOrCreateRestoreRequest,
   rebaseConfigHistory,
   shouldClearRestoreRequest,
@@ -42,6 +46,13 @@ export default function Admin() {
   const [adminKey, setAdminKey] = useState("");
   const [auth, setAuth] = useState<AuthState>("missing");
   const [frames, setFrames] = useState<Set<string>>(new Set());
+  const [locales, setLocales] = useState<Set<SupportedLocale>>(new Set(["en"]));
+  const [defaultLocale, setDefaultLocale] = useState<SupportedLocale>("en");
+  const [timeZone, setTimeZone] = useState<string | undefined>();
+  const [reviewEnabled, setReviewEnabled] = useState(true);
+  const [autoAcceptSeconds, setAutoAcceptSeconds] = useState(5);
+  const [countdownAudioDefault, setCountdownAudioDefault] = useState(false);
+  const [gallery, setGallery] = useState<PublicEventConfig["gallery"]>();
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configError, setConfigError] = useState("");
   const [currentRevisionId, setCurrentRevisionId] = useState<string | null>(null);
@@ -150,6 +161,13 @@ export default function Admin() {
       }
       const rebased = rebaseConfigHistory(data, defaults, pendingSaveMutationId);
       setFrames(new Set(rebased.frames));
+      setLocales(new Set(rebased.locales));
+      setDefaultLocale(rebased.defaultLocale);
+      setTimeZone(rebased.timeZone);
+      setReviewEnabled(rebased.reviewEnabled);
+      setAutoAcceptSeconds(rebased.autoAcceptSeconds);
+      setCountdownAudioDefault(rebased.countdownAudioDefault);
+      setGallery(rebased.gallery);
       setHasBoothKey(rebased.hasBoothKey);
       setCurrentRevisionId(rebased.currentRevisionId);
       setRevisions(rebased.revisions);
@@ -446,6 +464,53 @@ export default function Admin() {
     });
   };
 
+  const toggleLocale = (locale: SupportedLocale) => {
+    if (configMutationBusy.current) return;
+    clearPendingSave();
+    setLocales((current) => {
+      const next = new Set(current);
+      if (next.has(locale)) {
+        if (next.size === 1) return current;
+        next.delete(locale);
+        if (defaultLocale === locale) {
+          setDefaultLocale(next.values().next().value ?? "en");
+        }
+      } else {
+        next.add(locale);
+      }
+      return next;
+    });
+    setNotice("");
+  };
+
+  const changeDefaultLocale = (locale: SupportedLocale) => {
+    if (configMutationBusy.current || !locales.has(locale)) return;
+    clearPendingSave();
+    setDefaultLocale(locale);
+    setNotice("");
+  };
+
+  const changeReviewEnabled = (enabled: boolean) => {
+    if (configMutationBusy.current) return;
+    clearPendingSave();
+    setReviewEnabled(enabled);
+    setNotice("");
+  };
+
+  const changeAutoAcceptSeconds = (seconds: number) => {
+    if (configMutationBusy.current || !Number.isFinite(seconds)) return;
+    clearPendingSave();
+    setAutoAcceptSeconds(Math.min(30, Math.max(1, Math.round(seconds))));
+    setNotice("");
+  };
+
+  const changeCountdownAudioDefault = (enabled: boolean) => {
+    if (configMutationBusy.current) return;
+    clearPendingSave();
+    setCountdownAudioDefault(enabled);
+    setNotice("");
+  };
+
   const generateBoothKey = () => {
     if (configMutationBusy.current) return;
     clearPendingSave();
@@ -494,12 +559,19 @@ export default function Admin() {
       const response = await fetch(`/api/config?event=${encodeURIComponent(event)}`, {
         method: "PUT",
         headers: { "x-booth-key": adminKey, "content-type": "application/json" },
-        body: JSON.stringify({
+        body: JSON.stringify(buildConfigSaveBody({
           frames: [...frames],
+          locales: [...locales],
+          defaultLocale,
+          ...(timeZone ? { timeZone } : {}),
+          reviewEnabled,
+          autoAcceptSeconds,
+          countdownAudioDefault,
+          ...(gallery ? { gallery } : {}),
           ...(boothKey ? { boothKey } : {}),
           mutationId,
           baseRevisionId: currentRevisionId,
-        }),
+        })),
       });
       if ([400, 401, 409].includes(response.status)) pendingSaveMutationId.current = null;
       if (response.status === 401) { invalidateAuth(); throw new Error("That admin key was rejected."); }
@@ -552,7 +624,15 @@ export default function Admin() {
       if (!response.ok) throw new Error(`Restore failed (${response.status})`);
       await clearRestoreRequestAfterReconciliation(pending, request, async () => {
         const data = await response.json() as PublicEventConfig & { currentRevisionId: string };
-        setFrames(new Set(Array.isArray(data.frames) ? data.frames : defaults));
+        const restored = editableExperienceFromConfig(data, defaults);
+        setFrames(new Set(restored.frames));
+        setLocales(new Set(restored.locales));
+        setDefaultLocale(restored.defaultLocale);
+        setTimeZone(restored.timeZone);
+        setReviewEnabled(restored.reviewEnabled);
+        setAutoAcceptSeconds(restored.autoAcceptSeconds);
+        setCountdownAudioDefault(restored.countdownAudioDefault);
+        setGallery(restored.gallery);
         setHasBoothKey(Boolean(data.hasBoothKey));
         setCurrentRevisionId(data.currentRevisionId);
         setBoothKey("");
@@ -658,18 +738,53 @@ export default function Admin() {
         <div className={styles.mainColumn}>
           <section className={styles.section}>
             <div className={styles.sectionHead}><div><span>01</span><h2>Frame programme</h2></div><p>Choose what guests see at the booth. Previews follow the real background → photo → overlay composition.</p></div>
-            {configError ? <div className={styles.failure}><strong>Config unavailable</strong><p>{configError}</p><button onClick={() => void loadConfig()}>Retry config</button></div> :
-            <FrameProgrammeControls
-              frames={frames}
-              defaults={defaults}
-              disabled={configBusy}
-              onToggle={toggle}
-              onSetGroup={setGroup}
-            />}
+            {configError ? <div className={styles.failure}><strong>Config unavailable</strong><p>{configError}</p><button onClick={() => void loadConfig()}>Retry config</button></div> : (
+              <>
+                <FrameProgrammeControls
+                  frames={frames}
+                  defaults={defaults}
+                  disabled={configBusy}
+                  onToggle={toggle}
+                  onSetGroup={setGroup}
+                />
+                <div className={styles.experiencePanel}>
+                  <div>
+                    <span>Guest capture</span>
+                    <h3>Language &amp; review</h3>
+                    <p>Set the languages guests can choose and the handoff after each exposure.</p>
+                  </div>
+                  <CaptureExperienceControls
+                    enabledLocales={locales}
+                    defaultLocale={defaultLocale}
+                    reviewEnabled={reviewEnabled}
+                    autoAcceptSeconds={autoAcceptSeconds}
+                    countdownAudioDefault={countdownAudioDefault}
+                    disabled={configBusy}
+                    onToggleLocale={toggleLocale}
+                    onDefaultLocaleChange={changeDefaultLocale}
+                    onReviewEnabledChange={changeReviewEnabled}
+                    onAutoAcceptSecondsChange={changeAutoAcceptSeconds}
+                    onCountdownAudioDefaultChange={changeCountdownAudioDefault}
+                  />
+                </div>
+              </>
+            )}
           </section>
 
           <ConfigHistoryPanel
             currentFrames={[...frames]}
+            currentExperience={{
+              frames: [...frames],
+              locales: [...locales],
+              defaultLocale,
+              ...(timeZone ? { timeZone } : {}),
+              capture: {
+                reviewEnabled,
+                autoAcceptSeconds,
+                countdownAudioDefault,
+              },
+              ...(gallery ? { gallery } : {}),
+            }}
             currentRevisionId={currentRevisionId}
             revisions={revisions}
             loading={!configLoaded && !configError}
