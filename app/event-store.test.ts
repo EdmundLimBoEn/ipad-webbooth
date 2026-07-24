@@ -26,6 +26,7 @@ import {
   type StoredObjectBody,
 } from "./event-store";
 import type { BoothHeartbeatInput } from "./booth-control";
+import { InvalidPhotoReceiptError } from "./photo-metadata";
 
 class FailPrivatePhotoWriteStore extends InMemoryObjectStore {
   private writesFail = true;
@@ -75,6 +76,25 @@ class WaterlinePhotoStore extends InMemoryObjectStore {
       await hook();
     }
     return super.list(options);
+  }
+}
+
+class PagedExportPhotoStore extends InMemoryObjectStore {
+  photoLists = 0;
+
+  override async list(options: ListOptions = {}): Promise<ListResult> {
+    if (options.prefix === "launch/") {
+      this.photoLists += 1;
+      return super.list({ ...options, limit: 1 });
+    }
+    return super.list(options);
+  }
+}
+
+class FailingReceiptReadStore extends InMemoryObjectStore {
+  override async get(key: string): Promise<StoredObjectBody | null> {
+    if (key.includes("/photo-metadata/")) throw new Error("private STATE unavailable");
+    return super.get(key);
   }
 }
 
@@ -1435,7 +1455,7 @@ describe("EventStore", () => {
     const initial = await store.listPhotos("launch");
 
     const delayed = await store.putPhoto("launch", new Uint8Array([2]).buffer, {
-      upload: { captureId: "018f0000-0000-4000-8000-000000000102", capturedAt: 1000 },
+      upload: { captureId: "018f0000-0000-4000-8000-000000000102", capturedAt: 1000000000000 },
     });
     const delta = await store.listPhotos("launch", initial.cursor);
 
@@ -1493,7 +1513,7 @@ describe("EventStore", () => {
     let duringSnapshot: Awaited<ReturnType<EventStore["putPhoto"]>> | null = null;
     photos.setFirstPhotoListHook(async () => {
       duringSnapshot = await store.putPhoto("launch", new Uint8Array([1]).buffer, {
-        upload: { captureId: "018f0000-0000-4000-8000-000000000105", capturedAt: 1000 },
+        upload: { captureId: "018f0000-0000-4000-8000-000000000105", capturedAt: 1000000000000 },
       });
     });
 
@@ -1694,7 +1714,7 @@ describe("EventStore", () => {
     const store = new EventStore(photos, new InMemoryObjectStore(), "https://photos.example");
     const initial = await store.listPhotos("launch");
     const upload = await store.putPhoto("launch", new Uint8Array([1]).buffer, {
-      upload: { captureId: "018f0000-0000-4000-8000-000000000106", capturedAt: 1000 },
+      upload: { captureId: "018f0000-0000-4000-8000-000000000106", capturedAt: 1000000000000 },
     });
     photos.rejectPhotoLists = true;
 
@@ -1707,7 +1727,7 @@ describe("EventStore", () => {
     const store = new EventStore(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
     const initial = await store.listPhotos("launch");
     const upload = await store.putPhoto("launch", new Uint8Array([1]).buffer, {
-      upload: { captureId: "018f0000-0000-4000-8000-000000000107", capturedAt: 1000 },
+      upload: { captureId: "018f0000-0000-4000-8000-000000000107", capturedAt: 1000000000000 },
     });
     await store.deletePhoto("launch", upload.key);
 
@@ -1986,5 +2006,118 @@ describe("EventStore", () => {
       expect(Object.hasOwn(roundTripped.messages!, key)).toBe(true);
       expect(roundTripped.messages![key]).toBe(messages[key as keyof typeof messages]);
     }
+  });
+
+  describe("export photo sources", () => {
+    const firstKey = "launch/1721793600000-018f0000-0000-4000-8000-000000000001.jpg";
+    const secondKey = "launch/1721793600001-018f0000-0000-4000-8000-000000000002.png";
+    const receipt = (key: string) => ({
+      version: 1,
+      key,
+      uploadedAt: "2026-07-24T00:00:00.000Z",
+      capturedAt: 1721793600000,
+      source: "framed",
+      frameKey: "square",
+      configRevisionId: "018f0000-0000-7000-8000-000000000001",
+    });
+
+    test("pages exact Event images and joins only each exact private receipt", async () => {
+      const photos = new PagedExportPhotoStore({
+        [firstKey]: new Uint8Array([1, 2, 3]),
+        [secondKey]: new Uint8Array([4, 5]),
+        "launch/readme.txt": "not a photo",
+        "other/1721793600000-other.jpg": new Uint8Array([9]),
+      });
+      const state = new BoothStateAccessStore();
+      state.set(photoReceiptKey("launch", firstKey), JSON.stringify(receipt(firstKey)));
+      state.set(photoReceiptKey("launch", secondKey), JSON.stringify({
+        ...receipt(secondKey),
+        source: "camera-fallback",
+        frameKey: undefined,
+      }));
+      const store = new EventStore(photos, state, "https://photos.example");
+
+      const sources = [];
+      for await (const source of store.iterateExportPhotoSources("launch")) sources.push(source);
+
+      expect(photos.photoLists).toBeGreaterThan(1);
+      expect(sources.map(({ key }) => key)).toEqual([firstKey, secondKey]);
+      expect(sources[0]).toEqual({
+        key: firstKey,
+        size: 3,
+        uploadedAt: expect.any(String),
+        receipt: {
+          capturedAt: 1721793600000,
+          source: "framed",
+          frameKey: "square",
+        },
+      });
+      expect(sources[1]?.receipt).toEqual({
+        capturedAt: 1721793600000,
+        source: "camera-fallback",
+      });
+      expect(JSON.stringify(sources)).not.toContain("configRevisionId");
+      expect(JSON.stringify(sources)).not.toContain("photo-metadata");
+      expect(state.reads).toEqual([
+        photoReceiptKey("launch", firstKey),
+        photoReceiptKey("launch", secondKey),
+      ]);
+    });
+
+    test("uses null for one missing exact receipt and never yields orphan receipts", async () => {
+      const photos = new InMemoryObjectStore({ [firstKey]: new Uint8Array([1]) });
+      const state = new InMemoryObjectStore({
+        [photoReceiptKey("launch", secondKey)]: JSON.stringify(receipt(secondKey)),
+      });
+      const store = new EventStore(photos, state, "https://photos.example");
+      const sources = [];
+      for await (const source of store.iterateExportPhotoSources("launch")) sources.push(source);
+      expect(sources).toHaveLength(1);
+      expect(sources[0]?.key).toBe(firstKey);
+      expect(sources[0]?.receipt).toBeNull();
+    });
+
+    test("rejects non-canonical Events before public or private access", async () => {
+      const photos = new BoothStateAccessStore();
+      const state = new BoothStateAccessStore();
+      const store = new EventStore(photos, state, "https://photos.example");
+      await expect(async () => {
+        for await (const _source of store.iterateExportPhotoSources("Launch Event")) {
+          // no-op
+        }
+      }).toThrow(InvalidEventSlugError);
+      expect(photos.lists).toEqual([]);
+      expect(state.reads).toEqual([]);
+    });
+
+    test("fails enriched inventory on corrupt, wrong-key, or unavailable private receipts", async () => {
+      for (const stored of [
+        { ...receipt(firstKey), version: 2 },
+        { ...receipt(firstKey), key: secondKey },
+        { ...receipt(firstKey), credential: "secret" },
+      ]) {
+        const photos = new InMemoryObjectStore({ [firstKey]: new Uint8Array([1]) });
+        const state = new InMemoryObjectStore({
+          [photoReceiptKey("launch", firstKey)]: JSON.stringify(stored),
+        });
+        const store = new EventStore(photos, state, "https://photos.example");
+        await expect(async () => {
+          for await (const _source of store.iterateExportPhotoSources("launch")) {
+            // no-op
+          }
+        }).toThrow(InvalidPhotoReceiptError);
+      }
+
+      const unavailable = new EventStore(
+        new InMemoryObjectStore({ [firstKey]: new Uint8Array([1]) }),
+        new FailingReceiptReadStore(),
+        "https://photos.example",
+      );
+      await expect(async () => {
+        for await (const _source of unavailable.iterateExportPhotoSources("launch")) {
+          // no-op
+        }
+      }).toThrow("private STATE unavailable");
+    });
   });
 });

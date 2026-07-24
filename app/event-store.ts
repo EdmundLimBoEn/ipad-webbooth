@@ -27,6 +27,11 @@ import {
 } from "./booth-control";
 import { canonicalEvent, InvalidEventSlugError, slugifyEvent } from "./event-identity";
 import type { StableCaptureIdentity, StableUpload } from "./upload-contract";
+import {
+  InvalidPhotoReceiptError,
+  parsePhotoReceipt,
+  type PhotoReceiptV1,
+} from "./photo-metadata";
 export { canonicalEvent, InvalidEventSlugError, slugifyEvent };
 export { EVENT_CONFIG_VERSION };
 export type { EventConfig } from "./event-config";
@@ -293,6 +298,12 @@ export type ConfigHistory = {
 };
 export type BoothHeartbeatListOptions = { cursor?: string | null; limit?: number };
 export type BoothHeartbeatPage = { booths: AdminBoothRecord[]; cursor: string | null };
+export type ExportPhotoSource = {
+  key: string;
+  size: number;
+  uploadedAt: string;
+  receipt: Pick<PhotoReceiptV1, "capturedAt" | "source" | "frameKey"> | null;
+};
 
 export class ConfigConflictError extends Error {
   constructor(readonly expectedRevisionId: string | null, readonly currentRevisionId: string | null) {
@@ -1172,6 +1183,38 @@ export class EventStore {
     } while (cursor);
   }
 
+  async *iterateExportPhotoSources(
+    event: string,
+  ): AsyncGenerator<ExportPhotoSource> {
+    const canonical = canonicalEvent(event);
+    for await (const photo of this.iteratePhotoObjects(canonical)) {
+      const receiptObject = await this.state.get(
+        photoReceiptKey(canonical, photo.key),
+      );
+      let receipt: ExportPhotoSource["receipt"] = null;
+      if (receiptObject) {
+        let value: unknown;
+        try {
+          value = await receiptObject.json<unknown>();
+        } catch {
+          throw new InvalidPhotoReceiptError(photo.key, "invalid_shape");
+        }
+        const parsed = parsePhotoReceipt(value, photo.key);
+        receipt = {
+          capturedAt: parsed.capturedAt,
+          ...(parsed.source !== undefined ? { source: parsed.source } : {}),
+          ...(parsed.frameKey !== undefined ? { frameKey: parsed.frameKey } : {}),
+        };
+      }
+      yield {
+        key: photo.key,
+        size: photo.size,
+        uploadedAt: photo.uploaded.toISOString(),
+        receipt,
+      };
+    }
+  }
+
   getPhoto(key: string): Promise<StoredObjectBody | null> {
     return this.photos.get(key);
   }
@@ -1596,15 +1639,7 @@ type PhotoFeedCursor = {
   sequence: number;
 };
 
-type PrivatePhotoMetadata = {
-  version: 1;
-  key: string;
-  uploadedAt: string;
-  capturedAt: number;
-  source?: StableUpload["source"];
-  frameKey?: string;
-  configRevisionId?: string;
-};
+type PrivatePhotoMetadata = PhotoReceiptV1;
 
 function photoPrivateMetadata(key: string, uploadedAt: Date, upload?: StableUpload): PrivatePhotoMetadata {
   return {
@@ -1732,30 +1767,14 @@ function parsePhotoFeedCommitted(event: string, value: unknown): PrivatePhotoFee
 }
 
 function parsePrivatePhotoMetadata(event: string, value: unknown): PrivatePhotoMetadata | null {
-  if (!isRecord(value)) return null;
-  if (
-    value.version !== 1
-    || typeof value.key !== "string"
-    || !isPhotoKey(event, value.key)
-    || typeof value.uploadedAt !== "string"
-    || Number.isNaN(Date.parse(value.uploadedAt))
-    || typeof value.capturedAt !== "number"
-    || !Number.isSafeInteger(value.capturedAt)
-    || (value.source !== undefined && value.source !== "framed" && value.source !== "camera-fallback")
-    || (value.frameKey !== undefined && !isBoundedToken(value.frameKey))
-    || (value.configRevisionId !== undefined && !isBoundedToken(value.configRevisionId))
-  ) {
+  if (!isRecord(value) || typeof value.key !== "string" || !isPhotoKey(event, value.key)) {
     return null;
   }
-  return {
-    version: 1,
-    key: value.key,
-    uploadedAt: value.uploadedAt,
-    capturedAt: value.capturedAt,
-    ...(value.source ? { source: value.source } : {}),
-    ...(typeof value.frameKey === "string" ? { frameKey: value.frameKey } : {}),
-    ...(typeof value.configRevisionId === "string" ? { configRevisionId: value.configRevisionId } : {}),
-  };
+  try {
+    return parsePhotoReceipt(value, value.key);
+  } catch {
+    return null;
+  }
 }
 
 function samePrivatePhotoMetadata(left: PrivatePhotoMetadata, right: PrivatePhotoMetadata): boolean {
