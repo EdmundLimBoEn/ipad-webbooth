@@ -80,6 +80,34 @@ Only after recording a passing iPad rehearsal should you promote explicitly:
 bun run deploy:production
 ```
 
+### Release 3 staging gallery and moderation gate
+
+Run `bun run test:browser -- tests/gallery-moderation.spec.ts`, then complete
+the Release 3 physical-phone/projector checklist in
+`pre-event-readiness.md`. Confirm the bounded rebuild's checkpoint, completion
+marker, index, and receipts exist only in staging `STATE`. Test exactly one
+designated canary deletion and one derived-cleanup failure; neither permits a
+prefix delete or an ambiguous retry. Verify staging records and photos never
+appear through the production Worker.
+
+### Release 4 staging operations gate
+
+Release 4 follows only the explicit `deploy:staging` then
+`deploy:production` path. Run
+`bun run test:browser -- tests/rehearsal-operations.spec.ts`, then complete the
+real-iPad guided rehearsal before promotion.
+
+- Inspect exact staging records to confirm presets, sessions, and evidence
+  exist only in staging `STATE`.
+- Rehearsal photo bytes are normal exact public photos in staging `PHOTOS`;
+  never place rehearsal state there.
+- Never use the health canary prefix for rehearsal evidence or photos.
+- Never add or run cleanup-all, prefix-delete, or abandoned-session cleanup.
+- Resolve stale or abandoned sessions through their visible complete keys,
+  one at a time.
+- Rollback changes Worker code only. It does not delete presets, sessions,
+  evidence, photos, indexes, or receipts.
+
 ### Release 5 staging export gate
 
 Use a canonical throwaway staging Event that is distinct from every production

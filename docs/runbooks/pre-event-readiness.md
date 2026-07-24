@@ -84,6 +84,71 @@ and production must not be promoted until every real-device item passes. Never
 remove test photos by prefix; copy and delete only each complete Event-owned
 image key intended for cleanup.
 
+### Release 3 gallery and moderation
+
+Continue with a throwaway canonical staging Event that is distinct from
+production:
+
+1. Upload enough exact photos to require multiple moderation pages. Interrupt
+   and resume the bounded add-only index rebuild, then confirm its checkpoint,
+   completion marker, index, and receipts exist only in staging `STATE`.
+2. Leave the physical projector running while photos arrive. Verify adaptive
+   polling, independent looping columns, four-second manual-scroll pause,
+   motion quality, visible gaps, and browse-QR readability at venue distance.
+3. On a physical phone, keep an older tile in view while several photos arrive.
+   Confirm the visible exact-key anchor stays put, the new-photo count is
+   correct, and **Jump to latest** returns to the newest-first edge.
+4. Open an exact handoff deep link before the browse feed settles. Exercise
+   native Share/Save, including cancellation, and confirm the shared dialog
+   uses the same complete key and URL.
+5. Filter and page Admin moderation, inspect with previous/next and arrow keys,
+   close with Escape, and verify focus returns to the exact originating tile.
+6. Delete one designated canary using its complete Event-owned key. Confirm
+   adjacent public photos and private records remain byte-identical.
+7. Simulate a derived cleanup failure. The public photo must remain deleted,
+   disappear from moderation, show only a cleanup warning, and never invite a
+   second public DELETE.
+8. Exercise the complete flow keyboard-only and with VoiceOver, Arabic RTL,
+   200% text, Reduce Motion, and high contrast. Obtain native-speaker review
+   for supported non-English catalog changes.
+
+Automated WebKit cannot certify iOS native Share activation or Save to Photos,
+VoiceOver speech timing, Safari process suspension, long-running physical
+projector performance, production-like R2 races, or translation quality.
+Never use prefix cleanup; retain abandoned staging records or remove each
+intended photo individually by complete key.
+
+### Release 4 guided rehearsal
+
+Run the guided rehearsal on the actual target iPad over staging HTTPS:
+
+1. Apply the intended preset to a throwaway canonical staging Event, then
+   separately install and verify that Event's Booth Key.
+2. Open the generated rehearsal link and verify authenticated preflight,
+   camera readiness, and durable IndexedDB before accepting evidence.
+3. Capture and accept one photo with every snapshotted Frame; inspect each
+   physical composition.
+4. Create two genuine network-class upload failures on two distinct captures,
+   reload Safari, and confirm a different boot ID recovers both exact rows.
+5. Reconnect and confirm exact oldest-first drain with no duplicate public
+   photos or acknowledgements.
+6. Observe one acknowledged exact key in the public Photo Feed and fetch its
+   public bytes.
+7. Designate that exact key as the moderation canary, delete it through the
+   existing exact-key endpoint, and verify adjacent photos remain.
+8. Explicitly retain or individually delete every other rehearsal photo.
+   Completion and abandonment must never perform automatic cleanup.
+9. Confirm the Photo Outbox and rehearsal evidence outbox are both empty.
+10. Complete projector, power, charging, and backup-network manual checks.
+11. Change config once and verify the old immutable rehearsal becomes stale.
+    Start a new rehearsal rather than rewriting its snapshot or evidence.
+
+A browser simulator cannot prove real camera composition, Safari
+IndexedDB/suspension behavior, genuine venue-network failure, installed wake
+behavior, projector crop/brightness/motion, charging and power, backup
+network, or VoiceOver. Record the Event, build, devices, exact remaining keys,
+and every result. Production promotion remains blocked until they pass.
+
 Then capture one photo with every enabled Frame and check crop, draw order,
 orientation, color, and final resolution. Confirm each photo appears once in
 the Live Gallery without a full-page refresh, exercise Save/Share on a phone,
