@@ -22,6 +22,7 @@ import {
 } from "./booth-operations";
 import { BoothOperationsPanel } from "./booth-operations-panel";
 import { ConfigHistoryPanel } from "./config-history-panel";
+import { ExportPanel } from "./export-panel";
 import {
   buildConfigSaveBody,
   clearRestoreRequestAfterReconciliation,
@@ -39,7 +40,6 @@ type Photo = { key: string; url: string; uploadedAt: string };
 type AuthState = "missing" | "ready" | "invalid";
 type Probe = { status: "up" | "degraded" | "down"; detail: string };
 type Health = { upload: Probe; live: Probe };
-type FilePickerWindow = Window & { showSaveFilePicker?: (options: { suggestedName: string; types: { description: string; accept: Record<string, string[]> }[] }) => Promise<{ createWritable(): Promise<WritableStream<Uint8Array>> }> };
 const CONFIG_CONFLICT_MESSAGE = "Configuration changed; review the latest version before saving.";
 
 export default function Admin() {
@@ -66,7 +66,6 @@ export default function Admin() {
   const [photosLoaded, setPhotosLoaded] = useState(false);
   const [photosError, setPhotosError] = useState("");
   const [saving, setSaving] = useState(false);
-  const [exporting, setExporting] = useState(false);
   const [deleting, setDeleting] = useState("");
   const [confirmDelete, setConfirmDelete] = useState("");
   const [notice, setNotice] = useState("");
@@ -650,32 +649,6 @@ export default function Admin() {
     }
   };
 
-  const exportZip = async () => {
-    setExporting(true); setError("");
-    try {
-      // Ask for the destination while the click's user activation is still
-      // live. The response can then stream straight to disk without a giant blob.
-      const picker = (window as FilePickerWindow).showSaveFilePicker;
-      const handle = picker ? await picker({ suggestedName: `${event}-photos.zip`, types: [{ description: "ZIP archive", accept: { "application/zip": [".zip"] } }] }) : null;
-      const response = await fetch(`/api/export?event=${encodeURIComponent(event)}`, { headers: { "x-booth-key": adminKey } });
-      if (response.status === 401) { invalidateAuth(); throw new Error("That admin key was rejected."); }
-      if (!response.ok) throw new Error(`Export failed (${response.status})`);
-      if (handle && response.body) {
-        const writable = await handle.createWritable();
-        await response.body.pipeTo(writable);
-      } else {
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-        const anchor = document.createElement("a");
-        anchor.href = url; anchor.download = `${event}-photos.zip`; anchor.click();
-        URL.revokeObjectURL(url);
-      }
-    } catch (cause) {
-      if (cause instanceof DOMException && cause.name === "AbortError") return;
-      setError(cause instanceof Error ? cause.message : "Export could not be created");
-    } finally { setExporting(false); }
-  };
-
   const deletePhoto = async (photo: Photo) => {
     setDeleting(photo.key); setError("");
     try {
@@ -852,8 +825,15 @@ export default function Admin() {
               saving={saving}
               onSave={() => void save()}
             />
-            <button className={styles.exportButton} onClick={() => void exportZip()} disabled={exporting}>{exporting ? "Building archive…" : `Export ${photos.length} photos (.zip)`}</button>
           </section>
+          <ExportPanel
+            event={event}
+            adminKey={adminKey}
+            locale={defaultLocale}
+            onUnauthorized={invalidateAuth}
+            onNotice={setNotice}
+            onError={setError}
+          />
         </aside>
       </div>
     </main>

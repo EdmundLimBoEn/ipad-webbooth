@@ -50,6 +50,25 @@ export const englishMessages = {
   captureFailed: "We couldn’t prepare this photo. Please try again.",
   saveFailed: "We couldn’t safely save this photo. Choose Use Photo to retry or Retake.",
   decodeFailed: "We couldn’t read this photo. Please take another one.",
+  exportPanelTitle: "Post-event package",
+  exportPanelDescription:
+    "Download photos with an escaped manifest, timezone-aware analytics, and a printable contact sheet.",
+  exportDesktopHint:
+    "For large archives, use a desktop browser with direct-to-disk downloads.",
+  exportPackageAction: "Download event package",
+  exportPhotosAction: "Download photos only",
+  exportPackageBusy: "Downloading event package…",
+  exportPhotosBusy: "Downloading photos…",
+  exportPackageDone: "Event package downloaded.",
+  exportPhotosDone: "Photo archive downloaded.",
+  exportTooLarge:
+    "This event exceeds the single-ZIP safety limit. Try photos-only or ask an operator to split the export; do not delete photos.",
+  exportMetadataInvalid:
+    "Stored photo metadata needs investigation. Photos-only export remains available.",
+  exportUnavailable:
+    "Export is temporarily unavailable. Your photos are unchanged; please retry.",
+  exportGenericError:
+    "The export could not be downloaded. Your photos are unchanged; please retry.",
 } satisfies Record<string, string>;
 
 export type MessageKey = keyof typeof englishMessages;
@@ -99,6 +118,19 @@ export const chineseSingaporeMessages: Record<MessageKey, string> = {
   captureFailed: "无法准备这张照片。请重试。",
   saveFailed: "无法安全保存这张照片。请选择“使用照片”重试或重拍。",
   decodeFailed: "无法读取这张照片。请重新拍摄。",
+  exportPanelTitle: "活动结束资料包",
+  exportPanelDescription: "下载照片，以及安全转义的清单、按时区统计的数据和可打印的联系表。",
+  exportDesktopHint: "大型压缩包建议使用支持直接保存到磁盘的桌面浏览器下载。",
+  exportPackageAction: "下载活动资料包",
+  exportPhotosAction: "仅下载照片",
+  exportPackageBusy: "正在下载活动资料包…",
+  exportPhotosBusy: "正在下载照片…",
+  exportPackageDone: "活动资料包已下载。",
+  exportPhotosDone: "照片压缩包已下载。",
+  exportTooLarge: "此活动超过单个 ZIP 的安全上限。请尝试仅下载照片，或请操作员拆分导出；不要删除照片。",
+  exportMetadataInvalid: "存储的照片元数据需要检查。仍可使用仅下载照片。",
+  exportUnavailable: "导出暂时不可用。照片未被更改，请重试。",
+  exportGenericError: "无法下载导出文件。照片未被更改，请重试。",
 };
 
 export const arabicMessages: Record<MessageKey, string> = {
@@ -150,6 +182,25 @@ export const arabicMessages: Record<MessageKey, string> = {
   saveFailed:
     "تعذر حفظ هذه الصورة بأمان. اختر استخدام الصورة للمحاولة مجددًا أو أعد الالتقاط.",
   decodeFailed: "تعذرت قراءة هذه الصورة. التقط صورة أخرى.",
+  exportPanelTitle: "حزمة ما بعد الحدث",
+  exportPanelDescription:
+    "نزّل الصور مع بيان آمن وتحليلات حسب المنطقة الزمنية وصفحة صور قابلة للطباعة.",
+  exportDesktopHint:
+    "للأرشيفات الكبيرة، استخدم متصفح سطح مكتب يدعم التنزيل المباشر إلى القرص.",
+  exportPackageAction: "تنزيل حزمة الحدث",
+  exportPhotosAction: "تنزيل الصور فقط",
+  exportPackageBusy: "جارٍ تنزيل حزمة الحدث…",
+  exportPhotosBusy: "جارٍ تنزيل الصور…",
+  exportPackageDone: "تم تنزيل حزمة الحدث.",
+  exportPhotosDone: "تم تنزيل أرشيف الصور.",
+  exportTooLarge:
+    "يتجاوز هذا الحدث حد أمان ملف ZIP واحد. جرّب الصور فقط أو اطلب من المشغّل تقسيم التصدير؛ لا تحذف الصور.",
+  exportMetadataInvalid:
+    "تحتاج بيانات الصور المخزنة إلى التحقيق. يظل تصدير الصور فقط متاحًا.",
+  exportUnavailable:
+    "التصدير غير متاح مؤقتًا. لم تتغير صورك؛ يرجى إعادة المحاولة.",
+  exportGenericError:
+    "تعذر تنزيل التصدير. لم تتغير صورك؛ يرجى إعادة المحاولة.",
 };
 
 const catalogs: Record<SupportedLocale, Record<MessageKey, string>> = {
