@@ -11,7 +11,7 @@ export type BoothAccessFeedback =
   | "ready";
 
 export type BoothPreflightResult =
-  | { kind: "ready"; frames: unknown }
+  | { kind: "ready"; frames: unknown; operationalState?: unknown }
   | { kind: "unauthorized" }
   | { kind: "unavailable" }
   | { kind: "recovery-only" };
@@ -53,6 +53,7 @@ type BoothLifecycleDependencies<Result> = {
   onOutboxRecovered: () => void;
   onAccess: (state: BoothAccessState, feedback: BoothAccessFeedback) => void;
   onFrames: (frames: string[] | null) => void;
+  onOperationalState: (state: unknown) => void;
   onCameraStart: () => void;
   onCameraStop: () => void;
   onUploaded: (result: Result) => void;
@@ -237,6 +238,9 @@ export class BoothLifecycleCoordinator<Result> {
     if (!this.isCurrent(active, preflightId)) return;
 
     active.credential.key = key;
+    if (result.operationalState !== undefined) {
+      this.deps.onOperationalState(result.operationalState);
+    }
     this.deps.onFrames(frames);
     this.deps.onAccess("ready", "ready");
     let startWork: Promise<void> | void;

@@ -145,3 +145,32 @@ describe("Booth unlock presentation", () => {
     expect(css).toContain("animation: none");
   });
 });
+
+describe("Booth operational integration", () => {
+  test("keeps polling, heartbeat, and paused capture boundaries separate from the Outbox", async () => {
+    const source = await Bun.file(`${import.meta.dir}/page.tsx`).text();
+
+    expect(source).toContain('from "./booth-session/device-identity"');
+    expect(source).toContain('from "./booth-session/operational-client"');
+    expect(source).toContain("loadOrCreateDeviceId(window.localStorage)");
+    expect(source).toContain("new BoothStatePoller");
+    expect(source).toContain("new BoothHeartbeatReporter");
+    expect(source).toContain("operational.paused");
+    expect(source).toContain("pauseAfterCaptureRef");
+    expect(source).toContain("resumeAfterCaptureRef");
+    expect(source).toContain("void session.process()");
+    expect(source).toContain("statePollerRef.current?.stop()");
+    expect(source).toContain("heartbeatReporterRef.current?.stop()");
+    expect(source).toContain('process.env.NEXT_PUBLIC_BUILD_ID ?? "development"');
+    expect(source).not.toContain("navigator.userAgent");
+  });
+
+  test("shows pause and connectivity states with touch-safe focus treatment", async () => {
+    const css = await Bun.file(`${import.meta.dir}/booth.module.css`).text();
+
+    expect(css).toContain(".operationalPause");
+    expect(css).toContain(".connectivity");
+    expect(css).toContain(".choice:focus-visible");
+    expect(css).toContain("min-height: 44px");
+  });
+});

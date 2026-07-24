@@ -60,6 +60,7 @@ function harness(options: {
   const access: string[] = [];
   const frames: Array<string[] | null> = [];
   const uploaded: string[] = [];
+  const operational: unknown[] = [];
   const cleared: string[] = [];
   let cameraStarts = 0;
   let cameraStops = 0;
@@ -76,6 +77,7 @@ function harness(options: {
     onOutboxRecovered: () => events.push("outbox-recovered"),
     onAccess: (state, feedback) => access.push(`${state}:${feedback}`),
     onFrames: (next) => frames.push(next),
+    onOperationalState: (state) => operational.push(state),
     onCameraStart: () => {
       cameraStarts++;
     },
@@ -90,6 +92,7 @@ function harness(options: {
     access,
     frames,
     uploaded,
+    operational,
     cleared,
     cameraStarts: () => cameraStarts,
     cameraStops: () => cameraStops,
@@ -197,6 +200,34 @@ describe("Booth lifecycle coordination", () => {
     expect(h.cleared).toEqual([]);
     expect(session.actions.filter((action) => action === "start")).toHaveLength(1);
     expect(h.cameraStarts()).toBe(1);
+  });
+
+  test("applies operational state only from the current successful preflight", async () => {
+    const first = deferred<BoothPreflightResult>();
+    const second = deferred<BoothPreflightResult>();
+    let attempts = 0;
+    const h = harness({
+      preflight: async () => (++attempts === 1 ? first.promise : second.promise),
+    });
+    const session = new FakeSession();
+    await h.coordinator.beginEvent("launch", session, credential());
+
+    const stale = h.coordinator.unlock("old-key");
+    const current = h.coordinator.unlock("new-key");
+    second.resolve({
+      kind: "ready",
+      frames: ["square"],
+      operationalState: { version: 1, paused: true },
+    });
+    await current;
+    first.resolve({
+      kind: "ready",
+      frames: ["square"],
+      operationalState: { version: 1, paused: false },
+    });
+    await stale;
+
+    expect(h.operational).toEqual([{ version: 1, paused: true }]);
   });
 
   test("StrictMode-style cleanup prevents deferred recovery from starting old work", async () => {

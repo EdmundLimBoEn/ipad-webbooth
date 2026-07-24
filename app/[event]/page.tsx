@@ -13,6 +13,13 @@ import {
 } from "./booth-session/session";
 import { outboxUploadHeaders } from "./booth-session/upload";
 import { HttpUploadError, type UploadErrorClass } from "./booth-session/retry-policy";
+import { loadOrCreateDeviceId } from "./booth-session/device-identity";
+import {
+  BoothHeartbeatReporter,
+  BoothStatePoller,
+  type BoothOperationalClientState,
+} from "./booth-session/operational-client";
+import type { BoothErrorClass, BoothHeartbeatInput } from "../booth-control";
 import type { BoothAccessState } from "./booth-session/access";
 import {
   clearBoothCredential,
@@ -28,6 +35,7 @@ import {
 import { BoothUnlock } from "./booth-unlock";
 
 type Status = "starting" | "picking" | "ready" | "denied" | "running";
+type OperationalState = BoothOperationalClientState;
 
 const INITIAL_UPLOAD_STATE: UploadState = {
   status: "idle",
@@ -42,6 +50,44 @@ function uploadErrorClass(status: number): UploadErrorClass {
   if (status >= 500) return "server";
   if (status === 400 || status === 403 || status === 413 || status === 415) return "payload";
   return "unknown";
+}
+
+function isPreflightOperationalState(value: unknown): value is { version: 1; paused: boolean } {
+  return Boolean(value)
+    && typeof value === "object"
+    && (value as { version?: unknown }).version === 1
+    && typeof (value as { paused?: unknown }).paused === "boolean";
+}
+
+function isInstalled() {
+  if (typeof window === "undefined") return false;
+  const navigatorWithStandalone = navigator as Navigator & { standalone?: boolean };
+  return window.matchMedia("(display-mode: standalone)").matches
+    || navigatorWithStandalone.standalone === true;
+}
+
+function heartbeatCamera(status: Status, paused: boolean): BoothHeartbeatInput["camera"] {
+  if (paused) return "stopped";
+  if (status === "starting") return "starting";
+  if (status === "denied") return "denied";
+  if (status === "picking" || status === "ready" || status === "running") return "ready";
+  return "stopped";
+}
+
+function heartbeatUpload(upload: UploadState): BoothHeartbeatInput["upload"] {
+  if (upload.status === "uploading") return "uploading";
+  if (upload.status === "failed") return "blocked";
+  return "idle";
+}
+
+function heartbeatError(
+  status: Status,
+  cameraError: Extract<BoothErrorClass, "camera-permission" | "camera-unavailable"> | null,
+  upload: UploadState
+): BoothErrorClass | undefined {
+  if (status === "denied") return cameraError ?? "camera-unavailable";
+  if (upload.status === "failed") return "unknown";
+  return undefined;
 }
 
 async function requestBoothPreflight(
@@ -62,8 +108,18 @@ async function requestBoothPreflight(
     return { kind: "unavailable" };
   }
   if (!response.ok) return { kind: "recovery-only" };
-  const payload = await response.json() as { experience?: { frames?: unknown } };
-  return { kind: "ready", frames: payload.experience?.frames };
+  const payload = await response.json() as {
+    experience?: { frames?: unknown };
+    operationalState?: unknown;
+  };
+  if (!isPreflightOperationalState(payload.operationalState)) {
+    return { kind: "recovery-only" };
+  }
+  return {
+    kind: "ready",
+    frames: payload.experience?.frames,
+    operationalState: payload.operationalState,
+  };
 }
 
 export default function Booth() {
@@ -71,9 +127,17 @@ export default function Booth() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<BoothSession | null>(null);
+  const statePollerRef = useRef<BoothStatePoller | null>(null);
+  const heartbeatReporterRef = useRef<BoothHeartbeatReporter | null>(null);
   const captureRef = useRef<AbortController | null>(null);
   const cameraRequestRef = useRef(0);
   const unmountedRef = useRef(false);
+  const deviceIdRef = useRef("");
+  const sessionStartedAtRef = useRef(0);
+  const pauseAfterCaptureRef = useRef(false);
+  const resumeAfterCaptureRef = useRef(false);
+  const operationalRef = useRef<OperationalState>({ paused: false, connected: false });
+  const uploadStateRef = useRef<UploadState>(INITIAL_UPLOAD_STATE);
   const [status, setStatus] = useState<Status>("starting");
   const [accessState, setAccessState] = useState<BoothAccessState>("locked");
   const [accessFeedback, setAccessFeedback] =
@@ -84,7 +148,16 @@ export default function Booth() {
   const [shot, setShot] = useState(0); // e.g. 2 of 3
   const [flash, setFlash] = useState(false);
   const [lastUrl, setLastUrl] = useState<string | null>(null);
+  const [lastSuccessfulUploadAt, setLastSuccessfulUploadAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [cameraErrorClass, setCameraErrorClass] = useState<
+    Extract<BoothErrorClass, "camera-permission" | "camera-unavailable"> | null
+  >(null);
+  const [operational, setOperational] = useState<OperationalState>({
+    paused: false,
+    connected: false,
+  });
+  const [online, setOnline] = useState(false);
   const [uploadState, setUploadState] =
     useState<UploadState>(INITIAL_UPLOAD_STATE);
   // Frames remain unavailable until authenticated preflight returns the safe
@@ -92,9 +165,11 @@ export default function Booth() {
   const [enabled, setEnabled] = useState<string[] | null>(null);
 
   const startCamera = useCallback(async () => {
+    if (operationalRef.current.paused || unmountedRef.current) return;
     const request = ++cameraRequestRef.current;
     setStatus("starting");
     setError(null);
+    setCameraErrorClass(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user", width: { ideal: 1920 }, height: { ideal: 1080 } },
@@ -102,7 +177,11 @@ export default function Booth() {
       });
       // unmounted while getUserMedia was pending: stop the tracks now or the
       // camera light stays on with nothing to clean it up
-      if (unmountedRef.current || request !== cameraRequestRef.current) {
+      if (
+        unmountedRef.current
+        || operationalRef.current.paused
+        || request !== cameraRequestRef.current
+      ) {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
@@ -112,7 +191,11 @@ export default function Booth() {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
-      if (unmountedRef.current || request !== cameraRequestRef.current) {
+      if (
+        unmountedRef.current
+        || operationalRef.current.paused
+        || request !== cameraRequestRef.current
+      ) {
         stream.getTracks().forEach((track) => track.stop());
         if (streamRef.current === stream) streamRef.current = null;
         return;
@@ -121,6 +204,11 @@ export default function Booth() {
     } catch (e) {
       if (unmountedRef.current || request !== cameraRequestRef.current) return;
       setStatus("denied");
+      setCameraErrorClass(
+        e instanceof DOMException && (e.name === "NotAllowedError" || e.name === "SecurityError")
+          ? "camera-permission"
+          : "camera-unavailable"
+      );
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
@@ -133,6 +221,38 @@ export default function Booth() {
     streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
   }, []);
+
+  const pauseAtSafeBoundary = useCallback(() => {
+    setMode(null);
+    setShot(0);
+    setCount(0);
+    setFlash(false);
+    setStatus("picking");
+    stopCamera();
+  }, [stopCamera]);
+
+  const applyOperationalState = useCallback((next: OperationalState) => {
+    const previous = operationalRef.current;
+    operationalRef.current = next;
+    setOperational(next);
+    if (next.paused) {
+      if (captureRef.current) {
+        pauseAfterCaptureRef.current = true;
+        resumeAfterCaptureRef.current = false;
+        return;
+      }
+      pauseAtSafeBoundary();
+      return;
+    }
+    if (previous.paused) {
+      pauseAfterCaptureRef.current = false;
+      if (captureRef.current) {
+        resumeAfterCaptureRef.current = true;
+        return;
+      }
+      void startCamera();
+    }
+  }, [pauseAtSafeBoundary, startCamera]);
 
   const lifecycle = useMemo(
     () => new BoothLifecycleCoordinator<UploadResult>({
@@ -150,6 +270,12 @@ export default function Booth() {
           window.localStorage
         ),
       onReset: () => {
+        pauseAfterCaptureRef.current = false;
+        resumeAfterCaptureRef.current = false;
+        operationalRef.current = { paused: false, connected: false };
+        uploadStateRef.current = INITIAL_UPLOAD_STATE;
+        deviceIdRef.current = loadOrCreateDeviceId(window.localStorage);
+        sessionStartedAtRef.current = Date.now();
         setStatus("starting");
         setMode(null);
         setLastUrl(null);
@@ -159,6 +285,9 @@ export default function Booth() {
         setFlash(false);
         setEnabled(null);
         setOutboxRecovered(false);
+        setCameraErrorClass(null);
+        setOperational(operationalRef.current);
+        setOnline(navigator.onLine);
         setUploadState(INITIAL_UPLOAD_STATE);
       },
       onOutboxRecovered: () => setOutboxRecovered(true),
@@ -175,13 +304,46 @@ export default function Booth() {
         setAccessFeedback(feedback);
       },
       onFrames: setEnabled,
-      onCameraStart: () => {
-        void startCamera();
+      onOperationalState: (value) => {
+        if (isPreflightOperationalState(value)) {
+          applyOperationalState({ paused: value.paused, connected: true });
+        }
       },
-      onCameraStop: stopCamera,
-      onUploaded: ({ url }) => setLastUrl(url),
+      onCameraStart: () => {
+        const reporter = heartbeatReporterRef.current;
+        if (reporter && deviceIdRef.current && sessionStartedAtRef.current) {
+          const upload = uploadStateRef.current;
+          reporter.update({
+            version: 1,
+            deviceId: deviceIdRef.current,
+            sessionStartedAt: sessionStartedAtRef.current,
+            pendingCount: upload.pendingCount,
+            durableStorage: upload.durable,
+            online: navigator.onLine,
+            installed: isInstalled(),
+            camera: operationalRef.current.paused ? "stopped" : "starting",
+            upload: heartbeatUpload(upload),
+            ...(heartbeatError("starting", null, upload) === undefined
+              ? {}
+              : { errorClass: heartbeatError("starting", null, upload) }),
+            buildId: process.env.NEXT_PUBLIC_BUILD_ID ?? "development",
+          });
+          reporter.start();
+        }
+        statePollerRef.current?.start();
+        if (!operationalRef.current.paused) void startCamera();
+      },
+      onCameraStop: () => {
+        statePollerRef.current?.stop();
+        heartbeatReporterRef.current?.stop();
+        stopCamera();
+      },
+      onUploaded: ({ url }) => {
+        setLastUrl(url);
+        setLastSuccessfulUploadAt(Date.now());
+      },
     }),
-    [startCamera, stopCamera]
+    [applyOperationalState, startCamera, stopCamera]
   );
 
   useEffect(() => {
@@ -239,25 +401,73 @@ export default function Booth() {
       }
     );
     sessionRef.current = session;
+    const poller = new BoothStatePoller({
+      event,
+      onState: applyOperationalState,
+    });
+    statePollerRef.current = poller;
+    const reporter = new BoothHeartbeatReporter({
+      event,
+      boothKey: () => credential.key,
+      onAuthRequired: () => lifecycle.authRequired(session, ""),
+    });
+    heartbeatReporterRef.current = reporter;
     const entering = lifecycle.beginEvent(event, session, credential);
     const unsubscribe = session.subscribe((next) => {
-      if (lifecycle.isActive(session)) setUploadState(next);
+      if (lifecycle.isActive(session)) {
+        uploadStateRef.current = next;
+        setUploadState(next);
+      }
     });
-    const reconsiderConnectivity = () => void session.reconsider("connectivity");
+    const reconsiderConnectivity = () => {
+      setOnline(navigator.onLine);
+      void session.reconsider("connectivity");
+    };
     const reconsiderForeground = () => {
       if (document.visibilityState === "visible") void session.reconsider("foreground");
     };
     window.addEventListener("online", reconsiderConnectivity);
+    window.addEventListener("offline", reconsiderConnectivity);
     document.addEventListener("visibilitychange", reconsiderForeground);
     void entering;
     return () => {
       unsubscribe();
       window.removeEventListener("online", reconsiderConnectivity);
+      window.removeEventListener("offline", reconsiderConnectivity);
       document.removeEventListener("visibilitychange", reconsiderForeground);
       if (sessionRef.current === session) sessionRef.current = null;
+      if (statePollerRef.current === poller) statePollerRef.current = null;
+      if (heartbeatReporterRef.current === reporter) heartbeatReporterRef.current = null;
       void lifecycle.leaveEvent(session);
     };
-  }, [event, lifecycle]);
+  }, [applyOperationalState, event, lifecycle]);
+
+  useEffect(() => {
+    const reporter = heartbeatReporterRef.current;
+    if (!reporter || !deviceIdRef.current || !sessionStartedAtRef.current) return;
+    const errorClass = heartbeatError(status, cameraErrorClass, uploadState);
+    reporter.update({
+      version: 1,
+      deviceId: deviceIdRef.current,
+      sessionStartedAt: sessionStartedAtRef.current,
+      pendingCount: uploadState.pendingCount,
+      durableStorage: uploadState.durable,
+      online,
+      installed: isInstalled(),
+      camera: heartbeatCamera(status, operational.paused),
+      upload: heartbeatUpload(uploadState),
+      ...(lastSuccessfulUploadAt === null ? {} : { lastSuccessfulUploadAt }),
+      ...(errorClass === undefined ? {} : { errorClass }),
+      buildId: process.env.NEXT_PUBLIC_BUILD_ID ?? "development",
+    });
+  }, [
+    cameraErrorClass,
+    lastSuccessfulUploadAt,
+    online,
+    operational.paused,
+    status,
+    uploadState,
+  ]);
 
   const unlock = useCallback((key: string, remember: boolean) => {
     saveBoothCredential(
@@ -281,7 +491,12 @@ export default function Booth() {
 
   // take the whole sequence for the chosen mode, composite, upload
   const run = useCallback(async () => {
-    if (accessState !== "ready" || status !== "ready" || !mode) return;
+    if (
+      accessState !== "ready"
+      || operationalRef.current.paused
+      || status !== "ready"
+      || !mode
+    ) return;
     const t = TEMPLATES[mode];
     setStatus("running");
     const controller = new AbortController();
@@ -316,8 +531,18 @@ export default function Booth() {
       // Durable handoff is complete. Return to the picker before uploading so
       // the next guest is never trapped on the previous guest's frame.
       setError(null);
-      setMode(null);
-      setStatus("picking");
+      if (operationalRef.current.paused) {
+        pauseAfterCaptureRef.current = false;
+        pauseAtSafeBoundary();
+      } else {
+        setMode(null);
+        setStatus("picking");
+        if (resumeAfterCaptureRef.current) {
+          resumeAfterCaptureRef.current = false;
+          void startCamera();
+        }
+      }
+      // Pause gates new capture only. It never interrupts the ordered Outbox.
       void session.process();
     } catch (e) {
       if (controller.signal.aborted || !session || !lifecycle.isActive(session)) return;
@@ -327,12 +552,29 @@ export default function Booth() {
       setShot(0);
       setCount(0);
       setFlash(false);
-      setMode(null);
-      setStatus(streamRef.current ? "picking" : "denied");
+      if (operationalRef.current.paused) {
+        pauseAfterCaptureRef.current = false;
+        pauseAtSafeBoundary();
+      } else {
+        setMode(null);
+        setStatus(streamRef.current ? "picking" : "denied");
+        if (resumeAfterCaptureRef.current) {
+          resumeAfterCaptureRef.current = false;
+          void startCamera();
+        }
+      }
     } finally {
       if (captureRef.current === controller) captureRef.current = null;
     }
-  }, [accessState, status, mode, grabFrame, lifecycle]);
+  }, [
+    accessState,
+    status,
+    mode,
+    grabFrame,
+    lifecycle,
+    pauseAtSafeBoundary,
+    startCamera,
+  ]);
 
   // fallback: native file input (camera) when getUserMedia is blocked.
   // Re-encode to a real JPEG first — iPhones hand back HEIC, and the stored
@@ -340,7 +582,7 @@ export default function Booth() {
   // ponytail: fallback photos stay frameless; compositing needs the live capture flow.
   const onFile = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
-      if (accessState !== "ready") {
+      if (accessState !== "ready" || operationalRef.current.paused) {
         e.target.value = "";
         return;
       }
@@ -352,7 +594,8 @@ export default function Booth() {
       const session = sessionRef.current;
       try {
         if (!session) throw new Error("Photo queue is still starting — please try again");
-        await session.enqueueCapture(async () => {
+        await session.enqueueCapture(async (signal) => {
+          if (signal?.aborted) throw new DOMException("Capture aborted", "AbortError");
           let blob: Blob = file;
           try {
             const bmp = await createImageBitmap(file);
@@ -375,19 +618,33 @@ export default function Booth() {
         });
         if (controller.signal.aborted || !lifecycle.isActive(session)) return;
         setError(null);
+        if (operationalRef.current.paused) {
+          pauseAfterCaptureRef.current = false;
+          pauseAtSafeBoundary();
+        } else if (resumeAfterCaptureRef.current) {
+          resumeAfterCaptureRef.current = false;
+          void startCamera();
+        }
         void session.process();
       } catch (uploadError) {
         if (controller.signal.aborted || !session || !lifecycle.isActive(session)) return;
         setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
+        if (operationalRef.current.paused) {
+          pauseAfterCaptureRef.current = false;
+          pauseAtSafeBoundary();
+        } else if (resumeAfterCaptureRef.current) {
+          resumeAfterCaptureRef.current = false;
+          void startCamera();
+        }
       } finally {
         if (captureRef.current === controller) captureRef.current = null;
       }
     },
-    [accessState, lifecycle]
+    [accessState, lifecycle, pauseAtSafeBoundary, startCamera]
   );
 
   const pick = (m: keyof typeof TEMPLATES) => {
-    if (accessState !== "ready") return;
+    if (accessState !== "ready" || operationalRef.current.paused) return;
     setMode(m);
     setStatus("ready");
   };
@@ -434,7 +691,12 @@ export default function Booth() {
             {availableTemplates(enabled).map((k) => {
               const t = TEMPLATES[k];
               return (
-                <button key={k} className={styles.choice} onClick={() => pick(k)}>
+                <button
+                  key={k}
+                  className={styles.choice}
+                  onClick={() => pick(k)}
+                  disabled={operational.paused}
+                >
                   {t.bgImage ? (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img src={t.bgImage} alt="" className={styles.iconFrame} />
@@ -460,7 +722,7 @@ export default function Booth() {
               accept="image/*"
               capture="user"
               onChange={onFile}
-              disabled={accessState !== "ready"}
+              disabled={accessState !== "ready" || operational.paused}
               hidden
             />
           </label>
@@ -476,7 +738,7 @@ export default function Booth() {
           <button
             className={styles.shutter}
             onClick={run}
-            disabled={accessState !== "ready" || status !== "ready"}
+            disabled={accessState !== "ready" || operational.paused || status !== "ready"}
             aria-label="Start"
           >
             {status === "running" ? "" : mode && TEMPLATES[mode].shots > 1 ? "▶" : ""}
@@ -484,7 +746,7 @@ export default function Booth() {
           <button
             className={styles.change}
             onClick={() => setStatus("picking")}
-            disabled={accessState !== "ready" || status !== "ready"}
+            disabled={accessState !== "ready" || operational.paused || status !== "ready"}
           >
             {mode && TEMPLATES[mode].label} · change
           </button>
@@ -528,6 +790,20 @@ export default function Booth() {
         <div className={styles.storageWarning} role="status">
           Offline photo storage is unavailable. Pending photos may be lost if this page reloads.
         </div>
+      )}
+      {accessState === "ready" && !operational.connected && (
+        <div className={styles.connectivity} role="status" aria-live="polite">
+          Checking Event connection. The last pause state stays in effect.
+        </div>
+      )}
+      {accessState === "ready" && operational.paused && (
+        <section className={styles.operationalPause} aria-labelledby="booth-paused-title">
+          <div className={styles.operationalPausePanel} role="status" aria-live="polite">
+            <p className={styles.operationalEyebrow}>Event operator</p>
+            <h1 id="booth-paused-title">Booth paused</h1>
+            <p>Finishing any photo already in progress. This Booth will resume when the Event is ready.</p>
+          </div>
+        </section>
       )}
     </main>
   );
