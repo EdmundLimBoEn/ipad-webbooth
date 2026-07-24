@@ -84,6 +84,13 @@ test("capture experience controls expose supported locales and plain capture set
   expect(html).toContain("Countdown sounds on by default");
   expect(html).toContain('min="1"');
   expect(html).toContain('max="30"');
+  const englishInput = html.match(/<input[^>]*><span lang="en"/)?.[0] ?? "";
+  const arabicInput = html.match(/<input[^>]*><span lang="ar"/)?.[0] ?? "";
+  expect(englishInput).toContain('checked=""');
+  expect(englishInput).toContain('disabled=""');
+  expect(englishInput).toContain('required=""');
+  expect(arabicInput).toContain('checked=""');
+  expect(arabicInput).not.toContain("disabled");
 });
 
 test("configuration mutation guard disables every locale and capture control", () => {

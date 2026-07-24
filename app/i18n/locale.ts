@@ -14,11 +14,9 @@ export function deviceLocaleStorageKey(event: string): string {
 export function resolveEnabledLocales(
   configured: readonly string[] | undefined
 ): SupportedLocale[] {
-  const enabled = (configured ?? [])
-    .filter(isSupportedLocale)
-    .filter((locale, index, locales) => locales.indexOf(locale) === index);
-  if (!enabled.includes("en")) enabled.push("en");
-  return enabled;
+  const configuredLocales = new Set((configured ?? []).filter(isSupportedLocale));
+  configuredLocales.add("en");
+  return SUPPORTED_LOCALES.filter((locale) => configuredLocales.has(locale));
 }
 
 function matchBrowserLocale(
@@ -27,10 +25,19 @@ function matchBrowserLocale(
 ): SupportedLocale | null {
   if (isSupportedLocale(language) && enabled.includes(language)) return language;
   const normalized = language.toLowerCase();
+  const subtags = normalized.split("-");
+  if (subtags[0] === "zh") {
+    if (!enabled.includes("zh-SG")) return null;
+    if (subtags.some((subtag) => ["hant", "tw", "hk", "mo"].includes(subtag))) {
+      return null;
+    }
+    return subtags.some((subtag) => ["hans", "sg", "cn"].includes(subtag))
+      ? "zh-SG"
+      : null;
+  }
   const candidate = SUPPORTED_LOCALES.find((locale) => {
     if (!enabled.includes(locale)) return false;
     const supported = locale.toLowerCase();
-    if (supported.startsWith("zh-")) return normalized === "zh" || normalized.startsWith("zh-");
     return normalized === supported || normalized.startsWith(`${supported}-`);
   });
   return candidate ?? null;
@@ -63,7 +70,12 @@ export function saveDeviceLocale(
   locale: SupportedLocale,
   storage: Pick<Storage, "setItem">
 ): void {
-  storage.setItem(deviceLocaleStorageKey(event), locale);
+  try {
+    storage.setItem(deviceLocaleStorageKey(event), locale);
+  } catch {
+    // Locale preference is an enhancement; denied/quota-limited storage must
+    // never block the guest experience.
+  }
 }
 
 export function applyDocumentLocale(

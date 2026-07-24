@@ -27,9 +27,10 @@ import {
   clearRestoreRequestAfterReconciliation,
   editableExperienceFromConfig,
   getOrCreateRestoreRequest,
+  parseConfigHistoryResponse,
+  parseConfigMutationResponse,
   rebaseConfigHistory,
   shouldClearRestoreRequest,
-  type ConfigHistoryResponse,
   type RestoreRequest,
 } from "./config-mutation";
 import styles from "./admin.module.css";
@@ -151,12 +152,8 @@ export default function Admin() {
         throw new Error("That admin key was rejected.");
       }
       if (!response.ok) throw new Error(`Configuration history returned ${response.status}`);
-      const data = await response.json() as ConfigHistoryResponse;
-      if (
-        !data.config
-        || !Array.isArray(data.revisions)
-        || (data.currentRevisionId !== null && typeof data.currentRevisionId !== "string")
-      ) {
+      const data = parseConfigHistoryResponse(await response.json());
+      if (!data) {
         throw new Error("Configuration history had an unexpected shape");
       }
       const rebased = rebaseConfigHistory(data, defaults, pendingSaveMutationId);
@@ -465,7 +462,7 @@ export default function Admin() {
   };
 
   const toggleLocale = (locale: SupportedLocale) => {
-    if (configMutationBusy.current) return;
+    if (configMutationBusy.current || locale === "en") return;
     clearPendingSave();
     setLocales((current) => {
       const next = new Set(current);
@@ -581,7 +578,8 @@ export default function Admin() {
         return;
       }
       if (!response.ok) throw new Error(`Save failed (${response.status})`);
-      const data = await response.json() as PublicEventConfig & { currentRevisionId: string };
+      const data = parseConfigMutationResponse(await response.json());
+      if (!data) throw new Error("Configuration response had an unexpected shape");
       pendingSaveMutationId.current = null;
       setCurrentRevisionId(data.currentRevisionId);
       if (boothKey) { setHasBoothKey(true); setBoothKeySaved(true); }
@@ -623,7 +621,8 @@ export default function Admin() {
       }
       if (!response.ok) throw new Error(`Restore failed (${response.status})`);
       await clearRestoreRequestAfterReconciliation(pending, request, async () => {
-        const data = await response.json() as PublicEventConfig & { currentRevisionId: string };
+        const data = parseConfigMutationResponse(await response.json());
+        if (!data) throw new Error("Configuration response had an unexpected shape");
         const restored = editableExperienceFromConfig(data, defaults);
         setFrames(new Set(restored.frames));
         setLocales(new Set(restored.locales));

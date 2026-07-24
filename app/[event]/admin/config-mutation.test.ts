@@ -3,6 +3,8 @@ import {
   buildConfigSaveBody,
   clearRestoreRequestAfterReconciliation,
   getOrCreateRestoreRequest,
+  parseConfigHistoryResponse,
+  parseConfigMutationResponse,
   rebaseConfigHistory,
   shouldClearRestoreRequest,
   type RestoreRequest,
@@ -121,7 +123,7 @@ test("history rebase restores the complete safe editable experience", () => {
   expect(rebased).toMatchObject({
     frames: ["one"],
     hasBoothKey: true,
-    locales: ["zh-SG", "ar", "en"],
+    locales: ["en", "zh-SG", "ar"],
     defaultLocale: "ar",
     timeZone: "Asia/Singapore",
     reviewEnabled: false,
@@ -183,4 +185,107 @@ test("a 2xx restore retains its exact tuple until parsing, apply, and history re
 
   await clearRestoreRequestAfterReconciliation(pending, request, async () => {});
   expect(pending.has(SOURCE_REVISION)).toBe(false);
+});
+
+test("strictly parses a complete Admin configuration history response", () => {
+  expect(parseConfigHistoryResponse({
+    config: {
+      frames: ["one"],
+      hasBoothKey: true,
+      locales: ["en", "ar"],
+      defaultLocale: "ar",
+      capture: {
+        reviewEnabled: false,
+        autoAcceptSeconds: 9,
+        countdownAudioDefault: true,
+      },
+    },
+    currentRevisionId: SOURCE_REVISION,
+    revisions: [{
+      version: 1,
+      id: SOURCE_REVISION,
+      createdAt: "2026-07-24T00:00:00.000Z",
+      parentRevisionId: null,
+      reason: "save",
+      config: {
+        frames: ["one"],
+        locales: ["en", "ar"],
+        defaultLocale: "ar",
+        capture: {
+          reviewEnabled: false,
+          autoAcceptSeconds: 9,
+          countdownAudioDefault: true,
+        },
+      },
+    }],
+  })).toMatchObject({
+    config: {
+      frames: ["one"],
+      hasBoothKey: true,
+      locales: ["en", "ar"],
+      defaultLocale: "ar",
+    },
+    currentRevisionId: SOURCE_REVISION,
+    revisions: [{ id: SOURCE_REVISION }],
+  });
+});
+
+test("rejects malformed nested config and revision data before rebase", () => {
+  const base = {
+    config: { frames: ["one"], hasBoothKey: false },
+    currentRevisionId: null,
+    revisions: [],
+  };
+  const malformed = [
+    { ...base, config: { ...base.config, locales: [null] } },
+    { ...base, config: { ...base.config, capture: { autoAcceptSeconds: 0 } } },
+    { ...base, currentRevisionId: "../revision" },
+    { ...base, revisions: [null] },
+    {
+      ...base,
+      revisions: [{
+        version: 1,
+        id: SOURCE_REVISION,
+        createdAt: "2026-07-24T00:00:00.000Z",
+        parentRevisionId: null,
+        reason: "save",
+        config: { frames: ["one"], capture: { reviewEnabled: "yes" } },
+      }],
+    },
+  ];
+
+  for (const response of malformed) {
+    expect(() => parseConfigHistoryResponse(response)).not.toThrow();
+    expect(parseConfigHistoryResponse(response)).toBeNull();
+  }
+});
+
+test("strictly parses mutation responses before applying restored settings", () => {
+  expect(parseConfigMutationResponse({
+    frames: ["one"],
+    hasBoothKey: true,
+    locales: ["en"],
+    defaultLocale: "en",
+    capture: {
+      reviewEnabled: true,
+      autoAcceptSeconds: 5,
+      countdownAudioDefault: false,
+    },
+    currentRevisionId: SOURCE_REVISION,
+    idempotent: false,
+  })).toMatchObject({
+    frames: ["one"],
+    currentRevisionId: SOURCE_REVISION,
+    idempotent: false,
+  });
+
+  expect(parseConfigMutationResponse({
+    frames: ["one"],
+    hasBoothKey: true,
+    locales: ["en"],
+    defaultLocale: "en",
+    capture: { autoAcceptSeconds: "soon" },
+    currentRevisionId: SOURCE_REVISION,
+    idempotent: false,
+  })).toBeNull();
 });

@@ -133,6 +133,7 @@ function parseSaveBody(value: unknown): SaveBody | null {
       || value.locales.length === 0
       || !value.locales.every(isSupportedLocale)
       || new Set(value.locales).size !== value.locales.length
+      || !value.locales.includes("en")
     )
   ) {
     return null;

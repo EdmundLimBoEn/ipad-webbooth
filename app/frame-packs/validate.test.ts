@@ -140,3 +140,35 @@ test("rejects a default Frame label longer than 80 characters", () => {
     message: "label must be at most 80 characters",
   });
 });
+
+test("counts non-BMP Frame label limits by Unicode code point", () => {
+  const manifest = (defaultLabel: string, localizedLabel: string): FramePackManifest => ({
+    version: 1,
+    pack: { key: "party", label: "Party" },
+    templates: {
+      frame: {
+        label: defaultLabel,
+        labels: { ar: localizedLabel },
+        shots: 1,
+        intervalMs: 3000,
+        canvas: { w: 100, h: 100 },
+        background: "#fff",
+        slots: [{ x: 0, y: 0, w: 100, h: 100 }],
+      },
+    },
+  });
+
+  expect(validateFramePacks([manifest("😀".repeat(80), "🎉".repeat(80))])).toEqual([]);
+  expect(validateFramePacks([manifest("😀".repeat(81), "🎉".repeat(81))])).toEqual(
+    expect.arrayContaining([
+      {
+        path: "party.templates.frame.label",
+        message: "label must be at most 80 characters",
+      },
+      {
+        path: "party.templates.frame.labels.ar",
+        message: "localized label must be at most 80 characters",
+      },
+    ])
+  );
+});

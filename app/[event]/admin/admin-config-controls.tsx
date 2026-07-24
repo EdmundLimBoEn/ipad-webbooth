@@ -215,8 +215,9 @@ export function CaptureExperienceControls({
             <label key={locale}>
               <input
                 type="checkbox"
-                checked={enabledLocales.has(locale)}
-                disabled={disabled}
+                checked={locale === "en" || enabledLocales.has(locale)}
+                disabled={disabled || locale === "en"}
+                required={locale === "en"}
                 onChange={() => onToggleLocale(locale)}
               />
               <span lang={locale} dir={locale === "ar" ? "rtl" : "ltr"}>

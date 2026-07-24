@@ -255,6 +255,7 @@ describe("config handlers", () => {
   test("new saves reject unsupported or inconsistent locale and capture settings", async () => {
     const invalidExperiences = [
       { locales: [] },
+      { locales: ["ar"], defaultLocale: "ar" },
       { locales: ["en", "fr"], defaultLocale: "en" },
       { locales: ["en"], defaultLocale: "ar" },
       { locales: ["en"], defaultLocale: "en", capture: { reviewEnabled: "yes", autoAcceptSeconds: 5, countdownAudioDefault: false } },
