@@ -22,6 +22,8 @@ const HEALTH_STATE_KEY = "health/statuspage.json";
 const LEGACY_HEALTH_STATE_KEY = "_health/state.json";
 const PAGE_SIZE = 1000;
 const BOOTH_KEY_MUTATION_FINGERPRINT = /^[0-9a-f]{64}$/;
+const PHOTO_FEED_VERSION = 1 as const;
+const PHOTO_FEED_APPEND_ATTEMPTS = 16;
 
 type StoredEventConfig = EventConfig & { version: typeof EVENT_CONFIG_VERSION };
 type ConfigSaveInput = {
@@ -229,11 +231,14 @@ export const photoReceiptKey = (event: string, key: string) =>
   `events/${event}/photo-metadata/${key.slice(eventPhotoPrefix(event).length)}.json`;
 export const photoIndexKey = (event: string, key: string, sortTime: number) =>
   `events/${event}/photo-index/v1/${String(9_999_999_999_999 - sortTime).padStart(13, "0")}-${base64url(key)}.json`;
-
-function photoTimestamp(key: string): number {
-  const filename = key.slice(key.lastIndexOf("/") + 1);
-  return Number(filename.split("-")[0]) || 0;
-}
+export const photoFeedHeadKey = (event: string) => `events/${event}/photo-feed/v1/head.json`;
+const photoFeedEntryKey = (event: string, key: string) =>
+  `events/${event}/photo-feed/v1/entries/${base64url(key)}.json`;
+const photoFeedCommitKey = (event: string, key: string) =>
+  `events/${event}/photo-feed/v1/commits/${base64url(key)}.json`;
+const photoFeedNodePrefix = (event: string) => `events/${event}/photo-feed/v1/nodes/`;
+const photoFeedNodeKey = (event: string) =>
+  `${photoFeedNodePrefix(event)}${crypto.randomUUID()}.json`;
 
 function isPhotoKey(event: string, key: string): boolean {
   return key.startsWith(eventPhotoPrefix(event)) && /\.(?:jpe?g|png|gif|webp|hei[cf]|avif)$/i.test(key);
@@ -297,6 +302,18 @@ export class PhotoIndexWriteError extends Error {
   ) {
     super("photo index write failed", options);
     this.name = "PhotoIndexWriteError";
+  }
+}
+
+export class InvalidPhotoCursorError extends Error {
+  constructor() {
+    super("photo feed cursor is invalid for this Event");
+  }
+}
+
+class InvalidStoredPhotoFeedError extends Error {
+  constructor(readonly event: string) {
+    super(`photo feed state for ${event} is corrupt or uses an unsupported version`);
   }
 }
 
@@ -497,17 +514,30 @@ export class EventStore {
   }
 
   async putPhoto(event: string, body: ArrayBuffer, options: PutPhotoOptions = {}): Promise<PutPhotoResult> {
-    // Capture server time once: the immutable records for this attempt then
-    // agree even when a retry completes a previously interrupted upload.
-    const uploadedAt = this.now();
+    // Capture server time once for a newly-created public object. A duplicate
+    // must read the public object's immutable uploaded timestamp instead of
+    // turning a delayed index repair into a false new arrival.
+    const attemptedAt = this.now();
     const upload = options.upload;
-    const key = upload ? stablePhotoKey(event, upload) : this.photoKey(event, uploadedAt.getTime());
+    const key = upload ? stablePhotoKey(event, upload) : this.photoKey(event, attemptedAt.getTime());
     const url = this.publicUrl(key);
     let duplicate = false;
+    let uploadedAt = attemptedAt;
 
     if (upload) {
       const created = await this.photos.compareAndSwap(key, null, body, jpegWriteOptions());
       duplicate = !created;
+      try {
+        const original = await this.photos.get(key);
+        // R2 is authoritative for immutable upload time after either a fresh
+        // conditional create or a lost-ack retry. Never invent retry-time
+        // metadata when the public object cannot be observed.
+        if (!original) throw new PhotoIndexWriteError({ key, url, duplicate }, { cause: new Error("stable photo missing") });
+        uploadedAt = original.uploaded;
+      } catch (cause) {
+        if (cause instanceof PhotoIndexWriteError) throw cause;
+        throw new PhotoIndexWriteError({ key, url, duplicate }, { cause });
+      }
     } else {
       // Legacy clients cannot retry the same public key. Keep their original
       // acknowledgment behavior even when private derived writes are down.
@@ -521,6 +551,7 @@ export class EventStore {
     if (upload) {
       try {
         await this.state.compareAndSwap(indexKey, null, JSON.stringify(metadata), jsonWriteOptions());
+        await this.ensurePhotoFeedRecord(event, key, metadata);
       } catch (cause) {
         throw new PhotoIndexWriteError(photo, { cause });
       }
@@ -529,29 +560,279 @@ export class EventStore {
     }
 
     const indexStored = await this.tryWritePhotoIndex(indexKey, metadata);
+    await this.tryWritePhotoFeedRecord(event, key, metadata);
     const receiptStored = await this.tryWritePhotoReceipt(event, key, metadata);
     return { ...photo, indexStored, receiptStored };
   }
 
   async listPhotos(event: string, after: string | null = null): Promise<PhotoFeed> {
-    const prefix = eventPhotoPrefix(event);
-    const startAfter = after && after.startsWith(prefix) ? after : undefined;
+    if (after === null) return this.initialPhotoFeed(event);
+    return this.incrementalPhotoFeed(event, parsePhotoFeedCursor(event, after));
+  }
+
+  /**
+   * The initial scan remains the compatibility path for photos created before
+   * the private arrival feed existed. Capture a feed waterline first, then
+   * omit any image committed after it so the immediate delta returns it once.
+   */
+  private async initialPhotoFeed(event: string): Promise<PhotoFeed> {
+    const waterline = await this.readPhotoFeedHead(event);
+    const objects = await this.listEventPhotoObjects(event);
+    const current = await this.readPhotoFeedHead(event);
+    const afterWaterline = new Set(
+      (await this.photoFeedNodesAfter(event, current.head.nodeKey, waterline.head.nodeKey))
+        .map((node) => node.entryKey)
+    );
+    const visible = objects
+      .filter((object) => !afterWaterline.has(photoFeedEntryKey(event, object.key)))
+      .sort(newestPublicObjectFirst);
+
+    return {
+      photos: visible.map((object) => this.toPhoto(object)),
+      cursor: encodePhotoFeedCursor(event, waterline.head.nodeKey),
+      unchanged: visible.length === 0,
+      truncated: false,
+    };
+  }
+
+  /** Deltas traverse only private arrival nodes and the exact public images. */
+  private async incrementalPhotoFeed(event: string, cursor: PhotoFeedCursor): Promise<PhotoFeed> {
+    const current = await this.readPhotoFeedHead(event);
+    const nodes = await this.photoFeedNodesAfter(event, current.head.nodeKey, cursor.nodeKey);
+    const photos: Photo[] = [];
+    const seen = new Set<string>();
+    for (const node of nodes) {
+      const entry = await this.readPhotoFeedEntry(event, node.entryKey);
+      if (seen.has(entry.key)) continue;
+      seen.add(entry.key);
+      const object = await this.photos.get(entry.key);
+      // Exact-key deletion or a stale record must never resurrect an image.
+      if (!object || !isPhotoKey(event, object.key)) continue;
+      photos.push(this.toPhoto(object));
+    }
+    return {
+      photos,
+      cursor: encodePhotoFeedCursor(event, current.head.nodeKey),
+      unchanged: photos.length === 0,
+      truncated: false,
+    };
+  }
+
+  private toPhoto(object: StoredObject): Photo {
+    return { key: object.key, url: this.publicUrl(object.key), uploadedAt: object.uploaded };
+  }
+
+  private async listEventPhotoObjects(event: string): Promise<StoredObject[]> {
     const objects: StoredObject[] = [];
     let cursor: string | undefined;
     do {
-      const page = await this.photos.list({ prefix, cursor, ...(!cursor && startAfter ? { startAfter } : {}), limit: PAGE_SIZE });
+      const page = await this.photos.list({ prefix: eventPhotoPrefix(event), cursor, limit: PAGE_SIZE });
       objects.push(...page.objects.filter((object) => isPhotoKey(event, object.key)));
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
+    return objects;
+  }
 
-    objects.sort((a, b) => photoTimestamp(b.key) - photoTimestamp(a.key) || b.key.localeCompare(a.key));
-    const newest = objects[0]?.key ?? after;
-    return {
-      photos: objects.map((object) => ({ key: object.key, url: this.publicUrl(object.key), uploadedAt: object.uploaded })),
-      cursor: newest ?? null,
-      unchanged: objects.length === 0,
-      truncated: false,
-    };
+  /**
+   * Creates one immutable entry per public key, then atomically appends an
+   * immutable linked node by CASing the Event head. The normal lost-ack path
+   * reads the per-photo commit marker in O(1); a chain walk happens only when
+   * recovering a successful head CAS whose marker write was interrupted.
+   */
+  private async ensurePhotoFeedRecord(
+    event: string,
+    key: string,
+    metadata: PrivatePhotoMetadata
+  ): Promise<void> {
+    const entryKey = photoFeedEntryKey(event, key);
+    const entry: PrivatePhotoFeedEntry = { version: PHOTO_FEED_VERSION, key, metadata };
+    const entryCreated = await this.state.compareAndSwap(
+      entryKey,
+      null,
+      JSON.stringify(entry),
+      jsonWriteOptions()
+    );
+    if (!entryCreated) {
+      const existing = await this.readPhotoFeedEntry(event, entryKey);
+      if (existing.key !== key || !samePrivatePhotoMetadata(existing.metadata, metadata)) {
+        throw new InvalidStoredPhotoFeedError(event);
+      }
+      const committed = await this.readPhotoFeedCommit(event, key);
+      if (committed) return;
+      // A prior request might have advanced the head and then lost its marker
+      // write. Recover that exact node before ever attempting a new append.
+      const head = await this.readPhotoFeedHead(event);
+      const recovered = await this.findPhotoFeedEntryNode(event, head.head.nodeKey, entryKey);
+      if (recovered) {
+        await this.writePhotoFeedCommit(event, key, recovered);
+        return;
+      }
+    }
+
+    for (let attempt = 0; attempt < PHOTO_FEED_APPEND_ATTEMPTS; attempt += 1) {
+      const committed = await this.readPhotoFeedCommit(event, key);
+      if (committed) return;
+      const head = await this.readPhotoFeedHead(event);
+      const nodeKey = photoFeedNodeKey(event);
+      const node: PrivatePhotoFeedNode = {
+        version: PHOTO_FEED_VERSION,
+        sequence: head.head.sequence + 1,
+        entryKey,
+        previousNodeKey: head.head.nodeKey,
+      };
+      const nodeCreated = await this.state.compareAndSwap(
+        nodeKey,
+        null,
+        JSON.stringify(node),
+        jsonWriteOptions()
+      );
+      if (!nodeCreated) continue;
+      const advanced = await this.state.compareAndSwap(
+        photoFeedHeadKey(event),
+        head.etag,
+        JSON.stringify({ version: PHOTO_FEED_VERSION, sequence: node.sequence, nodeKey }),
+        jsonWriteOptions()
+      );
+      if (advanced) {
+        await this.writePhotoFeedCommit(event, key, nodeKey);
+        return;
+      }
+
+      // Another duplicate request may have won the head CAS. Its normal path
+      // records a marker; if that write was interrupted, recover by chain.
+      const racedCommit = await this.readPhotoFeedCommit(event, key);
+      if (racedCommit) return;
+      const current = await this.readPhotoFeedHead(event);
+      const recovered = await this.findPhotoFeedEntryNode(event, current.head.nodeKey, entryKey);
+      if (recovered) {
+        await this.writePhotoFeedCommit(event, key, recovered);
+        return;
+      }
+    }
+    throw new Error("photo feed append contention exceeded retry budget");
+  }
+
+  private async tryWritePhotoFeedRecord(
+    event: string,
+    key: string,
+    metadata: PrivatePhotoMetadata
+  ): Promise<boolean> {
+    try {
+      await this.ensurePhotoFeedRecord(event, key, metadata);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async readPhotoFeedHead(event: string): Promise<{ head: PrivatePhotoFeedHead; etag: string | null }> {
+    const object = await this.state.get(photoFeedHeadKey(event));
+    if (!object) {
+      return { head: { version: PHOTO_FEED_VERSION, sequence: 0, nodeKey: null }, etag: null };
+    }
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredPhotoFeedError(event);
+    }
+    const head = parsePhotoFeedHead(event, value);
+    if (!head) throw new InvalidStoredPhotoFeedError(event);
+    return { head, etag: object.etag };
+  }
+
+  private async readPhotoFeedEntry(event: string, entryKey: string): Promise<PrivatePhotoFeedEntry> {
+    if (!entryKey.startsWith(`events/${event}/photo-feed/v1/entries/`)) {
+      throw new InvalidStoredPhotoFeedError(event);
+    }
+    const object = await this.state.get(entryKey);
+    if (!object) throw new InvalidStoredPhotoFeedError(event);
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredPhotoFeedError(event);
+    }
+    const entry = parsePhotoFeedEntry(event, value);
+    if (!entry) throw new InvalidStoredPhotoFeedError(event);
+    return entry;
+  }
+
+  private async readPhotoFeedNode(event: string, nodeKey: string): Promise<PrivatePhotoFeedNode> {
+    if (!nodeKey.startsWith(photoFeedNodePrefix(event))) throw new InvalidStoredPhotoFeedError(event);
+    const object = await this.state.get(nodeKey);
+    if (!object) throw new InvalidStoredPhotoFeedError(event);
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredPhotoFeedError(event);
+    }
+    const node = parsePhotoFeedNode(event, value);
+    if (!node) throw new InvalidStoredPhotoFeedError(event);
+    return node;
+  }
+
+  private async readPhotoFeedCommit(event: string, key: string): Promise<string | null> {
+    const object = await this.state.get(photoFeedCommitKey(event, key));
+    if (!object) return null;
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredPhotoFeedError(event);
+    }
+    const marker = parsePhotoFeedCommit(event, value);
+    if (!marker) throw new InvalidStoredPhotoFeedError(event);
+    return marker.nodeKey;
+  }
+
+  private async writePhotoFeedCommit(event: string, key: string, nodeKey: string): Promise<void> {
+    const created = await this.state.compareAndSwap(
+      photoFeedCommitKey(event, key),
+      null,
+      JSON.stringify({ version: PHOTO_FEED_VERSION, nodeKey }),
+      jsonWriteOptions()
+    );
+    if (created) return;
+    const existing = await this.readPhotoFeedCommit(event, key);
+    if (existing !== nodeKey) throw new InvalidStoredPhotoFeedError(event);
+  }
+
+  private async photoFeedNodesAfter(
+    event: string,
+    headNodeKey: string | null,
+    afterNodeKey: string | null
+  ): Promise<PrivatePhotoFeedNode[]> {
+    const nodes: PrivatePhotoFeedNode[] = [];
+    const visited = new Set<string>();
+    let nodeKey = headNodeKey;
+    while (nodeKey !== null && nodeKey !== afterNodeKey) {
+      if (visited.has(nodeKey)) throw new InvalidStoredPhotoFeedError(event);
+      visited.add(nodeKey);
+      const node = await this.readPhotoFeedNode(event, nodeKey);
+      nodes.push(node);
+      nodeKey = node.previousNodeKey;
+    }
+    if (afterNodeKey !== null && nodeKey !== afterNodeKey) throw new InvalidPhotoCursorError();
+    return nodes;
+  }
+
+  private async findPhotoFeedEntryNode(
+    event: string,
+    headNodeKey: string | null,
+    entryKey: string
+  ): Promise<string | null> {
+    const visited = new Set<string>();
+    let nodeKey = headNodeKey;
+    while (nodeKey !== null) {
+      if (visited.has(nodeKey)) throw new InvalidStoredPhotoFeedError(event);
+      visited.add(nodeKey);
+      const node = await this.readPhotoFeedNode(event, nodeKey);
+      if (node.entryKey === entryKey) return nodeKey;
+      nodeKey = node.previousNodeKey;
+    }
+    return null;
   }
 
   async *iteratePhotoObjects(event: string): AsyncGenerator<StoredObject> {
@@ -925,6 +1206,36 @@ function jpegWriteOptions(): R2PutOptions {
   return { httpMetadata: { contentType: "image/jpeg" } };
 }
 
+type PrivatePhotoFeedHead = {
+  version: typeof PHOTO_FEED_VERSION;
+  sequence: number;
+  nodeKey: string | null;
+};
+
+type PrivatePhotoFeedEntry = {
+  version: typeof PHOTO_FEED_VERSION;
+  key: string;
+  metadata: PrivatePhotoMetadata;
+};
+
+type PrivatePhotoFeedNode = {
+  version: typeof PHOTO_FEED_VERSION;
+  sequence: number;
+  entryKey: string;
+  previousNodeKey: string | null;
+};
+
+type PrivatePhotoFeedCommit = {
+  version: typeof PHOTO_FEED_VERSION;
+  nodeKey: string;
+};
+
+type PhotoFeedCursor = {
+  version: typeof PHOTO_FEED_VERSION;
+  event: string;
+  nodeKey: string | null;
+};
+
 type PrivatePhotoMetadata = {
   version: 1;
   key: string;
@@ -947,11 +1258,139 @@ function photoPrivateMetadata(key: string, uploadedAt: Date, upload?: StableUplo
   };
 }
 
+function parsePhotoFeedHead(event: string, value: unknown): PrivatePhotoFeedHead | null {
+  if (!isRecord(value)) return null;
+  if (
+    value.version !== PHOTO_FEED_VERSION
+    || typeof value.sequence !== "number"
+    || !Number.isSafeInteger(value.sequence)
+    || value.sequence < 0
+    || (value.nodeKey !== null && (typeof value.nodeKey !== "string" || !value.nodeKey.startsWith(photoFeedNodePrefix(event))))
+  ) {
+    return null;
+  }
+  return { version: PHOTO_FEED_VERSION, sequence: value.sequence, nodeKey: value.nodeKey as string | null };
+}
+
+function parsePhotoFeedEntry(event: string, value: unknown): PrivatePhotoFeedEntry | null {
+  if (!isRecord(value) || value.version !== PHOTO_FEED_VERSION || typeof value.key !== "string" || !isPhotoKey(event, value.key)) return null;
+  const metadata = parsePrivatePhotoMetadata(event, value.metadata);
+  if (!metadata || metadata.key !== value.key) return null;
+  return { version: PHOTO_FEED_VERSION, key: value.key, metadata };
+}
+
+function parsePhotoFeedNode(event: string, value: unknown): PrivatePhotoFeedNode | null {
+  if (!isRecord(value)) return null;
+  if (
+    value.version !== PHOTO_FEED_VERSION
+    || typeof value.sequence !== "number"
+    || !Number.isSafeInteger(value.sequence)
+    || value.sequence < 1
+    || typeof value.entryKey !== "string"
+    || !value.entryKey.startsWith(`events/${event}/photo-feed/v1/entries/`)
+    || (value.previousNodeKey !== null && (typeof value.previousNodeKey !== "string" || !value.previousNodeKey.startsWith(photoFeedNodePrefix(event))))
+  ) {
+    return null;
+  }
+  return {
+    version: PHOTO_FEED_VERSION,
+    sequence: value.sequence,
+    entryKey: value.entryKey,
+    previousNodeKey: value.previousNodeKey as string | null,
+  };
+}
+
+function parsePhotoFeedCommit(event: string, value: unknown): PrivatePhotoFeedCommit | null {
+  if (
+    !isRecord(value)
+    || value.version !== PHOTO_FEED_VERSION
+    || typeof value.nodeKey !== "string"
+    || !value.nodeKey.startsWith(photoFeedNodePrefix(event))
+  ) {
+    return null;
+  }
+  return { version: PHOTO_FEED_VERSION, nodeKey: value.nodeKey };
+}
+
+function parsePrivatePhotoMetadata(event: string, value: unknown): PrivatePhotoMetadata | null {
+  if (!isRecord(value)) return null;
+  if (
+    value.version !== 1
+    || typeof value.key !== "string"
+    || !isPhotoKey(event, value.key)
+    || typeof value.uploadedAt !== "string"
+    || Number.isNaN(Date.parse(value.uploadedAt))
+    || typeof value.capturedAt !== "number"
+    || !Number.isSafeInteger(value.capturedAt)
+    || (value.source !== undefined && value.source !== "framed" && value.source !== "camera-fallback")
+    || (value.frameKey !== undefined && !isBoundedToken(value.frameKey))
+    || (value.configRevisionId !== undefined && !isBoundedToken(value.configRevisionId))
+  ) {
+    return null;
+  }
+  return {
+    version: 1,
+    key: value.key,
+    uploadedAt: value.uploadedAt,
+    capturedAt: value.capturedAt,
+    ...(value.source ? { source: value.source } : {}),
+    ...(typeof value.frameKey === "string" ? { frameKey: value.frameKey } : {}),
+    ...(typeof value.configRevisionId === "string" ? { configRevisionId: value.configRevisionId } : {}),
+  };
+}
+
+function samePrivatePhotoMetadata(left: PrivatePhotoMetadata, right: PrivatePhotoMetadata): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function newestPublicObjectFirst(left: StoredObject, right: StoredObject): number {
+  return right.uploaded.getTime() - left.uploaded.getTime() || right.key.localeCompare(left.key);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isBoundedToken(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
+}
+
+function encodePhotoFeedCursor(event: string, nodeKey: string | null): string {
+  return `pf1.${base64url(JSON.stringify({ version: PHOTO_FEED_VERSION, event, nodeKey }))}`;
+}
+
+function parsePhotoFeedCursor(event: string, value: string): PhotoFeedCursor {
+  if (!value.startsWith("pf1.")) throw new InvalidPhotoCursorError();
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(base64urlDecode(value.slice(4)));
+  } catch {
+    throw new InvalidPhotoCursorError();
+  }
+  if (!isRecord(decoded) || decoded.version !== PHOTO_FEED_VERSION || decoded.event !== event) {
+    throw new InvalidPhotoCursorError();
+  }
+  if (decoded.nodeKey !== null && (typeof decoded.nodeKey !== "string" || !decoded.nodeKey.startsWith(photoFeedNodePrefix(event)))) {
+    throw new InvalidPhotoCursorError();
+  }
+  return {
+    version: PHOTO_FEED_VERSION,
+    event,
+    nodeKey: decoded.nodeKey as string | null,
+  };
+}
+
 function base64url(value: string): string {
   const bytes = new TextEncoder().encode(value);
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function base64urlDecode(value: string): string {
+  if (!/^[A-Za-z0-9_-]*$/.test(value)) throw new Error("invalid base64url");
+  const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4);
+  return atob(padded);
 }
 
 function randomSuffix(): string {

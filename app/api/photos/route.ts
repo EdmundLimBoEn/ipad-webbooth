@@ -2,24 +2,14 @@ import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { NextRequest, NextResponse } from "next/server";
 import { canonicalEvent, EventStore, InvalidEventSlugError } from "@/app/event-store";
 import { adminOk } from "@/app/upload-auth";
+import { getPhotos } from "./handlers";
 
 // no caching by Next — the gallery polls this for fresh photos
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
-  let event: string;
-  try {
-    event = canonicalEvent(req.nextUrl.searchParams.get("event"));
-  } catch (error) {
-    if (error instanceof InvalidEventSlugError) return NextResponse.json({ error: error.message }, { status: 400 });
-    throw error;
-  }
   const { env } = getCloudflareContext();
-  const after = req.nextUrl.searchParams.get("after") ?? req.nextUrl.searchParams.get("cursor");
-  const feed = await EventStore.fromEnv(env).listPhotos(event, after);
-  // `photos` remains the original full-response field. New clients retain
-  // `cursor` and pass it as `after` for a small startAfter delta.
-  return NextResponse.json(feed);
+  return getPhotos(req, { store: EventStore.fromEnv(env) });
 }
 
 export async function DELETE(req: NextRequest) {

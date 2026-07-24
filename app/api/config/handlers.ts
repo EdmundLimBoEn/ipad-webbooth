@@ -11,6 +11,7 @@ import {
   isRevisionId,
   projectPublicConfig,
   type ConfigRevision,
+  type EventConfig,
 } from "@/app/event-config";
 import { TEMPLATES } from "@/app/templates";
 import { adminOk } from "@/app/upload-auth";
@@ -147,6 +148,48 @@ function parseRestoreBody(value: unknown): RestoreBody | null {
   };
 }
 
+/**
+ * Frames and a possible Booth-key rotation are the deliberately small Admin
+ * save surface. Preserve every other known experience field explicitly rather
+ * than spreading an HTTP body into a stored config.
+ */
+function configForSave(
+  current: EventConfig | null,
+  body: SaveBody,
+  boothKeyHash: string | undefined
+): EventConfig {
+  return {
+    frames: [...body.frames],
+    ...(current?.locales ? { locales: [...current.locales] } : {}),
+    ...(current?.defaultLocale ? { defaultLocale: current.defaultLocale } : {}),
+    ...(current?.timeZone ? { timeZone: current.timeZone } : {}),
+    ...(current?.capture
+      ? {
+        capture: {
+          ...(current.capture.reviewEnabled !== undefined
+            ? { reviewEnabled: current.capture.reviewEnabled }
+            : {}),
+          ...(current.capture.autoAcceptSeconds !== undefined
+            ? { autoAcceptSeconds: current.capture.autoAcceptSeconds }
+            : {}),
+          ...(current.capture.countdownAudioDefault !== undefined
+            ? { countdownAudioDefault: current.capture.countdownAudioDefault }
+            : {}),
+        },
+      }
+      : {}),
+    ...(current?.gallery
+      ? {
+        gallery: {
+          ...(current.gallery.title !== undefined ? { title: current.gallery.title } : {}),
+          ...(current.gallery.accentColor !== undefined ? { accentColor: current.gallery.accentColor } : {}),
+        },
+      }
+      : {}),
+    ...(boothKeyHash === undefined ? {} : { boothKeyHash }),
+  };
+}
+
 function safeRevision(revision: ConfigRevision): ConfigRevision {
   const { hasBoothKey: _hasBoothKey, ...config } = projectPublicConfig(revision.config);
   return {
@@ -197,11 +240,9 @@ export async function putConfig(
     : await boothKeyMutationFingerprint(body.boothKey, deps.adminKey!);
 
   try {
+    const current = await deps.store.readConfig(event);
     const result = await deps.store.saveConfigRevision(event, {
-      config: {
-        frames: body.frames,
-        ...(boothKeyHash === undefined ? {} : { boothKeyHash }),
-      },
+      config: configForSave(current, body, boothKeyHash),
       mutationId: body.mutationId,
       baseRevisionId: body.baseRevisionId,
       ...(fingerprint === undefined

@@ -155,6 +155,137 @@ describe("config handlers", () => {
     expect(JSON.stringify(json)).not.toContain(BOOTH_KEY);
   });
 
+  test("a normal Frames save preserves the allowlisted experience and existing Booth credential through its revision", async () => {
+    const d = deps();
+    await d.deps.store.writeConfig("launch", {
+      frames: ["birthday"],
+      boothKeyHash: "existing-private-hash",
+      locales: ["en", "zh-SG"],
+      defaultLocale: "en",
+      timeZone: "Asia/Singapore",
+      capture: { reviewEnabled: true, autoAcceptSeconds: 5, countdownAudioDefault: false },
+      gallery: { title: "Launch Night", accentColor: "#ff3366" },
+    });
+
+    const response = await putConfig(
+      adminRequest("/api/config?event=launch", "PUT", saveBody()),
+      d.deps
+    );
+    const config = await d.deps.store.readConfig("launch");
+    const history = await d.deps.store.readConfigHistory("launch");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      frames: ["square"],
+      hasBoothKey: true,
+      locales: ["en", "zh-SG"],
+      defaultLocale: "en",
+      timeZone: "Asia/Singapore",
+      capture: { reviewEnabled: true, autoAcceptSeconds: 5, countdownAudioDefault: false },
+      gallery: { title: "Launch Night", accentColor: "#ff3366" },
+    });
+    expect(config).toMatchObject({
+      frames: ["square"],
+      boothKeyHash: "existing-private-hash",
+      locales: ["en", "zh-SG"],
+      defaultLocale: "en",
+      timeZone: "Asia/Singapore",
+      capture: { reviewEnabled: true, autoAcceptSeconds: 5, countdownAudioDefault: false },
+      gallery: { title: "Launch Night", accentColor: "#ff3366" },
+    });
+    expect(history.revisions[0]).toMatchObject({
+      id: FIRST_ID,
+      config: {
+        frames: ["square"],
+        locales: ["en", "zh-SG"],
+        defaultLocale: "en",
+        timeZone: "Asia/Singapore",
+        capture: { reviewEnabled: true, autoAcceptSeconds: 5, countdownAudioDefault: false },
+        gallery: { title: "Launch Night", accentColor: "#ff3366" },
+      },
+    });
+    expect(JSON.stringify(history.revisions)).not.toContain("existing-private-hash");
+  });
+
+  test("a stale normal Frames save conflicts without discarding preserved experience fields", async () => {
+    const d = deps();
+    await d.deps.store.writeConfig("launch", {
+      frames: ["birthday"],
+      boothKeyHash: "existing-private-hash",
+      locales: ["en"],
+      defaultLocale: "en",
+      timeZone: "Asia/Singapore",
+      capture: { reviewEnabled: true },
+      gallery: { title: "Launch Night" },
+    });
+    expect((await putConfig(
+      adminRequest("/api/config?event=launch", "PUT", saveBody()),
+      d.deps
+    )).status).toBe(200);
+
+    const conflict = await putConfig(
+      adminRequest("/api/config?event=launch", "PUT", saveBody({
+        frames: ["birthday"],
+        mutationId: SECOND_ID,
+        baseRevisionId: null,
+      })),
+      d.deps
+    );
+
+    expect(conflict.status).toBe(409);
+    expect(await d.deps.store.readConfig("launch")).toMatchObject({
+      frames: ["square"],
+      boothKeyHash: "existing-private-hash",
+      locales: ["en"],
+      defaultLocale: "en",
+      timeZone: "Asia/Singapore",
+      capture: { reviewEnabled: true },
+      gallery: { title: "Launch Night" },
+    });
+  });
+
+  test("a Booth-key rotation preserves the allowlisted experience without putting its hash in history", async () => {
+    const d = deps({ hashBoothKey: async () => "new-private-hash" });
+    await d.deps.store.writeConfig("launch", {
+      frames: ["birthday"],
+      boothKeyHash: "old-private-hash",
+      locales: ["en", "zh-SG"],
+      defaultLocale: "en",
+      timeZone: "Asia/Singapore",
+      capture: { reviewEnabled: true, autoAcceptSeconds: 5 },
+      gallery: { title: "Launch Night", accentColor: "#ff3366" },
+    });
+
+    const response = await putConfig(
+      adminRequest("/api/config?event=launch", "PUT", saveBody({ boothKey: BOOTH_KEY })),
+      d.deps
+    );
+    const config = await d.deps.store.readConfig("launch");
+    const history = await d.deps.store.readConfigHistory("launch");
+
+    expect(response.status).toBe(200);
+    expect(config).toMatchObject({
+      frames: ["square"],
+      boothKeyHash: "new-private-hash",
+      locales: ["en", "zh-SG"],
+      defaultLocale: "en",
+      timeZone: "Asia/Singapore",
+      capture: { reviewEnabled: true, autoAcceptSeconds: 5 },
+      gallery: { title: "Launch Night", accentColor: "#ff3366" },
+    });
+    expect(history.revisions[0]).toMatchObject({
+      config: {
+        frames: ["square"],
+        locales: ["en", "zh-SG"],
+        defaultLocale: "en",
+        timeZone: "Asia/Singapore",
+        capture: { reviewEnabled: true, autoAcceptSeconds: 5 },
+        gallery: { title: "Launch Night", accentColor: "#ff3366" },
+      },
+    });
+    expect(JSON.stringify(history.revisions)).not.toContain("new-private-hash");
+  });
+
   test("save stores an opaque fingerprint privately with the independently hashed key", async () => {
     const d = deps({ hashBoothKey: async () => "salted-pbkdf2-hash" });
     await putConfig(
