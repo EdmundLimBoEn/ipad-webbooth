@@ -120,6 +120,7 @@ export default function Admin() {
   const [presetsLoading, setPresetsLoading] = useState(false);
   const [presetsError, setPresetsError] = useState("");
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+  const [selectedPresetUpdatedAt, setSelectedPresetUpdatedAt] = useState<string | null>(null);
   const [presetIdDraft, setPresetIdDraft] = useState("");
   const [presetLabelDraft, setPresetLabelDraft] = useState("");
   const [presetSaving, setPresetSaving] = useState(false);
@@ -859,6 +860,7 @@ export default function Admin() {
     setPresetActionError("");
     setPresetNotice("");
     const selected = presets.find((preset) => preset.id === presetId);
+    setSelectedPresetUpdatedAt(selected?.updatedAt ?? null);
     setPresetIdDraft(selected?.id ?? "");
     setPresetLabelDraft(selected?.label ?? "");
   };
@@ -871,7 +873,6 @@ export default function Admin() {
       setPresetActionError(message(defaultLocale, "presetGenericError"));
       return;
     }
-    const selected = presets.find((preset) => preset.id === selectedPresetId);
     configMutationBusy.current = true;
     setPresetSaving(true);
     setPresetActionError("");
@@ -888,7 +889,10 @@ export default function Admin() {
           },
           body: JSON.stringify(buildPresetSaveBody({
             label,
-            expectedUpdatedAt: selected?.updatedAt ?? null,
+            // Keep the compare-and-set token paired with the draft the
+            // operator actually opened. Background reloads must not silently
+            // advance it past another operator's edit.
+            expectedUpdatedAt: selectedPresetUpdatedAt,
             experience: currentExperience,
           })),
         },
@@ -901,6 +905,7 @@ export default function Admin() {
         const latest = await loadPresets();
         const refreshed = latest?.find((preset) => preset.id === presetId);
         setSelectedPresetId(refreshed?.id ?? null);
+        setSelectedPresetUpdatedAt(refreshed?.updatedAt ?? null);
         setPresetIdDraft(refreshed?.id ?? "");
         setPresetLabelDraft(refreshed?.label ?? "");
         setPresetActionError(message(defaultLocale, "presetConflict"));
@@ -911,15 +916,12 @@ export default function Admin() {
       if (!saved) throw new Error("Preset response had an unexpected shape");
       setPresets((current) => mergePresetPage(current, [saved]));
       setSelectedPresetId(saved.id);
+      setSelectedPresetUpdatedAt(saved.updatedAt);
       setPresetIdDraft(saved.id);
       setPresetLabelDraft(saved.label);
       setPresetNotice(message(defaultLocale, "presetSaved", { preset: saved.label }));
-    } catch (cause) {
-      setPresetActionError(
-        cause instanceof Error
-          ? cause.message
-          : message(defaultLocale, "presetGenericError"),
-      );
+    } catch {
+      setPresetActionError(message(defaultLocale, "presetGenericError"));
     } finally {
       configMutationBusy.current = false;
       setPresetSaving(false);
@@ -1005,12 +1007,8 @@ export default function Admin() {
       setPresetNotice(message(defaultLocale, "presetApplied", {
         preset: preset.label,
       }));
-    } catch (cause) {
-      setPresetActionError(
-        cause instanceof Error
-          ? cause.message
-          : message(defaultLocale, "presetGenericError"),
-      );
+    } catch {
+      setPresetActionError(message(defaultLocale, "presetGenericError"));
     } finally {
       configMutationBusy.current = false;
       setApplyingPresetId(null);
