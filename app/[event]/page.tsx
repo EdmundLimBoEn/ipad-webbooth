@@ -315,6 +315,10 @@ export default function Booth() {
         }
       },
       onCameraStart: () => {
+        // Stored credentials can complete preflight without a fresh tap.
+        // Attempt wake anyway; gesture-restricted browsers report the visible
+        // Auto-Lock fallback instead of silently leaving the Booth unprotected.
+        void requestWake();
         const reporter = heartbeatReporterRef.current;
         if (reporter && deviceIdRef.current && sessionStartedAtRef.current) {
           const upload = uploadStateRef.current;
@@ -353,7 +357,14 @@ export default function Booth() {
         setLastSuccessfulUploadAt(Date.now());
       },
     }),
-    [applyOperationalState, pauseBoundary, startCamera, stopCamera, wakeController]
+    [
+      applyOperationalState,
+      pauseBoundary,
+      requestWake,
+      startCamera,
+      stopCamera,
+      wakeController,
+    ]
   );
 
   useEffect(() => {
@@ -690,7 +701,8 @@ export default function Booth() {
     stopHeartbeat: () => heartbeatReporterRef.current?.stop(),
     stopPoller: () => statePollerRef.current?.stop(),
     stopSession: async () => {
-      await sessionRef.current?.stop();
+      const session = sessionRef.current;
+      if (session) await lifecycle.leaveEvent(session);
     },
     clearCredentials: () => clearBoothCredential(
       event,
@@ -709,7 +721,7 @@ export default function Booth() {
       setAccessFeedback("locked");
       setAccessState("exited");
     },
-  }), [event, pauseBoundary, stopCamera, wakeController]);
+  }), [event, lifecycle, pauseBoundary, stopCamera, wakeController]);
 
   // preview crops to the chosen frame's photo aspect (w/h of its first slot),
   // so guests see exactly what will be captured. Fullscreen until a mode is set.

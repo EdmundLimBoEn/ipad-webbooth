@@ -127,6 +127,13 @@ describe("Booth page safety wiring", () => {
     expect(source).toContain('"x-booth-key": credential.key');
     expect(source).not.toContain("keyRef");
   });
+
+  test("verified Operator exit tears down the lifecycle-owned credential", async () => {
+    const source = await Bun.file(`${import.meta.dir}/page.tsx`).text();
+
+    expect(source).toContain("await lifecycle.leaveEvent(session)");
+    expect(source).not.toContain("await sessionRef.current?.stop()");
+  });
 });
 
 describe("Booth unlock presentation", () => {

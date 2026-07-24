@@ -71,7 +71,7 @@ export class BoothStatePoller {
   private runEpoch = 0;
 
   constructor(private readonly options: BoothStatePollerOptions) {
-    this.fetch = options.fetch ?? fetch;
+    this.fetch = options.fetch ?? ((input, init) => fetch(input, init));
     this.onState = options.onState ?? (() => {});
     this.setTimer = options.setTimer ?? defaultSetTimer;
     this.clearTimer = options.clearTimer ?? defaultClearTimer;
@@ -167,7 +167,7 @@ export class BoothHeartbeatReporter {
   private runEpoch = 0;
 
   constructor(private readonly options: BoothHeartbeatReporterOptions) {
-    this.fetch = options.fetch ?? fetch;
+    this.fetch = options.fetch ?? ((input, init) => fetch(input, init));
     this.onAuthRequired = options.onAuthRequired ?? (() => {});
     this.setTimer = options.setTimer ?? defaultSetTimer;
     this.clearTimer = options.clearTimer ?? defaultClearTimer;
