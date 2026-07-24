@@ -277,6 +277,23 @@ describe("upload route", () => {
     expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(0);
   });
 
+  test("rejects a tracked upload with an evidence-incompatible timestamp before writing public bytes", async () => {
+    const { photos, deps } = memoryDeps();
+    await deps.store.startRehearsal("launch", { rehearsalId: REHEARSAL_ID });
+
+    const response = await handleUpload(request("launch", {
+      headers: stableHeaders({
+        "x-captured-at": "0000000000000",
+        "x-rehearsal-id": REHEARSAL_ID,
+      }),
+    }), deps);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "invalid_captured_at" });
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(0);
+    expect((await deps.store.readRehearsal("launch", REHEARSAL_ID)).evidence).toEqual([]);
+  });
+
   test("retries missing rehearsal evidence without duplicating the public image", async () => {
     const state = new FailPrivateWrites(
       `events/launch/rehearsals/${REHEARSAL_ID}/evidence/`,

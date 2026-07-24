@@ -38,6 +38,17 @@ describe("stable upload headers", () => {
     expect(parseUploadHeaders(headers({ "content-type": "image/jpeg" }))).toEqual({ kind: "legacy" });
   });
 
+  test("preserves the existing untracked stable timestamp contract", () => {
+    expect(parseUploadHeaders(headers({
+      ...identity,
+      "x-captured-at": "0000000000000",
+    }))).toEqual({
+      kind: "stable",
+      captureId: identity["x-capture-id"],
+      capturedAt: 0,
+    });
+  });
+
   test("rejects partial capture identity", () => {
     expect(() => parseUploadHeaders(headers({ "x-capture-id": identity["x-capture-id"] })))
       .toThrow(InvalidUploadHeadersError);

@@ -1,3 +1,5 @@
+import { isRehearsalTimestamp } from "./rehearsal";
+
 export type CaptureSource = "framed" | "camera-fallback";
 
 export type CaptureMetadata = {
@@ -83,6 +85,12 @@ export function parseUploadHeaders(headers: Headers): UploadIntent {
   }
   if (rehearsalId !== null && !UUID_V4.test(rehearsalId)) {
     invalid("invalid_rehearsal_id", "Rehearsal ID must be a lowercase UUID-v4.");
+  }
+  if (rehearsalId !== null && !isRehearsalTimestamp(Number(capturedAt))) {
+    invalid(
+      "invalid_captured_at",
+      "Tracked captured-at must be compatible with rehearsal evidence.",
+    );
   }
 
   return {

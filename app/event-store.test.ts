@@ -16,6 +16,7 @@ import {
   InvalidStoredRehearsalError,
   PresetConflictError,
   RehearsalConflictError,
+  RehearsalEvidenceLimitError,
   RehearsalNotFoundError,
   eventConfigKey,
   eventConfigMutationKey,
@@ -582,6 +583,96 @@ describe("private rehearsal storage", () => {
       ...input,
       errorClass: "timeout",
     })).rejects.toBeInstanceOf(RehearsalConflictError);
+  });
+
+  test("gives one simultaneous exact evidence retry ownership of the append", async () => {
+    const store = new EventStore(
+      new InMemoryObjectStore(),
+      new InMemoryObjectStore(),
+      "https://photos.example",
+      () => new Date("2026-07-24T00:00:00.000Z"),
+    );
+    await store.startRehearsal("launch", { rehearsalId });
+    const input = {
+      version: 1 as const,
+      id: evidenceId,
+      rehearsalId,
+      observedAt: 1_753_315_200_000,
+      kind: "abandoned" as const,
+    };
+
+    const results = await Promise.all([
+      store.appendRehearsalEvidence("launch", rehearsalId, input),
+      store.appendRehearsalEvidence("launch", rehearsalId, input),
+    ]);
+
+    expect(results.map((result) => result.idempotent).sort()).toEqual([false, true]);
+    expect(results[0]!.evidence).toEqual(results[1]!.evidence);
+  });
+
+  test("atomically caps simultaneous distinct evidence appends at 512 records", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(
+      new InMemoryObjectStore(),
+      state,
+      "https://photos.example",
+      () => new Date("2026-07-24T00:00:00.000Z"),
+    );
+    await store.startRehearsal("launch", { rehearsalId });
+    for (let index = 0; index < 511; index += 1) {
+      const id = `018f0000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+      const observedAt = 1_753_315_200_000 + index;
+      state.set(
+        rehearsalEvidenceKey("launch", rehearsalId, observedAt, id),
+        JSON.stringify({
+          version: 1,
+          id,
+          rehearsalId,
+          observedAt,
+          recordedAt: new Date(1_753_315_200_000 + index).toISOString(),
+          kind: "abandoned",
+        }),
+      );
+    }
+    const contenders = [
+      {
+        version: 1 as const,
+        id: "018f0000-0000-4000-8000-000000000601",
+        rehearsalId,
+        observedAt: 1_753_315_201_000,
+        kind: "abandoned" as const,
+      },
+      {
+        version: 1 as const,
+        id: "018f0000-0000-4000-8000-000000000602",
+        rehearsalId,
+        observedAt: 1_753_315_201_001,
+        kind: "abandoned" as const,
+      },
+    ];
+
+    const results = await Promise.allSettled(
+      contenders.map((input) =>
+        store.appendRehearsalEvidence("launch", rehearsalId, input)
+      ),
+    );
+
+    const fulfilled = results.filter(
+      (result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof store.appendRehearsalEvidence>>> =>
+        result.status === "fulfilled",
+    );
+    const rejected = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]!.reason).toBeInstanceOf(RehearsalEvidenceLimitError);
+    expect((await store.readRehearsal("launch", rehearsalId)).evidence).toHaveLength(512);
+
+    const winner = fulfilled[0]!.value.evidence;
+    const retryInput = contenders.find((input) => input.id === winner.id)!;
+    expect(await store.appendRehearsalEvidence("launch", rehearsalId, retryInput))
+      .toEqual({ evidence: winner, idempotent: true });
   });
 
   test("isolates Events and fails explicitly for missing or corrupt private records", async () => {

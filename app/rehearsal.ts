@@ -161,7 +161,7 @@ export function isRehearsalId(value: unknown): value is string {
   return isUuid(value);
 }
 
-function isTimestamp(value: unknown): value is number {
+export function isRehearsalTimestamp(value: unknown): value is number {
   return typeof value === "number"
     && Number.isSafeInteger(value)
     && value >= 1_000_000_000_000
@@ -251,7 +251,7 @@ export function parseRehearsalEvidence(
       )
     )
     || !isUuid(value.rehearsalId)
-    || !isTimestamp(value.observedAt)
+    || !isRehearsalTimestamp(value.observedAt)
     || !isStoredInstant(value.recordedAt)
   ) {
     return null;
@@ -296,7 +296,7 @@ export function parseRehearsalEvidence(
       if (
         !hasExactKeys(value, keys)
         || !isUuid(value.captureId)
-        || !isTimestamp(value.capturedAt)
+        || !isRehearsalTimestamp(value.capturedAt)
         || !isPhotoKey(value.photoKey, event)
         || (
           value.frameKey !== undefined
