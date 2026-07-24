@@ -827,6 +827,7 @@ export class EventStore {
     event: string,
     input: ConfigPresetApplyInput,
   ): Promise<ConfigMutationResult> {
+    const canonical = canonicalEvent(event);
     if (
       !isPresetId(input.presetId)
       || !isRevisionId(input.mutationId)
@@ -836,7 +837,7 @@ export class EventStore {
     }
     const preset = await this.getEventPreset(input.presetId);
     if (!preset) throw new EventPresetNotFoundError(input.presetId);
-    return this.appendConfigRevision(canonicalEvent(event), {
+    return this.appendConfigRevision(canonical, {
       config: preset.config,
       baseRevisionId: input.baseRevisionId,
       mutationId: input.mutationId,

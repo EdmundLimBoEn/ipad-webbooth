@@ -2825,6 +2825,22 @@ describe("EventStore", () => {
         .rejects.toBeInstanceOf(ConfigMutationConflictError);
     });
 
+    test("rejects a non-canonical target Event before reading the global preset", async () => {
+      const state = new PresetAccessStore();
+      const store = new EventStore(
+        new InMemoryObjectStore(),
+        state,
+        "https://photos.example",
+      );
+      await expect(store.applyEventPreset("Launch Event", {
+        presetId: "launch-night",
+        mutationId: "018f0000-0000-4000-8000-000000000205",
+        baseRevisionId: null,
+      })).rejects.toBeInstanceOf(InvalidEventSlugError);
+      expect(state.gets).toBe(0);
+      expect(state.lists).toBe(0);
+    });
+
     test("fails explicitly for corrupt stored presets and never offers deletion", async () => {
       const state = new InMemoryObjectStore({
         [eventPresetIndexKey(
