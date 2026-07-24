@@ -4,8 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import styles from "./booth.module.css";
 import { TEMPLATES, availableTemplates, composite } from "../templates";
-import { createOutboxStore } from "./booth-session/outbox";
+import { createOutboxStore, type OutboxItem } from "./booth-session/outbox";
 import { BoothSession, runCaptureSequence, type UploadState } from "./booth-session/session";
+import { outboxUploadHeaders } from "./booth-session/upload";
 
 type Status = "starting" | "picking" | "ready" | "denied" | "running";
 
@@ -32,11 +33,15 @@ export default function Booth() {
   // per-event frame allowlist from /api/config; null (no config / not loaded
   // yet / fetch failed) degrades to defaults-only, never to all frames
   const [enabled, setEnabled] = useState<string[] | null>(null);
+  const [configRevisionId, setConfigRevisionId] = useState<string | undefined>();
 
   useEffect(() => {
     fetch(`/api/config?event=${encodeURIComponent(event)}`)
       .then((r) => r.json())
-      .then((d) => setEnabled(Array.isArray(d.frames) ? d.frames : null))
+      .then((d) => {
+        setEnabled(Array.isArray(d.frames) ? d.frames : null);
+        setConfigRevisionId(typeof d.currentRevisionId === "string" ? d.currentRevisionId : undefined);
+      })
       .catch(() => {});
   }, [event]);
 
@@ -108,11 +113,15 @@ export default function Booth() {
   }, []);
 
   const uploadOne = useCallback(
-    async (blob: Blob) => {
+    async (item: OutboxItem) => {
       const res = await fetch(`/api/upload?event=${encodeURIComponent(event)}`, {
         method: "POST",
-        headers: { "x-booth-key": keyRef.current, "content-type": "image/jpeg" },
-        body: blob,
+        headers: {
+          "x-booth-key": keyRef.current,
+          "content-type": "image/jpeg",
+          ...outboxUploadHeaders(item),
+        },
+        body: item.blob,
       });
       if (res.status === 401) {
         localStorage.removeItem(storageKey);
@@ -120,7 +129,7 @@ export default function Booth() {
         throw new Error("Wrong booth key — tap Retry to re-enter it");
       }
       if (!res.ok) throw new Error(`Upload failed (${res.status}) — tap Retry`);
-      return res.json() as Promise<{ url: string }>;
+      return res.json() as Promise<{ url: string; key?: string; duplicate?: boolean }>;
     },
     [event, storageKey]
   );
@@ -172,7 +181,14 @@ export default function Booth() {
           });
           return composite(frames, frames.map((f) => ({ w: f.width, h: f.height })), t);
         },
-        controller.signal
+        {
+          signal: controller.signal,
+          metadata: {
+            source: "framed",
+            frameKey: mode,
+            ...(configRevisionId ? { configRevisionId } : {}),
+          },
+        }
       );
       // Durable handoff is complete. Return to the picker before uploading so
       // the next guest is never trapped on the previous guest's frame.
@@ -221,6 +237,11 @@ export default function Booth() {
             // Undecodable file: preserve it; the server signature check decides.
           }
           return blob;
+        }, {
+          metadata: {
+            source: "camera-fallback",
+            ...(configRevisionId ? { configRevisionId } : {}),
+          },
         });
         setError(null);
         void session.process();
@@ -228,7 +249,7 @@ export default function Booth() {
         setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
       }
     },
-    []
+    [configRevisionId]
   );
 
   const pick = (m: keyof typeof TEMPLATES) => {

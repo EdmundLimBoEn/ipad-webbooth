@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { createOutboxStore, MemoryOutboxStore } from "./outbox";
+import { createOutboxStore, MemoryOutboxStore, type OutboxItem } from "./outbox";
 import { BoothSession, runCaptureSequence } from "./session";
+import { outboxUploadHeaders } from "./upload";
 
 const photo = (name: string) => new Blob([name], { type: "image/jpeg" });
 const text = (blob: Blob) => blob.text();
@@ -9,25 +10,31 @@ describe("BoothSession outbox", () => {
   test("retains an older failure when a later capture is queued, then recovers in order", async () => {
     const store = new MemoryOutboxStore();
     const attempted: string[] = [];
+    const uploadIdentities: Array<{ id: string; headers: Record<string, string> }> = [];
     let offline = true;
     let nextId = 0;
     const session = new BoothSession(
       "party",
       store,
-      async (blob) => {
-        attempted.push(await text(blob));
+      async (item) => {
+        attempted.push(await text(item.blob));
+        uploadIdentities.push({ id: item.id, headers: outboxUploadHeaders(item) });
         if (offline) throw new Error("venue Wi-Fi offline");
-        return { url: `/photos/${await text(blob)}` };
+        return { url: `/photos/${await text(item.blob)}` };
       },
       () => {},
-      () => String(++nextId),
-      () => nextId
+      () => `018f0000-0000-4000-8000-${String(++nextId).padStart(12, "0")}`,
+      () => 1753315200000 + nextId
     );
 
     await session.recover();
-    await session.enqueueCapture(async () => photo("first"));
+    const first = await session.enqueueCapture(async () => photo("first"), {
+      metadata: { source: "framed", frameKey: "square" },
+    });
     await session.process();
-    await session.enqueueCapture(async () => photo("second"));
+    const second = await session.enqueueCapture(async () => photo("second"), {
+      metadata: { source: "camera-fallback" },
+    });
 
     const failedQueue = await store.list("party");
     await expect(Promise.all(failedQueue.map((item) => text(item.blob)))).resolves.toEqual(["first", "second"]);
@@ -36,9 +43,10 @@ describe("BoothSession outbox", () => {
     // A reload creates a new session over the same durable store.
     offline = false;
     const recoveredUrls: string[] = [];
-    const recovered = new BoothSession("party", store, async (blob) => {
-      attempted.push(await text(blob));
-      return { url: `/photos/${await text(blob)}` };
+    const recovered = new BoothSession("party", store, async (item) => {
+      attempted.push(await text(item.blob));
+      uploadIdentities.push({ id: item.id, headers: outboxUploadHeaders(item) });
+      return { url: `/photos/${await text(item.blob)}` };
     }, ({ url }) => recoveredUrls.push(url));
     const states: string[] = [];
     recovered.subscribe((state) => states.push(`${state.status}:${state.pendingCount}:${state.error ?? ""}`));
@@ -46,6 +54,13 @@ describe("BoothSession outbox", () => {
     await recovered.retry();
 
     expect(attempted).toEqual(["first", "first", "second"]);
+    expect(first.id).toBe(failedQueue[0].id);
+    expect(second.id).toBe(failedQueue[1].id);
+    expect(uploadIdentities).toEqual([
+      { id: first.id, headers: outboxUploadHeaders(first) },
+      { id: first.id, headers: outboxUploadHeaders(first) },
+      { id: second.id, headers: outboxUploadHeaders(second) },
+    ]);
     expect(recoveredUrls).toEqual(["/photos/first", "/photos/second"]);
     expect(await store.list("party")).toEqual([]);
     expect(states.at(-1)).toBe("idle:0:");
@@ -59,9 +74,62 @@ describe("BoothSession outbox", () => {
       await Promise.resolve();
       return { url: "/photo" };
     });
-    await session.enqueueCapture(async () => photo("one"));
+    await session.enqueueCapture(async () => photo("one"), { metadata: { source: "camera-fallback" } });
     await Promise.all([session.process(), session.process(), session.process()]);
     expect(uploads).toBe(1);
+  });
+
+  test("persists one identity and metadata before upload", async () => {
+    const store = new MemoryOutboxStore();
+    const seen: OutboxItem[] = [];
+    const session = new BoothSession(
+      "launch",
+      store,
+      async (item) => {
+        seen.push(item);
+        return { url: "/photo", key: "launch/photo.jpg" };
+      },
+      () => {},
+      () => "018f0000-0000-4000-8000-000000000001",
+      () => 1753315200000
+    );
+
+    const item = await session.enqueueCapture(
+      async () => new Blob(["photo"], { type: "image/jpeg" }),
+      { metadata: { source: "framed", frameKey: "square" } }
+    );
+
+    expect(item).toMatchObject({
+      id: "018f0000-0000-4000-8000-000000000001",
+      createdAt: 1753315200000,
+      metadata: { capturedAt: 1753315200000, source: "framed", frameKey: "square" },
+    });
+    expect(await store.list("launch")).toEqual([item]);
+    await session.process();
+    expect(seen).toEqual([item]);
+  });
+
+  test("allocates identity only after capture succeeds", async () => {
+    const store = new MemoryOutboxStore();
+    let ids = 0;
+    const session = new BoothSession(
+      "launch",
+      store,
+      async () => ({ url: "/photo" }),
+      () => {},
+      () => {
+        ids++;
+        return "018f0000-0000-4000-8000-000000000001";
+      }
+    );
+
+    await expect(session.enqueueCapture(
+      async () => Promise.reject(new Error("composite failed")),
+      { metadata: { source: "framed", frameKey: "square" } }
+    )).rejects.toThrow("composite failed");
+
+    expect(ids).toBe(0);
+    expect(await store.list("launch")).toEqual([]);
   });
 
   test("memory store keeps events isolated and items ordered", async () => {

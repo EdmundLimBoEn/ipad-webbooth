@@ -1,3 +1,5 @@
+import type { CaptureMetadata } from "../../upload-contract";
+
 export type OutboxItem = {
   id: string;
   event: string;
@@ -5,6 +7,11 @@ export type OutboxItem = {
   createdAt: number;
   attempts: number;
   lastError?: string;
+  nextAttemptAt?: number;
+  /** Optional so rows saved by earlier Booth versions remain readable. */
+  metadata?: CaptureMetadata;
+  /** Reserved for the operator rehearsal flow; durable rows retain it verbatim. */
+  rehearsalId?: string;
 };
 
 export interface OutboxStore {

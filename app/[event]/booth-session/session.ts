@@ -1,4 +1,5 @@
 import type { OutboxItem, OutboxStore } from "./outbox";
+import type { CaptureMetadata } from "../../upload-contract";
 
 export type UploadState = {
   status: "idle" | "uploading" | "failed";
@@ -7,8 +8,14 @@ export type UploadState = {
   durable: boolean;
 };
 
-type UploadResult = { url: string };
-type Upload = (blob: Blob) => Promise<UploadResult>;
+export type UploadResult = { url: string; key?: string; duplicate?: boolean };
+export type Upload = (item: OutboxItem) => Promise<UploadResult>;
+
+export type EnqueueCaptureOptions = {
+  signal?: AbortSignal;
+  metadata: Omit<CaptureMetadata, "capturedAt">;
+  rehearsalId?: string;
+};
 
 export class BoothSession {
   private state: UploadState = { status: "idle", pendingCount: 0, error: null, durable: true };
@@ -48,21 +55,26 @@ export class BoothSession {
   }
 
   /** The capture adapter owns camera/file decoding; the session owns durable handoff. */
-  async enqueueCapture(capture: (signal?: AbortSignal) => Promise<Blob>, signal?: AbortSignal) {
-    const blob = await capture(signal);
-    if (signal?.aborted) throw abortError();
+  async enqueueCapture(
+    capture: (signal?: AbortSignal) => Promise<Blob>,
+    options: EnqueueCaptureOptions
+  ) {
+    const blob = await capture(options.signal);
+    if (options.signal?.aborted) throw abortError();
     // Preserve enqueue order even if two captures share a millisecond or the
     // device clock moves backwards while the booth is running.
     const createdAt = Math.max(this.now(), this.lastCreatedAt + 1);
-    this.lastCreatedAt = createdAt;
     const item: OutboxItem = {
       id: this.makeId(),
       event: this.event,
       blob,
       createdAt,
       attempts: 0,
+      metadata: { ...options.metadata, capturedAt: createdAt },
+      ...(options.rehearsalId === undefined ? {} : { rehearsalId: options.rehearsalId }),
     };
     await this.store.put(item);
+    this.lastCreatedAt = createdAt;
     const pending = await this.store.list(this.event);
     this.publish({
       status: this.state.status === "failed" ? "failed" : "idle",
@@ -97,7 +109,7 @@ export class BoothSession {
         durable: this.store.isDurable(),
       });
       try {
-        const result = await this.upload(item.blob);
+        const result = await this.upload(item);
         await this.store.remove(item.id);
         this.onUploaded(result);
         pending = await this.store.list(this.event);
