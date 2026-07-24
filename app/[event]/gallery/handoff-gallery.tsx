@@ -457,6 +457,8 @@ export default function HandoffGallery() {
   const gridRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<(ScrollAnchor & { scrollTop: number }) | null>(null);
   const selectedRef = useRef<FeedPhoto | null>(null);
+  const browseTriggerRef = useRef<HTMLElement | null>(null);
+  const browseTriggerKeyRef = useRef<string | null>(null);
   const controllerRef = useRef<HandoffGalleryController | null>(null);
   if (!controllerRef.current) {
     controllerRef.current = new HandoffGalleryController({
@@ -560,16 +562,31 @@ export default function HandoffGallery() {
   );
 
   const openPhoto = useCallback((photo: FeedPhoto) => {
+    browseTriggerRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    browseTriggerKeyRef.current = photo.key;
     selectedRef.current = photo;
     setDirectState({ kind: "ready", photo });
     openBrowsePhoto(window.history, window.location.origin, event, photo.key);
   }, [event]);
 
   const closePhoto = useCallback(() => {
+    const trigger = browseTriggerRef.current;
+    const triggerKey = browseTriggerKeyRef.current;
+    browseTriggerRef.current = null;
+    browseTriggerKeyRef.current = null;
     controllerRef.current?.cancel();
     selectedRef.current = null;
     setDirectState(null);
     restoreBrowseUrl(window.history, window.location.origin, event);
+    window.requestAnimationFrame(() => {
+      const currentTrigger = triggerKey
+        ? Array.from(document.querySelectorAll<HTMLElement>("[data-photo-key]"))
+          .find((element) => element.dataset.photoKey === triggerKey)
+        : null;
+      (currentTrigger ?? (trigger?.isConnected ? trigger : null))?.focus();
+    });
   }, [event]);
 
   const jumpLatest = useCallback(() => {

@@ -27,6 +27,7 @@
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
     "@cloudflare/workers-types": "^5.20260705.1",
     "@playwright/test": "^1.61.1",
     "@types/bun": "^1.2.19",
