@@ -47,7 +47,9 @@ export class RehearsalClient {
     previousBootId?: string | null;
   }) {
     this.outbox = options.outbox ?? createRehearsalEvidenceOutbox();
-    this.fetcher = options.fetch ?? fetch;
+    // Do not retain Window.fetch as a bare method: WebKit requires its Window
+    // receiver. The wrapper also keeps injected test fetchers unchanged.
+    this.fetcher = options.fetch ?? ((input, init) => fetch(input, init));
     this.makeId = options.makeId ?? (() => crypto.randomUUID());
     this.now = options.now ?? Date.now;
     this.bootId = this.makeId();

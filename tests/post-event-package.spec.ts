@@ -104,6 +104,30 @@ async function installAdminMocks(
       });
       return;
     }
+    if (url.pathname === "/api/presets") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ presets: [], cursor: null }),
+      });
+      return;
+    }
+    if (url.pathname === "/api/rehearsals") {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "missing" }),
+      });
+      return;
+    }
+    if (url.pathname === "/api/moderation/photos") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ photos: [], nextCursor: null }),
+      });
+      return;
+    }
     throw new Error(`Unexpected Admin API request: ${request.method()} ${url.pathname}`);
   });
 }

@@ -233,6 +233,8 @@ export default function Booth() {
     useState<WakeRequestState | "idle">("idle");
   const [durableHandoffActive, setDurableHandoffActive] = useState(false);
   const [requestedRehearsalId, setRequestedRehearsalId] = useState<string | null>(null);
+  const [rehearsalQueryReady, setRehearsalQueryReady] = useState(false);
+  const requestedRehearsalIdRef = useRef<string | null>(null);
   const [rehearsalState, setRehearsalState] =
     useState<RehearsalClientState>(INITIAL_REHEARSAL_STATE);
   // Frames remain unavailable until authenticated preflight returns the safe
@@ -254,8 +256,15 @@ export default function Booth() {
   );
 
   useEffect(() => {
-    setRequestedRehearsalId(new URL(window.location.href).searchParams.get("rehearsal"));
+    const requested = new URL(window.location.href).searchParams.get("rehearsal");
+    requestedRehearsalIdRef.current = requested;
+    setRequestedRehearsalId(requested);
+    setRehearsalQueryReady(true);
   }, [event]);
+
+  const rehearsalCaptureAllowed = useCallback(() =>
+    requestedRehearsalIdRef.current === null
+    || Boolean(rehearsalClientRef.current?.rehearsalIdForNewCapture()), []);
 
   const startCamera = useCallback(async () => {
     if (operationalRef.current.paused || unmountedRef.current) return;
@@ -342,10 +351,10 @@ export default function Booth() {
       clearFrame,
       stopCamera,
       startCamera: () => {
-        void startCamera();
+        if (rehearsalCaptureAllowed()) void startCamera();
       },
     }),
-    [clearFrame, startCamera, stopCamera]
+    [clearFrame, rehearsalCaptureAllowed, startCamera, stopCamera]
   );
 
   const applyOperationalState = useCallback((next: OperationalState) => {
@@ -471,7 +480,9 @@ export default function Booth() {
           reporter.start();
         }
         statePollerRef.current?.start();
-        if (!operationalRef.current.paused) void startCamera();
+        if (!operationalRef.current.paused && rehearsalCaptureAllowed()) {
+          void startCamera();
+        }
       },
       onCameraStop: () => {
         statePollerRef.current?.stop();
@@ -555,6 +566,7 @@ export default function Booth() {
   }, []);
 
   useEffect(() => {
+    if (!rehearsalQueryReady) return;
     const credential: BoothCredentialHolder = { key: "" };
     credentialRef.current = credential;
     const uploadOne = async (item: OutboxItem) => {
@@ -662,7 +674,14 @@ export default function Booth() {
       if (heartbeatReporterRef.current === reporter) heartbeatReporterRef.current = null;
       void lifecycle.leaveEvent(session);
     };
-  }, [applyOperationalState, event, lifecycle]);
+  }, [
+    applyOperationalState,
+    event,
+    lifecycle,
+    rehearsalCaptureAllowed,
+    rehearsalQueryReady,
+    startCamera,
+  ]);
 
   useEffect(() => {
     if (
@@ -703,6 +722,12 @@ export default function Booth() {
         }
         if (remaining.length === 0) await client.recordEmptyOutbox();
         await client.drainEvidence();
+        if (
+          client.rehearsalIdForNewCapture()
+          && !operationalRef.current.paused
+        ) {
+          void startCamera();
+        }
       } catch (cause) {
         if (!cancelled) {
           setError(cause instanceof Error ? cause.message : label("rehearsalJoinError"));
@@ -716,7 +741,7 @@ export default function Booth() {
       if (rehearsalClientRef.current === client) rehearsalClientRef.current = null;
       setRehearsalState(INITIAL_REHEARSAL_STATE);
     };
-  }, [accessState, event, label, requestedRehearsalId]);
+  }, [accessState, event, label, requestedRehearsalId, startCamera]);
 
   useEffect(() => {
     if (
@@ -1114,11 +1139,13 @@ export default function Booth() {
         onLeave={() => {
           rehearsalClientRef.current?.stop();
           rehearsalClientRef.current = null;
+          requestedRehearsalIdRef.current = null;
           setRequestedRehearsalId(null);
           setRehearsalState(INITIAL_REHEARSAL_STATE);
           const url = new URL(window.location.href);
           url.searchParams.delete("rehearsal");
           window.history.replaceState(null, "", url);
+          if (!operationalRef.current.paused) void startCamera();
         }}
       />
       {/* framed box is exactly the slot's aspect at the largest size that fits,

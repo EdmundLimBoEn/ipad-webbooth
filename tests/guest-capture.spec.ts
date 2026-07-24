@@ -8,6 +8,7 @@ import {
 
 const EVENT = "guest-capture";
 const BOOTH_KEY = "guest-key";
+const REHEARSAL_ID = "018f0000-0000-4000-8000-000000000411";
 const LOCALE_KEY = `boothLocale:${EVENT}`;
 
 type HeldUpload = {
@@ -25,6 +26,9 @@ type GuestFixture = {
   photoKeys: Map<string, string>;
   externalRequests: string[];
   pageErrors: string[];
+  rehearsal: "active" | "stale" | null;
+  holdRehearsalJoin: boolean;
+  heldRehearsalJoins: Route[];
   experience: {
     frames: string[];
     locales: string[];
@@ -44,6 +48,7 @@ type GuestBrowserState = {
   failNextEncoding: boolean;
   audioStarts: number;
   bitmapCloses: number;
+  getUserMediaCalls: number;
   online: boolean;
 };
 
@@ -60,6 +65,9 @@ function createFixture(
     photoKeys: new Map(),
     externalRequests: [],
     pageErrors: [],
+    rehearsal: null,
+    holdRehearsalJoin: false,
+    heldRehearsalJoins: [],
     experience: {
       frames: ["square", "beacon"],
       locales: ["en", "zh-SG", "ar"],
@@ -109,6 +117,7 @@ async function installGuestMocks(
       failNextEncoding: false,
       audioStarts: 0,
       bitmapCloses: 0,
+      getUserMediaCalls: 0,
       online: true,
     };
     Object.defineProperty(window, "__guestCaptureTest", {
@@ -206,6 +215,7 @@ async function installGuestMocks(
     Object.defineProperty(mediaDevices, "getUserMedia", {
       configurable: true,
       value: async () => {
+        state.getUserMediaCalls += 1;
         if (camera === "denied") {
           throw new DOMException("camera denied by browser fixture", "NotAllowedError");
         }
@@ -325,6 +335,38 @@ async function installGuestMocks(
       return;
     }
 
+    if (url.pathname === "/api/rehearsals/join") {
+      if (fixture.holdRehearsalJoin) {
+        fixture.heldRehearsalJoins.push(route);
+        return;
+      }
+      const body = request.postDataJSON() as { rehearsalId?: string };
+      await route.fulfill({
+        status: fixture.rehearsal ? 200 : 404,
+        contentType: "application/json",
+        body: JSON.stringify(fixture.rehearsal ? {
+          rehearsal: {
+            version: 1,
+            id: body.rehearsalId,
+            startedAt: "2026-07-24T00:00:00.000Z",
+            configRevisionId: null,
+            frames: fixture.experience.frames,
+            stale: fixture.rehearsal === "stale",
+          },
+        } : { error: "missing" }),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/rehearsals/evidence") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ accepted: true }),
+      });
+      return;
+    }
+
     if (url.pathname === "/api/booths") {
       await route.fulfill({
         status: 200,
@@ -376,6 +418,15 @@ async function installGuestMocks(
           url: `/mock-photo/${captureId}.jpg`,
           uploadedAt: "2026-07-24T12:00:00.000Z",
         }),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/photos") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ photos: [], cursor: null }),
       });
       return;
     }
@@ -570,8 +621,9 @@ test("WebKit reviews the exact one-shot and multi-shot canvas before one durable
   const directPagePromise = context.waitForEvent("page");
   await link.click();
   const directPage = await directPagePromise;
-  await expect(directPage.getByRole("heading", { name: "Your photo is ready" })).toBeVisible();
-  await expect(directPage.getByRole("img", { name: "Photo preview" })).toHaveAttribute(
+  await expect(directPage.getByRole("heading", { name: "Event photos" })).toBeVisible();
+  await expect(directPage.getByRole("dialog", { name: "Event photo" })).toBeVisible();
+  await expect(directPage.getByRole("img", { name: "Event photo" })).toHaveAttribute(
     "src",
     `/mock-photo/${firstCaptureId}.jpg`,
   );
@@ -597,6 +649,57 @@ test("WebKit reviews the exact one-shot and multi-shot canvas before one durable
   await expect(page.getByRole("heading", { name: "Pick a style" })).toBeVisible();
   expect(fixture.externalRequests).toEqual([]);
   expect(fixture.pageErrors).toEqual([]);
+});
+
+test("rehearsal join gates the camera and new captures", async ({
+  context,
+  page,
+}) => {
+  const fixture = createFixture();
+  fixture.rehearsal = "active";
+  fixture.holdRehearsalJoin = true;
+  await installGuestMocks(context, fixture);
+
+  await page.goto(`/${EVENT}?rehearsal=${REHEARSAL_ID}`);
+  await page.getByLabel("Booth Key").fill(BOOTH_KEY);
+  await page.getByRole("button", { name: "Unlock Booth" }).click();
+  await expect.poll(() => fixture.heldRehearsalJoins.length).toBe(1);
+  expect((await browserState(page)).getUserMediaCalls).toBe(0);
+
+  fixture.holdRehearsalJoin = false;
+  await fixture.heldRehearsalJoins.shift()!.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      rehearsal: {
+        version: 1,
+        id: REHEARSAL_ID,
+        startedAt: "2026-07-24T00:00:00.000Z",
+        configRevisionId: null,
+        frames: fixture.experience.frames,
+        stale: false,
+      },
+    }),
+  });
+
+  await expect(page.getByRole("heading", { name: "Rehearsal active" }))
+    .toBeVisible();
+  await expect.poll(async () => (await browserState(page)).getUserMediaCalls)
+    .toBe(1);
+  await expect(page.getByRole("heading", { name: "Pick a style" })).toBeVisible();
+});
+
+test("a stale rehearsal blocks new camera work", async ({ context, page }) => {
+  const fixture = createFixture();
+  fixture.rehearsal = "stale";
+  await installGuestMocks(context, fixture);
+
+  await page.goto(`/${EVENT}?rehearsal=${REHEARSAL_ID}`);
+  await page.getByLabel("Booth Key").fill(BOOTH_KEY);
+  await page.getByRole("button", { name: "Unlock Booth" }).click();
+
+  await expect(page.getByText(/Configuration changed/)).toBeVisible();
+  expect((await browserState(page)).getUserMediaCalls).toBe(0);
 });
 
 test("WebKit fences encode races and keeps the newer handoff during delayed recovery", async ({

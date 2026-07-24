@@ -243,7 +243,34 @@ export function RehearsalPanel({
       return retained.cleanupPending;
     }
     const query = new URLSearchParams({ event, key: photoKey });
+    // Reconcile public truth before mutating. If a prior DELETE succeeded but
+    // its response or local marker was lost, the exact read returns 404 and
+    // we finalize private evidence without ever issuing DELETE again.
+    const current = await request(`/api/photo?${query}`);
+    if (current.status === 404) {
+      const alreadyAbsent = {
+        kind,
+        cleanupPending: true,
+      } satisfies ConfirmedDeletion;
+      confirmedDeleteMap().set(photoKey, alreadyAbsent);
+      persistConfirmedDeletes();
+      return alreadyAbsent.cleanupPending;
+    }
+    if (!current.ok) throw new Error(label("rehearsalActionError"));
+    const currentPhoto = await current.json() as { key?: unknown };
+    if (currentPhoto.key !== photoKey) {
+      throw new Error(label("rehearsalActionError"));
+    }
     const response = await request(`/api/photos?${query}`, { method: "DELETE" });
+    if (response.status === 404) {
+      const concurrentlyAbsent = {
+        kind,
+        cleanupPending: true,
+      } satisfies ConfirmedDeletion;
+      confirmedDeleteMap().set(photoKey, concurrentlyAbsent);
+      persistConfirmedDeletes();
+      return concurrentlyAbsent.cleanupPending;
+    }
     const result = await response.json() as {
       deleted?: unknown;
       cleanupPending?: unknown;

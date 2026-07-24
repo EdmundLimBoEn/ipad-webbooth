@@ -51,6 +51,7 @@ type RehearsalFixture = {
   appliedRevisionId: string | null;
   appliedPresetId: string | null;
   failEvidenceKindOnce: string | null;
+  deletedPhotoKeys: Set<string>;
 };
 
 function rehearsalView(
@@ -284,11 +285,21 @@ async function installAdminMocks(
       return;
     }
     if (url.pathname === "/api/photos" && request.method() === "DELETE") {
+      fixture.deletedPhotoKeys.add(url.searchParams.get("key") ?? "");
       await json({
         deleted: true,
         key: url.searchParams.get("key"),
         cleanupPending: false,
       });
+      return;
+    }
+    if (url.pathname === "/api/photo" && request.method() === "GET") {
+      const key = url.searchParams.get("key") ?? "";
+      if (fixture.deletedPhotoKeys.has(key)) {
+        await json({ error: "missing" }, 404);
+      } else {
+        await json({ key, url: PIXEL, uploadedAt: "2026-07-24T00:00:00.000Z" });
+      }
       return;
     }
     if (url.pathname === "/api/photos" && request.method() === "GET") {
@@ -337,6 +348,7 @@ function createFixture(
     appliedRevisionId: null,
     appliedPresetId: null,
     failEvidenceKindOnce: null,
+    deletedPhotoKeys: new Set(),
   };
 }
 
@@ -433,8 +445,9 @@ test("guided rehearsal uses only exact tracked-photo dispositions", async ({
   await expect(page.getByText("That rehearsal action did not finish."))
     .toBeVisible();
 
-  // A confirmed public delete survives page reload. Retrying finalizes only
-  // the private evidence and must never issue the exact DELETE again.
+  // Even if browser storage is cleared, exact public truth reconciles a lost
+  // confirmation after reload without issuing the DELETE again.
+  await page.evaluate(() => window.localStorage.clear());
   await unlock(page);
   const recoveredCanaryRow = page.getByRole("listitem").filter({
     hasText: canaryKey,
@@ -482,6 +495,7 @@ test("guided rehearsal uses only exact tracked-photo dispositions", async ({
   expect(evidenceKinds).toEqual([
     "canary-designated",
     "canary-deleted",
+    "canary-designated",
     "canary-deleted",
     "photo-retained",
     "photo-deleted",

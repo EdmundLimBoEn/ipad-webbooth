@@ -238,6 +238,22 @@ async function installModerationRoutes(
       });
       return;
     }
+    if (url.pathname === "/api/presets") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ presets: [], cursor: null }),
+      });
+      return;
+    }
+    if (url.pathname === "/api/rehearsals") {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "missing" }),
+      });
+      return;
+    }
     throw new Error(
       `Unexpected Admin API request: ${request.method()} ${url.pathname}`,
     );
