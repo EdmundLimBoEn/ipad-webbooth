@@ -3,6 +3,7 @@ import {
   canonicalEvent,
   EventStore,
   InvalidEventSlugError,
+  InvalidPublicPhotoKeyError,
 } from "@/app/event-store";
 
 export type PublicPhotoHandlerDeps = { store: EventStore };
@@ -31,7 +32,7 @@ export async function getPublicPhoto(
     if (!photo) return NextResponse.json({ error: "photo not found" }, { status: 404 });
     return NextResponse.json(photo, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
-    if (error instanceof TypeError) {
+    if (error instanceof InvalidPublicPhotoKeyError) {
       return NextResponse.json({ error: "key must be a complete Event-owned image key" }, { status: 400 });
     }
     throw error;

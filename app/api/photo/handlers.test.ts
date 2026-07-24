@@ -16,6 +16,12 @@ class ExactPhotoReadStore extends InMemoryObjectStore {
   }
 }
 
+class StorageTypeErrorStore extends InMemoryObjectStore {
+  override async get(_key: string): Promise<StoredObjectBody | null> {
+    throw new TypeError("simulated PHOTOS failure");
+  }
+}
+
 function request(query: string): NextRequest {
   return new NextRequest(`https://app.test/api/photo?${query}`);
 }
@@ -71,5 +77,19 @@ describe("exact public photo handler", () => {
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({ error: "photo not found" });
     expect(photos.reads).toEqual([key]);
+  });
+
+  test("does not misclassify an unexpected PHOTOS TypeError as invalid input", async () => {
+    const key = "launch/0000000001000-photo.jpg";
+    const store = new EventStore(
+      new StorageTypeErrorStore(),
+      new InMemoryObjectStore(),
+      "https://photos.example"
+    );
+
+    await expect(getPublicPhoto(
+      request(`event=launch&key=${encodeURIComponent(key)}`),
+      { store }
+    )).rejects.toThrow("simulated PHOTOS failure");
   });
 });

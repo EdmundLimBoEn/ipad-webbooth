@@ -31,25 +31,59 @@ type PhotoTransferDeps = {
   download: (blob: Blob, filename: string) => void;
 };
 
+type HandoffGalleryControllerDeps = {
+  fetchPhoto: (
+    url: string,
+    init: { cache: "no-store"; signal: AbortSignal }
+  ) => Promise<Response>;
+  isOnline: () => boolean;
+  onState: (state: HandoffGalleryState) => void;
+};
+
 export function parseDirectPhotoQuery(params: Pick<URLSearchParams, "getAll">): string | null {
   const values = params.getAll("photo");
   return values.length === 1 && values[0] ? values[0] : null;
 }
 
+export async function prefetchPublicPhoto(
+  photo: DirectPhoto,
+  fetchPhoto: (url: string) => Promise<Response>
+): Promise<Blob> {
+  const response = await fetchPhoto(photo.url);
+  if (!response.ok) throw new Error("photo prefetch failed");
+  return response.blob();
+}
+
 export async function transferPublicPhoto(
   photo: DirectPhoto,
+  prefetchedBlob: Blob | null,
   deps: PhotoTransferDeps
 ): Promise<"shared" | "downloaded"> {
+  const filename = photo.key.slice(photo.key.lastIndexOf("/") + 1);
+  if (prefetchedBlob) {
+    const file = new File(
+      [prefetchedBlob],
+      filename,
+      { type: prefetchedBlob.type || "image/jpeg" }
+    );
+    const data = { files: [file], title: "Photo" };
+    try {
+      if (deps.canShare(data)) {
+        await deps.share(data);
+        return "shared";
+      }
+    } catch {
+      // A rejected native share still leaves a reliable direct download.
+    }
+    deps.download(prefetchedBlob, filename);
+    return "downloaded";
+  }
+
+  // Fetching here crosses Safari's transient user-activation boundary, so this
+  // path deliberately downloads instead of attempting a late native share.
   const response = await deps.fetchPhoto(photo.url);
   if (!response.ok) throw new Error("photo download failed");
   const blob = await response.blob();
-  const filename = photo.key.slice(photo.key.lastIndexOf("/") + 1);
-  const file = new File([blob], filename, { type: blob.type || "image/jpeg" });
-  const data = { files: [file], title: "Photo" };
-  if (deps.canShare(data)) {
-    await deps.share(data);
-    return "shared";
-  }
   deps.download(blob, filename);
   return "downloaded";
 }
@@ -91,6 +125,81 @@ function isDirectPhoto(value: unknown, expectedKey: string): value is DirectPhot
   return photo.key === expectedKey
     && typeof photo.url === "string"
     && typeof photo.uploadedAt === "string";
+}
+
+export class HandoffGalleryController {
+  private generation = 0;
+  private active: AbortController | null = null;
+
+  constructor(private readonly deps: HandoffGalleryControllerDeps) {}
+
+  async load(event: string, photoKey: string | null): Promise<void> {
+    const generation = ++this.generation;
+    this.active?.abort();
+    const controller = new AbortController();
+    this.active = controller;
+    const publish = (state: HandoffGalleryState) => {
+      if (this.generation === generation && !controller.signal.aborted) {
+        this.deps.onState(state);
+      }
+    };
+
+    if (!photoKey) {
+      publish({ kind: "invalid" });
+      this.finish(generation);
+      return;
+    }
+    if (!this.deps.isOnline()) {
+      publish({ kind: "offline" });
+      this.finish(generation);
+      return;
+    }
+
+    publish({ kind: "loading" });
+    try {
+      const query = new URLSearchParams({ event, key: photoKey });
+      const response = await this.deps.fetchPhoto(`/api/photo?${query}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (response.status === 400) {
+        publish({ kind: "invalid" });
+        return;
+      }
+      if (response.status === 404) {
+        publish({ kind: "not-found" });
+        return;
+      }
+      if (!response.ok) throw new Error(`photo lookup returned ${response.status}`);
+      const payload: unknown = await response.json();
+      publish(isDirectPhoto(payload, photoKey)
+        ? { kind: "ready", photo: payload }
+        : { kind: "invalid" });
+    } catch {
+      if (this.generation !== generation || controller.signal.aborted) return;
+      publish({ kind: this.deps.isOnline() ? "error" : "offline" });
+    } finally {
+      this.finish(generation);
+    }
+  }
+
+  cancel(): void {
+    this.generation += 1;
+    this.active?.abort();
+    this.active = null;
+  }
+
+  private finish(generation: number): void {
+    if (this.generation === generation) this.active = null;
+  }
+}
+
+export function focusHandoffStatus(
+  target: Pick<HTMLElement, "focus"> | null,
+  state: HandoffGalleryState,
+  saveError: boolean
+): void {
+  if (state.kind !== "ready" || saveError) target?.focus();
 }
 
 function storedLocale(event: string): string | null {
@@ -177,6 +286,15 @@ export default function HandoffGallery() {
   const [locale, setLocale] = useState<SupportedLocale>("en");
   const [saveError, setSaveError] = useState(false);
   const statusRef = useRef<HTMLElement>(null);
+  const photoBlobRef = useRef<{ url: string; blob: Blob } | null>(null);
+  const controllerRef = useRef<HandoffGalleryController | null>(null);
+  if (!controllerRef.current) {
+    controllerRef.current = new HandoffGalleryController({
+      fetchPhoto: (url, init) => fetch(url, init),
+      isOnline: () => navigator.onLine,
+      onState: setState,
+    });
+  }
   const setStatusElement = useCallback((element: HTMLElement | null) => {
     statusRef.current = element;
   }, []);
@@ -189,57 +307,46 @@ export default function HandoffGallery() {
     applyDocumentLocale(document.documentElement, locale);
   }, [locale]);
 
-  const load = useCallback(async (signal?: AbortSignal) => {
-    if (!photoKey) {
-      setState({ kind: "invalid" });
-      return;
-    }
-    if (!navigator.onLine) {
-      setState({ kind: "offline" });
-      return;
-    }
-
+  const load = useCallback(async () => {
     setSaveError(false);
-    setState({ kind: "loading" });
-    try {
-      const query = new URLSearchParams({ event, key: photoKey });
-      const response = await fetch(`/api/photo?${query}`, { cache: "no-store", signal });
-      if (response.status === 400) {
-        setState({ kind: "invalid" });
-        return;
-      }
-      if (response.status === 404) {
-        setState({ kind: "not-found" });
-        return;
-      }
-      if (!response.ok) throw new Error(`photo lookup returned ${response.status}`);
-      const payload: unknown = await response.json();
-      if (!isDirectPhoto(payload, photoKey)) {
-        setState({ kind: "invalid" });
-        return;
-      }
-      setState({ kind: "ready", photo: payload });
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") return;
-      setState({ kind: navigator.onLine ? "error" : "offline" });
-    }
+    await controllerRef.current!.load(event, photoKey);
   }, [event, photoKey]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    return () => controller.abort();
+    void load();
+    return () => controllerRef.current?.cancel();
   }, [load]);
 
   useEffect(() => {
-    if (state.kind !== "ready" || saveError) statusRef.current?.focus();
+    focusHandoffStatus(statusRef.current, state, saveError);
   }, [saveError, state.kind]);
+
+  useEffect(() => {
+    photoBlobRef.current = null;
+    if (state.kind !== "ready") return;
+    const photo = state.photo;
+    const controller = new AbortController();
+    let active = true;
+    void prefetchPublicPhoto(
+      photo,
+      (url) => fetch(url, { signal: controller.signal })
+    ).then((blob) => {
+      if (active) photoBlobRef.current = { url: photo.url, blob };
+    }).catch(() => {});
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [state]);
 
   const save = useCallback(async () => {
     if (state.kind !== "ready") return;
     setSaveError(false);
     try {
-      await transferPublicPhoto(state.photo, browserTransferDeps());
+      const prefetched = photoBlobRef.current?.url === state.photo.url
+        ? photoBlobRef.current.blob
+        : null;
+      await transferPublicPhoto(state.photo, prefetched, browserTransferDeps());
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) setSaveError(true);
     }

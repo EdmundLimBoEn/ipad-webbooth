@@ -352,6 +352,12 @@ export class InvalidPhotoCursorError extends Error {
   }
 }
 
+export class InvalidPublicPhotoKeyError extends TypeError {
+  constructor() {
+    super("public photo key must be an exact Event-owned image key");
+  }
+}
+
 export class InvalidStoredBoothHeartbeatError extends Error {
   constructor(readonly event: string) {
     super(`stored booth heartbeat for ${event} is corrupt or uses an unsupported version`);
@@ -1223,7 +1229,7 @@ export class EventStore {
   async getPublicPhoto(event: string, completeKey: string): Promise<PublicPhoto | null> {
     const canonical = canonicalEvent(event);
     if (!isPhotoKey(canonical, completeKey)) {
-      throw new TypeError("public photo key must be an exact Event-owned image key");
+      throw new InvalidPublicPhotoKeyError();
     }
     const object = await this.photos.get(completeKey);
     if (!object || object.key !== completeKey) return null;
