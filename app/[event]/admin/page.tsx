@@ -12,8 +12,11 @@ import {
 } from "./admin-config-controls";
 import { ConfigHistoryPanel } from "./config-history-panel";
 import {
+  clearRestoreRequestAfterReconciliation,
   getOrCreateRestoreRequest,
+  rebaseConfigHistory,
   shouldClearRestoreRequest,
+  type ConfigHistoryResponse,
   type RestoreRequest,
 } from "./config-mutation";
 import styles from "./admin.module.css";
@@ -22,11 +25,6 @@ type Photo = { key: string; url: string; uploadedAt: string };
 type AuthState = "missing" | "ready" | "invalid";
 type Probe = { status: "up" | "degraded" | "down"; detail: string };
 type Health = { upload: Probe; live: Probe };
-type ConfigHistoryResponse = {
-  config: PublicEventConfig;
-  currentRevisionId: string | null;
-  revisions: ConfigRevision[];
-};
 type FilePickerWindow = Window & { showSaveFilePicker?: (options: { suggestedName: string; types: { description: string; accept: Record<string, string[]> }[] }) => Promise<{ createWritable(): Promise<WritableStream<Uint8Array>> }> };
 const CONFIG_CONFLICT_MESSAGE = "Configuration changed; review the latest version before saving.";
 
@@ -126,13 +124,16 @@ export default function Admin() {
       ) {
         throw new Error("Configuration history had an unexpected shape");
       }
-      setFrames(new Set(Array.isArray(data.config.frames) ? data.config.frames : defaults));
-      setHasBoothKey(Boolean(data.config.hasBoothKey));
-      setCurrentRevisionId(data.currentRevisionId);
-      setRevisions(data.revisions);
+      const rebased = rebaseConfigHistory(data, defaults, pendingSaveMutationId);
+      setFrames(new Set(rebased.frames));
+      setHasBoothKey(rebased.hasBoothKey);
+      setCurrentRevisionId(rebased.currentRevisionId);
+      setRevisions(rebased.revisions);
       setConfigLoaded(true);
+      return true;
     } catch (cause) {
       setConfigError(cause instanceof Error ? cause.message : "Config could not be loaded");
+      return false;
     }
   }, [adminKey, defaults, event]);
 
@@ -312,15 +313,18 @@ export default function Admin() {
         return;
       }
       if (!response.ok) throw new Error(`Restore failed (${response.status})`);
-      const data = await response.json() as PublicEventConfig & { currentRevisionId: string };
-      pendingSaveMutationId.current = null;
-      setFrames(new Set(Array.isArray(data.frames) ? data.frames : defaults));
-      setHasBoothKey(Boolean(data.hasBoothKey));
-      setCurrentRevisionId(data.currentRevisionId);
-      setBoothKey("");
-      setBoothKeySaved(false);
-      setCopied((current) => current === "key" ? "" : current);
-      await loadConfig();
+      await clearRestoreRequestAfterReconciliation(pending, request, async () => {
+        const data = await response.json() as PublicEventConfig & { currentRevisionId: string };
+        setFrames(new Set(Array.isArray(data.frames) ? data.frames : defaults));
+        setHasBoothKey(Boolean(data.hasBoothKey));
+        setCurrentRevisionId(data.currentRevisionId);
+        setBoothKey("");
+        setBoothKeySaved(false);
+        setCopied((current) => current === "key" ? "" : current);
+        if (!await loadConfig()) {
+          throw new Error("Configuration restored, but history could not be reloaded.");
+        }
+      });
       setNotice("Configuration restored.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Configuration could not be restored");
