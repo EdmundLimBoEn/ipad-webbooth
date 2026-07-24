@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createOutboxStore, MemoryOutboxStore, type OutboxItem } from "./outbox";
-import { BoothSession, runCaptureSequence } from "./session";
+import { BoothSession, runCaptureSequence, type UploadState } from "./session";
 import { outboxUploadHeaders } from "./upload";
 import { HttpUploadError } from "./retry-policy";
 
@@ -790,6 +790,106 @@ describe("BoothSession outbox", () => {
     }
   });
 
+  test("keeps renewing a blocked upload when manual retry coalesces", async () => {
+    const store = new MemoryOutboxStore();
+    const scheduler = new ManualScheduler();
+    let now = 0;
+    let releaseUpload!: () => void;
+    const uploadBlocked = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+    let uploadStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      uploadStarted = resolve;
+    });
+    await store.put({ id: "one", event: "party", blob: photo("one"), createdAt: 1, attempts: 0 });
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => {
+        uploadStarted();
+        await uploadBlocked;
+        return { url: "/photo" };
+      },
+      () => {},
+      undefined,
+      () => now,
+      {
+        ownerId: "first",
+        leaseTtlMs: 100,
+        setTimer: scheduler.setTimer,
+        clearTimer: scheduler.clearTimer,
+      }
+    );
+
+    const drain = session.start();
+    await started;
+    const retrying = session.retry();
+    try {
+      expect([...scheduler.timers.values()].map((timer) => timer.delayMs)).toContain(50);
+      now = 50;
+      scheduler.runNext();
+      await Promise.resolve();
+      await Promise.resolve();
+      now = 101;
+      expect(await store.acquireLease("party", "second", now, 100)).toBe(false);
+    } finally {
+      releaseUpload();
+      await Promise.all([drain, retrying]);
+      await session.stop();
+    }
+  });
+
+  test("keeps renewing a blocked upload when foreground reconsider coalesces", async () => {
+    const store = new MemoryOutboxStore();
+    const scheduler = new ManualScheduler();
+    let now = 0;
+    let releaseUpload!: () => void;
+    const uploadBlocked = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+    let uploadStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      uploadStarted = resolve;
+    });
+    await store.put({ id: "one", event: "party", blob: photo("one"), createdAt: 1, attempts: 0 });
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => {
+        uploadStarted();
+        await uploadBlocked;
+        return { url: "/photo" };
+      },
+      () => {},
+      undefined,
+      () => now,
+      {
+        ownerId: "first",
+        leaseTtlMs: 100,
+        setTimer: scheduler.setTimer,
+        clearTimer: scheduler.clearTimer,
+      }
+    );
+
+    const drain = session.start();
+    await started;
+    const reconsidering = session.reconsider("foreground");
+    try {
+      expect([...scheduler.timers.values()].map((timer) => timer.delayMs)).toContain(50);
+      now = 50;
+      scheduler.runNext();
+      await Promise.resolve();
+      await Promise.resolve();
+      now = 101;
+      expect(await store.acquireLease("party", "second", now, 100)).toBe(false);
+    } finally {
+      releaseUpload();
+      await Promise.all([drain, reconsidering]);
+      await session.stop();
+    }
+  });
+
   test("does not resurrect an item removed between a manual retry read and lease acquisition", async () => {
     class NoLeaseStore extends MemoryOutboxStore {
       override async acquireLease() {
@@ -852,6 +952,51 @@ describe("BoothSession outbox", () => {
     await drain;
 
     expect(await store.list("party")).toEqual([]);
+    await store.releaseLease("party", "second");
+  });
+
+  test("reconciles away from uploading after a stale failure loses its row", async () => {
+    const store = new MemoryOutboxStore();
+    let now = 0;
+    let releaseFailure!: () => void;
+    const failureBlocked = new Promise<void>((resolve) => {
+      releaseFailure = resolve;
+    });
+    let uploadStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      uploadStarted = resolve;
+    });
+    await store.put({ id: "one", event: "party", blob: photo("one"), createdAt: 1, attempts: 0 });
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => {
+        uploadStarted();
+        await failureBlocked;
+        throw new TypeError("offline");
+      },
+      () => {},
+      undefined,
+      () => now,
+      { ownerId: "first", leaseTtlMs: 100, random: () => 0 }
+    );
+    const states: UploadState[] = [];
+    session.subscribe((state) => states.push(state));
+
+    const drain = session.process();
+    await started;
+    now = 101;
+    expect(await store.acquireLease("party", "second", now, 100)).toBe(true);
+    await store.remove("one");
+    releaseFailure();
+    await drain;
+
+    expect(states.at(-1)).toEqual({
+      status: "idle",
+      pendingCount: 0,
+      error: null,
+      durable: false,
+    });
     await store.releaseLease("party", "second");
   });
 

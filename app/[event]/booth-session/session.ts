@@ -123,8 +123,10 @@ export class BoothSession {
     // the Event lease; a stale pre-lease read could resurrect an acknowledged
     // item from another tab.
     this.environmentalRetryRequested = true;
-    this.retryAt = this.now();
-    this.cancelTimer();
+    if (!this.processing) {
+      this.retryAt = this.now();
+      this.cancelTimer();
+    }
     await this.process();
   }
 
@@ -178,8 +180,10 @@ export class BoothSession {
   async retry() {
     if (this.stopRequested) return;
     this.manualRetryRequested = true;
-    this.retryAt = null;
-    this.cancelTimer();
+    if (!this.processing) {
+      this.retryAt = null;
+      this.cancelTimer();
+    }
     await this.process();
   }
 
@@ -314,6 +318,22 @@ export class BoothSession {
     if (!await this.store.markFailure(failed, this.ownerId, now)) {
       this.leaseHeld = false;
       this.leaseExpiresAt = 0;
+      try {
+        const pending = await this.store.list(this.event);
+        this.publish({
+          status: pending.some((queued) => queued.lastError) ? "failed" : "idle",
+          pendingCount: pending.length,
+          error: pending.find((queued) => queued.lastError)?.lastError ?? null,
+          durable: this.store.isDurable(),
+        });
+      } catch (reconcileError) {
+        this.publish({
+          status: "failed",
+          pendingCount: 0,
+          error: reconcileError instanceof Error ? reconcileError.message : String(reconcileError),
+          durable: this.store.isDurable(),
+        });
+      }
       if (this.started && !this.stopRequested) {
         this.retryAt = now + this.leaseTtlMs;
         this.scheduleWake();
