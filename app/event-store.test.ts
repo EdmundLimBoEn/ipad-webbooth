@@ -96,6 +96,27 @@ class InstrumentedStateStore extends InMemoryObjectStore {
   }
 }
 
+class CrashAfterSuccessfulCasStore extends InMemoryObjectStore {
+  private crashed = false;
+
+  constructor(private readonly crashPrefix: string) {
+    super();
+  }
+
+  override async compareAndSwap(
+    key: string,
+    expectedEtag: string | null,
+    value: ArrayBuffer | ArrayBufferView | string
+  ): Promise<boolean> {
+    const written = await super.compareAndSwap(key, expectedEtag, value);
+    if (written && !this.crashed && key.startsWith(this.crashPrefix)) {
+      this.crashed = true;
+      throw new Error(`simulated crash after durable CAS for ${key}`);
+    }
+    return written;
+  }
+}
+
 function decodePhotoFeedCursor(cursor: string): Record<string, unknown> {
   const encoded = cursor.slice("pf1.".length).replaceAll("-", "+").replaceAll("_", "/");
   const padded = encoded + "=".repeat((4 - encoded.length % 4) % 4);
@@ -1184,12 +1205,12 @@ describe("EventStore", () => {
     expect(delta.photos.map((photo) => photo.key)).toEqual([repaired.key]);
   });
 
-  test("a normal lost-ack retry validates its exact commit proof in bounded O(1) reads", async () => {
+  test("a missing-marker retry stays bounded after 50 intervening arrivals", async () => {
     const state = new InstrumentedStateStore();
     const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
     const upload = { captureId: "018f0000-0000-4000-8000-000000000111", capturedAt: 1753315200006 };
 
-    await store.putPhoto("launch", new Uint8Array([1]).buffer, { upload });
+    const first = await store.putPhoto("launch", new Uint8Array([1]).buffer, { upload });
     for (let index = 0; index < 50; index += 1) {
       await store.putPhoto("launch", new Uint8Array([index]).buffer, {
         upload: {
@@ -1198,10 +1219,79 @@ describe("EventStore", () => {
         },
       });
     }
+    await state.delete(photoFeedMarkerKey("launch", first.key));
     state.resetReads();
 
     await expect(store.putPhoto("launch", new Uint8Array([2]).buffer, { upload })).resolves.toMatchObject({ duplicate: true });
-    expect(state.reads).toBeLessThanOrEqual(10);
+    expect(state.reads).toBeLessThanOrEqual(15);
+  });
+
+  for (const crashPoint of ["claims/", "head.json", "committed/", "markers/"] as const) {
+    test(`an identical retry finalizes a lost acknowledgement after ${crashPoint}`, async () => {
+      const state = new CrashAfterSuccessfulCasStore(`events/launch/photo-feed/v1/${crashPoint}`);
+      const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+      const before = await store.listPhotos("launch");
+      const crashIndex = ["claims/", "head.json", "committed/", "markers/"].indexOf(crashPoint);
+      const upload = {
+        captureId: `018f0000-0000-4000-8000-${String(120 + crashIndex).padStart(12, "0")}`,
+        capturedAt: 1753315200020 + crashIndex,
+      };
+
+      await expect(store.putPhoto("launch", new Uint8Array([1]).buffer, { upload }))
+        .rejects.toBeInstanceOf(PhotoIndexWriteError);
+      const retry = await store.putPhoto("launch", new Uint8Array([2]).buffer, { upload });
+      const delta = await store.listPhotos("launch", before.cursor);
+
+      expect(retry).toMatchObject({ duplicate: true, indexStored: true });
+      expect(delta.photos.map((photo) => photo.key)).toEqual([retry.key]);
+      expect(decodePhotoFeedCursor(delta.cursor!).sequence).toBe(1);
+    });
+  }
+
+  test("replaces an exact stale claim after another arrival wins its sequence", async () => {
+    const state = new CrashAfterSuccessfulCasStore("events/launch/photo-feed/v1/claims/");
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const before = await store.listPhotos("launch");
+    const interruptedUpload = {
+      captureId: "018f0000-0000-4000-8000-000000000130",
+      capturedAt: 1753315200030,
+    };
+
+    await expect(store.putPhoto("launch", new Uint8Array([1]).buffer, { upload: interruptedUpload }))
+      .rejects.toBeInstanceOf(PhotoIndexWriteError);
+    const winner = await store.putPhoto("launch", new Uint8Array([2]).buffer, {
+      upload: { captureId: "018f0000-0000-4000-8000-000000000131", capturedAt: 1753315200031 },
+    });
+    const recovered = await store.putPhoto("launch", new Uint8Array([3]).buffer, { upload: interruptedUpload });
+    const delta = await store.listPhotos("launch", before.cursor);
+
+    expect(delta.photos.map((photo) => photo.key)).toEqual([recovered.key, winner.key]);
+    expect(decodePhotoFeedCursor(delta.cursor!).sequence).toBe(2);
+  });
+
+  test("a corrupt exact claim fails closed without advancing the Event head", async () => {
+    const state = new CrashAfterSuccessfulCasStore("events/launch/photo-feed/v1/claims/");
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const upload = {
+      captureId: "018f0000-0000-4000-8000-000000000132",
+      capturedAt: 1753315200032,
+    };
+
+    await expect(store.putPhoto("launch", new Uint8Array([1]).buffer, { upload }))
+      .rejects.toBeInstanceOf(PhotoIndexWriteError);
+    const claimObject = (await state.list({
+      prefix: "events/launch/photo-feed/v1/claims/",
+    })).objects[0]!;
+    const claim = await (await state.get(claimObject.key))!.json<Record<string, unknown>>();
+    state.set(claimObject.key, JSON.stringify({
+      ...claim,
+      sequence: 2,
+      previousNodeKey: null,
+    }));
+
+    await expect(store.putPhoto("launch", new Uint8Array([2]).buffer, { upload }))
+      .rejects.toBeInstanceOf(PhotoIndexWriteError);
+    expect(state.has(photoFeedHeadKey("launch"))).toBe(false);
   });
 
   test("receipt failure is observable but does not reject an acknowledged stable photo", async () => {
@@ -1331,7 +1421,7 @@ describe("EventStore", () => {
     expect(decoded).not.toHaveProperty("nodeKey");
   });
 
-  test("bounds fabricated-head delta work and stops before a missing committed sequence", async () => {
+  test("fails closed on a fabricated head in bounded work", async () => {
     const state = new InstrumentedStateStore();
     const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
     const before = await store.listPhotos("launch");
@@ -1342,9 +1432,9 @@ describe("EventStore", () => {
     }));
     state.resetReads();
 
-    const delta = await store.listPhotos("launch", before.cursor);
-
-    expect(delta).toMatchObject({ photos: [], cursor: before.cursor, unchanged: true, truncated: true });
+    await expect(store.listPhotos("launch", before.cursor)).rejects.toThrow(
+      "photo feed state for launch is corrupt"
+    );
     expect(state.reads).toBeLessThanOrEqual(3);
   });
 
@@ -1376,7 +1466,7 @@ describe("EventStore", () => {
     expect(keys).toEqual([...uploaded.slice(0, 1000).reverse(), ...uploaded.slice(1000).reverse()]);
   });
 
-  test("does not advance past a missing committed sequence and retry repairs it", async () => {
+  test("a read repairs a stable head commit before it can advance the cursor", async () => {
     const photos = new InMemoryObjectStore();
     const state = new FailPrivatePhotoWriteStore("events/launch/photo-feed/v1/committed/");
     const store = new EventStore(photos, state, "https://photos.example");
@@ -1384,19 +1474,57 @@ describe("EventStore", () => {
     const upload = { captureId: "018f0000-0000-4000-8000-000000000113", capturedAt: 1753315200008 };
 
     await expect(store.putPhoto("launch", new Uint8Array([1]).buffer, { upload })).rejects.toBeInstanceOf(PhotoIndexWriteError);
-    const blocked = await store.listPhotos("launch", before.cursor);
-    expect(blocked).toMatchObject({ photos: [], cursor: before.cursor, truncated: true });
+    await expect(store.listPhotos("launch", before.cursor)).rejects.toThrow(
+      "simulated private write failure"
+    );
 
     state.allowWrites();
-    const repaired = await store.putPhoto("launch", new Uint8Array([2]).buffer, { upload });
     const delta = await store.listPhotos("launch", before.cursor);
+    const repaired = await store.putPhoto("launch", new Uint8Array([2]).buffer, { upload });
 
     expect(delta.photos.map((photo) => photo.key)).toEqual([repaired.key]);
     expect(decodePhotoFeedCursor(delta.cursor!).sequence).toBe(1);
     expect(delta.truncated).toBe(false);
   });
 
-  test("keeps a valid prior cursor usable while its successor commit is repaired", async () => {
+  test("an existing Gallery read repairs a legacy head left ahead of its commit", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new FailPrivatePhotoWriteStore("events/launch/photo-feed/v1/committed/");
+    const store = new EventStore(photos, state, "https://photos.example");
+    const before = await store.listPhotos("launch");
+
+    const legacy = await store.putPhoto("launch", new Uint8Array([1]).buffer);
+    expect(legacy).toMatchObject({ duplicate: false, indexStored: true });
+    expect(state.has(photoFeedHeadKey("launch"))).toBe(true);
+    expect(state.has(photoFeedCommittedKey("launch", 1))).toBe(false);
+
+    state.allowWrites();
+    const delta = await store.listPhotos("launch", before.cursor);
+
+    expect(delta.photos.map((photo) => photo.key)).toEqual([legacy.key]);
+    expect(decodePhotoFeedCursor(delta.cursor!).sequence).toBe(1);
+    expect(state.has(photoFeedCommittedKey("launch", 1))).toBe(true);
+    expect(state.has(photoFeedMarkerKey("launch", legacy.key))).toBe(true);
+  });
+
+  test("a fresh Gallery read repairs a legacy head left ahead of its commit", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new FailPrivatePhotoWriteStore("events/launch/photo-feed/v1/committed/");
+    const store = new EventStore(photos, state, "https://photos.example");
+
+    const legacy = await store.putPhoto("launch", new Uint8Array([1]).buffer);
+    expect(state.has(photoFeedCommittedKey("launch", 1))).toBe(false);
+
+    state.allowWrites();
+    const initial = await store.listPhotos("launch");
+
+    expect(initial.photos.map((photo) => photo.key)).toEqual([legacy.key]);
+    expect(decodePhotoFeedCursor(initial.cursor!).sequence).toBe(1);
+    expect(state.has(photoFeedCommittedKey("launch", 1))).toBe(true);
+    expect(state.has(photoFeedMarkerKey("launch", legacy.key))).toBe(true);
+  });
+
+  test("repairs a missing head commit before advancing a valid prior cursor", async () => {
     const state = new InMemoryObjectStore();
     const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
     const before = await store.listPhotos("launch");
@@ -1411,18 +1539,10 @@ describe("EventStore", () => {
     const second = await store.putPhoto("launch", new Uint8Array([2]).buffer, { upload: secondUpload });
     await state.delete(photoFeedCommittedKey("launch", 2));
 
-    const blocked = await store.listPhotos("launch", throughFirst.cursor);
-    expect(blocked).toMatchObject({
-      photos: [],
-      cursor: throughFirst.cursor,
-      unchanged: true,
-      truncated: true,
-    });
-
-    await store.putPhoto("launch", new Uint8Array([3]).buffer, { upload: secondUpload });
     const repaired = await store.listPhotos("launch", throughFirst.cursor);
     expect(repaired.photos.map((photo) => photo.key)).toEqual([second.key]);
     expect(decodePhotoFeedCursor(repaired.cursor!).sequence).toBe(2);
+    expect(state.has(photoFeedCommittedKey("launch", 2))).toBe(true);
   });
 
   test("fails closed on a corrupt per-photo sequence marker", async () => {
