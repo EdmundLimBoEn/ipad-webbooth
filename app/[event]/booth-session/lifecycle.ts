@@ -1,4 +1,5 @@
 import { availableTemplates } from "../../templates";
+import { parseBoothOperationalState } from "../../booth-control";
 import type { BoothAccessState } from "./access";
 
 export type BoothAccessFeedback =
@@ -65,6 +66,23 @@ export function usablePreflightFrames(value: unknown): string[] | null {
   }
   const usable = availableTemplates(value);
   return usable.length > 0 ? usable : null;
+}
+
+export function boothPreflightResultFromPayload(value: unknown): BoothPreflightResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { kind: "recovery-only" };
+  }
+  const payload = value as {
+    experience?: unknown;
+    operationalState?: unknown;
+  };
+  const operationalState = parseBoothOperationalState(payload.operationalState);
+  if (!operationalState) return { kind: "recovery-only" };
+  const experience = payload.experience;
+  const frames = experience && typeof experience === "object" && !Array.isArray(experience)
+    ? (experience as { frames?: unknown }).frames
+    : undefined;
+  return { kind: "ready", frames, operationalState };
 }
 
 export class BoothLifecycleCoordinator<Result> {

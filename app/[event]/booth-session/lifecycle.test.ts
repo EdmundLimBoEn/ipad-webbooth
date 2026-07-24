@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  boothPreflightResultFromPayload,
   BoothLifecycleCoordinator,
   usablePreflightFrames,
   type BoothLifecycleSession,
@@ -467,4 +468,53 @@ describe("preflight Frame validation", () => {
       expect(h.cameraStarts()).toBe(0);
     }
   );
+});
+
+describe("preflight operational-state validation", () => {
+  const validState = {
+    version: 1,
+    paused: true,
+    messages: { en: "Hold for setup" },
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+
+  test("accepts a full strict v1 state alongside the raw Frame list", () => {
+    expect(boothPreflightResultFromPayload({
+      experience: { frames: ["square"] },
+      operationalState: validState,
+    })).toEqual({
+      kind: "ready",
+      frames: ["square"],
+      operationalState: validState,
+    });
+  });
+
+  test.each([
+    { paused: false },
+    { ...validState, version: 2 },
+    { ...validState, unexpected: true },
+  ])("rejects malformed or incompatible operational state: $value", (value) => {
+    expect(boothPreflightResultFromPayload({
+      experience: { frames: ["square"] },
+      operationalState: value,
+    })).toEqual({ kind: "recovery-only" });
+  });
+
+  test("malformed preflight cannot clear pause or become ready", async () => {
+    const h = harness({
+      stored: { launch: "stored-key" },
+      preflight: async () => boothPreflightResultFromPayload({
+        experience: { frames: ["square"] },
+        operationalState: { paused: false },
+      }),
+    });
+    const session = new FakeSession();
+
+    await h.coordinator.beginEvent("launch", session, credential());
+
+    expect(h.operational).toEqual([]);
+    expect(h.access.at(-1)).toBe("recovery-only:network");
+    expect(session.actions).not.toContain("start");
+    expect(h.cameraStarts()).toBe(0);
+  });
 });

@@ -1,4 +1,7 @@
-import type { BoothHeartbeatInput } from "../../booth-control";
+import {
+  parseBoothOperationalState,
+  type BoothHeartbeatInput,
+} from "../../booth-control";
 
 export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -10,6 +13,24 @@ export type BoothOperationalClientState = {
   paused: boolean;
   connected: boolean;
 };
+
+export type BoothOperationalSessionState = {
+  sessionStartedAt: number;
+  lastSuccessfulUploadAt: number | null;
+  operational: BoothOperationalClientState;
+  cameraErrorClass: "camera-permission" | "camera-unavailable" | null;
+};
+
+export function createBoothOperationalSessionState(
+  sessionStartedAt: number
+): BoothOperationalSessionState {
+  return {
+    sessionStartedAt,
+    lastSuccessfulUploadAt: null,
+    operational: { paused: false, connected: false },
+    cameraErrorClass: null,
+  };
+}
 
 export type BoothStatePollerOptions = {
   event: string;
@@ -46,6 +67,7 @@ export class BoothStatePoller {
   private started = false;
   private stopped = false;
   private paused = false;
+  private runEpoch = 0;
 
   constructor(private readonly options: BoothStatePollerOptions) {
     this.fetch = options.fetch ?? fetch;
@@ -58,6 +80,8 @@ export class BoothStatePoller {
     if (this.started) return;
     this.started = true;
     this.stopped = false;
+    this.runEpoch++;
+    this.inFlight = null;
     void this.refresh();
   }
 
@@ -67,6 +91,7 @@ export class BoothStatePoller {
 
     const controller = new AbortController();
     this.controller = controller;
+    const epoch = this.runEpoch;
     let work!: Promise<void>;
     work = (async () => {
       try {
@@ -76,15 +101,19 @@ export class BoothStatePoller {
         );
         if (!response.ok) throw new TypeError("Booth state request failed");
         const body: unknown = await response.json();
-        if (!isOperationalState(body)) throw new TypeError("Invalid Booth state response");
-        this.paused = body.paused;
-        if (!this.stopped) this.onState({ paused: this.paused, connected: true });
+        const state = parseBoothOperationalState(body);
+        if (!state) throw new TypeError("Invalid Booth state response");
+        if (!this.isCurrent(epoch)) return;
+        this.paused = state.paused;
+        this.onState({ paused: this.paused, connected: true });
       } catch {
-        if (!this.stopped) this.onState({ paused: this.paused, connected: false });
+        if (this.isCurrent(epoch)) {
+          this.onState({ paused: this.paused, connected: false });
+        }
       } finally {
         if (this.controller === controller) this.controller = null;
         if (this.inFlight === work) this.inFlight = null;
-        if (this.started && !this.stopped) this.schedule();
+        if (this.started && this.isCurrent(epoch)) this.schedule();
       }
     })();
     this.inFlight = work;
@@ -94,9 +123,15 @@ export class BoothStatePoller {
   stop(): void {
     this.started = false;
     this.stopped = true;
+    this.runEpoch++;
     this.controller?.abort();
     this.controller = null;
+    this.inFlight = null;
     this.cancelTimer();
+  }
+
+  private isCurrent(epoch: number) {
+    return !this.stopped && epoch === this.runEpoch;
   }
 
   private schedule() {
@@ -127,6 +162,7 @@ export class BoothHeartbeatReporter {
   private started = false;
   private stopped = false;
   private dirty = false;
+  private runEpoch = 0;
 
   constructor(private readonly options: BoothHeartbeatReporterOptions) {
     this.fetch = options.fetch ?? fetch;
@@ -139,6 +175,8 @@ export class BoothHeartbeatReporter {
     if (this.started) return;
     this.started = true;
     this.stopped = false;
+    this.runEpoch++;
+    this.inFlight = null;
     void this.flush();
   }
 
@@ -159,6 +197,7 @@ export class BoothHeartbeatReporter {
     this.dirty = false;
     const controller = new AbortController();
     this.controller = controller;
+    const epoch = this.runEpoch;
     let work!: Promise<void>;
     work = (async () => {
       try {
@@ -174,7 +213,7 @@ export class BoothHeartbeatReporter {
             signal: controller.signal,
           }
         );
-        if (response.status === 401) {
+        if (response.status === 401 && this.isCurrent(epoch)) {
           try {
             await this.onAuthRequired();
           } catch {
@@ -186,7 +225,7 @@ export class BoothHeartbeatReporter {
       } finally {
         if (this.controller === controller) this.controller = null;
         if (this.inFlight === work) this.inFlight = null;
-        if (!this.started || this.stopped) return;
+        if (!this.started || !this.isCurrent(epoch)) return;
         if (this.dirty) {
           this.dirty = false;
           void this.flush();
@@ -202,10 +241,16 @@ export class BoothHeartbeatReporter {
   stop(): void {
     this.started = false;
     this.stopped = true;
+    this.runEpoch++;
     this.dirty = false;
     this.controller?.abort();
     this.controller = null;
+    this.inFlight = null;
     this.cancelTimer();
+  }
+
+  private isCurrent(epoch: number) {
+    return !this.stopped && epoch === this.runEpoch;
   }
 
   private schedule() {
@@ -221,12 +266,6 @@ export class BoothHeartbeatReporter {
     this.clearTimer(this.timer);
     this.timer = null;
   }
-}
-
-function isOperationalState(value: unknown): value is { paused: boolean } {
-  return Boolean(value)
-    && typeof value === "object"
-    && typeof (value as { paused?: unknown }).paused === "boolean";
 }
 
 // Enumerating these fields prevents browser details, arbitrary exception

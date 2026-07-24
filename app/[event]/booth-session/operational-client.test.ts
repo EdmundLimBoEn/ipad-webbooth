@@ -3,6 +3,7 @@ import type { BoothHeartbeatInput } from "../../booth-control";
 import {
   BoothHeartbeatReporter,
   BoothStatePoller,
+  createBoothOperationalSessionState,
   type FetchLike,
 } from "./operational-client";
 
@@ -81,6 +82,14 @@ function response(body: unknown, status = 200) {
   });
 }
 
+function operationalState(paused: boolean) {
+  return {
+    version: 1,
+    paused,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
 describe("BoothStatePoller", () => {
   test("polls immediately and schedules the next poll only after completion", async () => {
     const timers = new Timers();
@@ -88,7 +97,7 @@ describe("BoothStatePoller", () => {
     const states: Array<{ paused: boolean; connected: boolean }> = [];
     const fetch: FetchLike = async (input) => {
       calls.push(String(input));
-      return response({ version: 1, paused: false, updatedAt: "2026-01-01T00:00:00.000Z" });
+      return response(operationalState(false));
     };
     const poller = new BoothStatePoller({
       event: EVENT,
@@ -126,7 +135,7 @@ describe("BoothStatePoller", () => {
     expect(second).toBe(first);
     expect(calls).toBe(1);
 
-    pending.resolve(response({ version: 1, paused: true, updatedAt: "2026-01-01T00:00:00.000Z" }));
+    pending.resolve(response(operationalState(true)));
     await first;
   });
 
@@ -137,7 +146,7 @@ describe("BoothStatePoller", () => {
       event: EVENT,
       fetch: async () => {
         attempt++;
-        if (attempt === 1) return response({ version: 1, paused: true, updatedAt: "2026-01-01T00:00:00.000Z" });
+        if (attempt === 1) return response(operationalState(true));
         throw new TypeError("offline");
       },
       onState: (state) => states.push({ paused: state.paused, connected: state.connected }),
@@ -148,6 +157,65 @@ describe("BoothStatePoller", () => {
 
     expect(states.at(-1)).toEqual({ paused: true, connected: false });
   });
+
+  test("rejects partial, incompatible, and unknown state fields without clearing pause", async () => {
+    const states: Array<{ paused: boolean; connected: boolean }> = [];
+    const replies = [
+      operationalState(true),
+      { paused: false },
+      { ...operationalState(false), version: 2 },
+      { ...operationalState(false), unexpected: true },
+    ];
+    const poller = new BoothStatePoller({
+      event: EVENT,
+      fetch: async () => response(replies.shift()),
+      onState: (state) => states.push(state),
+    });
+
+    await poller.refresh();
+    await poller.refresh();
+    await poller.refresh();
+    await poller.refresh();
+
+    expect(states).toEqual([
+      { paused: true, connected: true },
+      { paused: true, connected: false },
+      { paused: true, connected: false },
+      { paused: true, connected: false },
+    ]);
+  });
+
+  test.each(["success", "error"] as const)(
+    "stop then start immediately polls a new generation and ignores delayed old %s",
+    async (outcome) => {
+      const timers = new Timers();
+      const old = deferred<Response>();
+      const current = deferred<Response>();
+      const requests = [old, current];
+      const states: Array<{ paused: boolean; connected: boolean }> = [];
+      const poller = new BoothStatePoller({
+        event: EVENT,
+        fetch: () => requests.shift()!.promise,
+        onState: (state) => states.push(state),
+        setTimer: timers.set,
+        clearTimer: timers.clear,
+      });
+
+      poller.start();
+      poller.stop();
+      poller.start();
+
+      expect(requests).toHaveLength(0);
+      current.resolve(response(operationalState(false)));
+      await settle();
+      if (outcome === "success") old.resolve(response(operationalState(true)));
+      else old.reject(new TypeError("delayed offline"));
+      await settle();
+
+      expect(states).toEqual([{ paused: false, connected: true }]);
+      expect(timers.delays()).toEqual([5_000]);
+    }
+  );
 });
 
 describe("BoothHeartbeatReporter", () => {
@@ -278,8 +346,83 @@ describe("BoothHeartbeatReporter", () => {
     poller.stop();
 
     expect(signal?.aborted).toBe(true);
-    pending.resolve(response({ version: 1, paused: false, updatedAt: "2026-01-01T00:00:00.000Z" }));
+    pending.resolve(response(operationalState(false)));
     await settle();
     expect(timers.pending).toHaveLength(0);
+  });
+
+  test.each(["success", "error"] as const)(
+    "stop then start sends a new generation and ignores delayed old %s",
+    async (outcome) => {
+      const timers = new Timers();
+      const old = deferred<Response>();
+      const current = deferred<Response>();
+      const requests = [old, current];
+      const reporter = new BoothHeartbeatReporter({
+        event: EVENT,
+        boothKey: () => "operator-key",
+        fetch: () => requests.shift()!.promise,
+        setTimer: timers.set,
+        clearTimer: timers.clear,
+      });
+      reporter.update(heartbeat({ pendingCount: 1 }));
+      reporter.start();
+      reporter.stop();
+      reporter.update(heartbeat({ pendingCount: 2 }));
+      reporter.start();
+
+      expect(requests).toHaveLength(0);
+      current.resolve(response({ ok: true }));
+      await settle();
+      if (outcome === "success") old.resolve(response({ ok: true }));
+      else old.reject(new TypeError("delayed offline"));
+      await settle();
+
+      expect(timers.delays()).toEqual([15_000]);
+    }
+  );
+
+  test("a delayed old 401 cannot relock a restarted reporter", async () => {
+    const old = deferred<Response>();
+    const current = deferred<Response>();
+    const requests = [old, current];
+    let authRequired = 0;
+    const reporter = new BoothHeartbeatReporter({
+      event: EVENT,
+      boothKey: () => "operator-key",
+      fetch: () => requests.shift()!.promise,
+      onAuthRequired: () => { authRequired++; },
+    });
+    reporter.update(heartbeat({ pendingCount: 1 }));
+    reporter.start();
+    reporter.stop();
+    reporter.update(heartbeat({ pendingCount: 2 }));
+    reporter.start();
+
+    expect(requests).toHaveLength(0);
+    old.resolve(response({ error: "unauthorized" }, 401));
+    current.resolve(response({ ok: true }));
+    await settle();
+
+    expect(authRequired).toBe(0);
+  });
+});
+
+describe("Booth operational Event reset", () => {
+  test("navigation cannot carry Event A upload or pause state into Event B", () => {
+    const eventA = createBoothOperationalSessionState(100);
+    eventA.lastSuccessfulUploadAt = 150;
+    eventA.operational = { paused: true, connected: true };
+    eventA.cameraErrorClass = "camera-unavailable";
+
+    const eventB = createBoothOperationalSessionState(200);
+
+    expect(eventB).toEqual({
+      sessionStartedAt: 200,
+      lastSuccessfulUploadAt: null,
+      operational: { paused: false, connected: false },
+      cameraErrorClass: null,
+    });
+    expect(eventB).not.toEqual(eventA);
   });
 });
