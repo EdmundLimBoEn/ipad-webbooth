@@ -627,6 +627,71 @@ describe("private rehearsal storage", () => {
     expect(latestRehearsalKey("launch")).toBe("events/launch/rehearsals/latest.json");
     expect("deleteRehearsal" in EventStore.prototype).toBeFalse();
   });
+
+  test("records one deterministic same-Event upload acknowledgement", async () => {
+    const store = new EventStore(
+      new InMemoryObjectStore(),
+      new InMemoryObjectStore(),
+      "https://photos.example",
+      () => new Date("2026-07-24T00:00:00.000Z"),
+    );
+    await store.startRehearsal("launch", { rehearsalId });
+    const upload = {
+      captureId,
+      capturedAt: 1_753_315_200_000,
+      source: "framed" as const,
+      frameKey: "square",
+      rehearsalId,
+    };
+    const photo = await store.putPhoto("launch", new Uint8Array([1]).buffer, { upload });
+
+    const first = await store.recordRehearsalUpload("launch", rehearsalId, upload, photo);
+    const retry = await store.recordRehearsalUpload("launch", rehearsalId, upload, {
+      key: photo.key,
+      duplicate: true,
+    });
+    expect(first).toMatchObject({
+      id: `upload-${captureId}`,
+      rehearsalId,
+      kind: "photo-acknowledged",
+      captureId,
+      capturedAt: upload.capturedAt,
+      frameKey: "square",
+      photoKey: photo.key,
+    });
+    expect(retry).toEqual(first);
+    expect((await store.readRehearsal("launch", rehearsalId)).evidence).toEqual([first]);
+
+    await expect(store.recordRehearsalUpload("launch", rehearsalId, upload, {
+      key: "launch/1753315200001-other.jpg",
+      duplicate: true,
+    })).rejects.toBeInstanceOf(RehearsalConflictError);
+  });
+
+  test("rejects missing and cross-Event upload sessions before attachment", async () => {
+    const store = new EventStore(
+      new InMemoryObjectStore(),
+      new InMemoryObjectStore(),
+      "https://photos.example",
+    );
+    await store.startRehearsal("launch", { rehearsalId });
+    const upload = {
+      captureId,
+      capturedAt: 1_753_315_200_000,
+      rehearsalId,
+    };
+    await expect(store.recordRehearsalUpload("other", rehearsalId, upload, {
+      key: "other/1753315200000-a.jpg",
+      duplicate: false,
+    })).rejects.toBeInstanceOf(RehearsalNotFoundError);
+    await expect(store.recordRehearsalUpload("launch", rehearsalId, {
+      ...upload,
+      rehearsalId: "018f0000-0000-4000-8000-000000000599",
+    }, {
+      key: "launch/1753315200000-a.jpg",
+      duplicate: false,
+    })).rejects.toBeInstanceOf(TypeError);
+  });
 });
 
 describe("canonical event identity", () => {

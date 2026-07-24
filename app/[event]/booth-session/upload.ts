@@ -17,6 +17,7 @@ export function outboxUploadHeaders(item: OutboxItem): Record<string, string> {
     source: item.metadata?.source,
     frameKey: item.metadata?.frameKey,
     configRevisionId: item.metadata?.configRevisionId,
+    rehearsalId: item.rehearsalId,
   });
 
   try {

@@ -31,12 +31,14 @@ describe("outboxUploadHeaders", () => {
         frameKey: "square",
         configRevisionId: "release_1",
       },
+      rehearsalId: "018f0000-0000-4000-8000-000000000501",
     })).toEqual({
       "x-capture-id": "018f0000-0000-4000-8000-000000000001",
       "x-captured-at": "1753315200999",
       "x-capture-source": "framed",
       "x-frame-key": "square",
       "x-config-revision-id": "release_1",
+      "x-rehearsal-id": "018f0000-0000-4000-8000-000000000501",
     });
   });
 

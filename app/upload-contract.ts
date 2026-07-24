@@ -16,6 +16,7 @@ export type StableUpload = StableCaptureIdentity & {
   source?: CaptureSource;
   frameKey?: string;
   configRevisionId?: string;
+  rehearsalId?: string;
 };
 
 export type UploadIntent = { kind: "legacy" } | ({ kind: "stable" } & StableUpload);
@@ -26,7 +27,8 @@ type InvalidUploadHeadersCode =
   | "invalid_captured_at"
   | "invalid_capture_source"
   | "invalid_frame_key"
-  | "invalid_config_revision_id";
+  | "invalid_config_revision_id"
+  | "invalid_rehearsal_id";
 
 export class InvalidUploadHeadersError extends Error {
   constructor(readonly code: InvalidUploadHeadersCode, message: string) {
@@ -49,8 +51,12 @@ export function parseUploadHeaders(headers: Headers): UploadIntent {
   const source = headers.get("x-capture-source");
   const frameKey = headers.get("x-frame-key");
   const configRevisionId = headers.get("x-config-revision-id");
+  const rehearsalId = headers.get("x-rehearsal-id");
 
-  const hasMetadata = source !== null || frameKey !== null || configRevisionId !== null;
+  const hasMetadata = source !== null
+    || frameKey !== null
+    || configRevisionId !== null
+    || rehearsalId !== null;
 
   if (captureId === null && capturedAt === null) {
     if (hasMetadata) invalid("incomplete_capture_identity", "Capture metadata requires a capture identity.");
@@ -75,6 +81,9 @@ export function parseUploadHeaders(headers: Headers): UploadIntent {
   if (configRevisionId !== null && !SAFE_TOKEN.test(configRevisionId)) {
     invalid("invalid_config_revision_id", "Config revision ID is invalid.");
   }
+  if (rehearsalId !== null && !UUID_V4.test(rehearsalId)) {
+    invalid("invalid_rehearsal_id", "Rehearsal ID must be a lowercase UUID-v4.");
+  }
 
   return {
     kind: "stable",
@@ -83,6 +92,7 @@ export function parseUploadHeaders(headers: Headers): UploadIntent {
     ...(parsedSource ? { source: parsedSource } : {}),
     ...(frameKey !== null ? { frameKey } : {}),
     ...(configRevisionId !== null ? { configRevisionId } : {}),
+    ...(rehearsalId !== null ? { rehearsalId } : {}),
   };
 }
 
@@ -93,5 +103,6 @@ export function stableUploadHeaders(input: StableUpload): Record<string, string>
     ...(input.source ? { "x-capture-source": input.source } : {}),
     ...(input.frameKey ? { "x-frame-key": input.frameKey } : {}),
     ...(input.configRevisionId ? { "x-config-revision-id": input.configRevisionId } : {}),
+    ...(input.rehearsalId ? { "x-rehearsal-id": input.rehearsalId } : {}),
   };
 }

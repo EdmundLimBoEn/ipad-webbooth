@@ -613,6 +613,10 @@ export class EventStore {
     return `${base}/${key.split("/").map(encodeURIComponent).join("/")}`;
   }
 
+  serverTime(): string {
+    return this.now().toISOString();
+  }
+
   async readConfig(event: string): Promise<EventConfig | null> {
     try {
       const current = await this.readPrivateConfig(event);
@@ -1041,7 +1045,7 @@ export class EventStore {
     const claimed = await this.state.compareAndSwap(
       identityKey,
       null,
-      JSON.stringify({ version: 1, key, semantic }),
+      JSON.stringify({ version: 1, key, evidence: record }),
       jsonWriteOptions(),
     );
     if (!claimed) {
@@ -1066,6 +1070,36 @@ export class EventStore {
     return { evidence: record, idempotent: false };
   }
 
+  async recordRehearsalUpload(
+    event: string,
+    rehearsalId: string,
+    upload: StableUpload,
+    photo: Pick<PutPhotoResult, "key" | "duplicate">,
+  ): Promise<RehearsalEvidence> {
+    const canonical = canonicalEvent(event);
+    if (
+      upload.rehearsalId !== rehearsalId
+      || !isRehearsalId(rehearsalId)
+      || !isPhotoKey(canonical, photo.key)
+    ) {
+      throw new TypeError("invalid rehearsal upload");
+    }
+    const result = await this.appendRehearsalEvidence(canonical, rehearsalId, {
+      version: 1,
+      id: `upload-${upload.captureId}`,
+      rehearsalId,
+      observedAt: upload.capturedAt,
+      kind: "photo-acknowledged",
+      captureId: upload.captureId,
+      capturedAt: upload.capturedAt,
+      ...(upload.source === "framed" && upload.frameKey
+        ? { frameKey: upload.frameKey }
+        : {}),
+      photoKey: photo.key,
+    });
+    return result.evidence;
+  }
+
   private async finishExistingRehearsalEvidence(
     event: string,
     rehearsalId: string,
@@ -1085,12 +1119,30 @@ export class EventStore {
       || Object.keys(marker).length !== 3
       || marker.version !== 1
       || marker.key !== key
-      || marker.semantic !== semantic
     ) {
       throw new RehearsalConflictError(evidenceId);
     }
-    const object = await this.state.get(key);
-    if (!object) throw new InvalidStoredRehearsalError(event, rehearsalId);
+    const markerEvidence = parseRehearsalEvidence(marker.evidence, event);
+    if (
+      !markerEvidence
+      || markerEvidence.id !== evidenceId
+      || markerEvidence.rehearsalId !== rehearsalId
+      || rehearsalEvidenceSemantic(markerEvidence) !== semantic
+    ) {
+      throw new RehearsalConflictError(evidenceId);
+    }
+    let object = await this.state.get(key);
+    if (!object) {
+      const repaired = await this.state.compareAndSwap(
+        key,
+        null,
+        JSON.stringify(markerEvidence),
+        jsonWriteOptions(),
+      );
+      if (repaired) return { evidence: markerEvidence, idempotent: true };
+      object = await this.state.get(key);
+      if (!object) throw new InvalidStoredRehearsalError(event, rehearsalId);
+    }
     let value: unknown;
     try {
       value = await object.json<unknown>();

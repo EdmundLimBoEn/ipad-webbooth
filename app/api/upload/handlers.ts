@@ -3,7 +3,9 @@ import {
   canonicalEvent,
   EventStore,
   InvalidEventSlugError,
+  InvalidStoredRehearsalError,
   PhotoIndexWriteError,
+  RehearsalNotFoundError,
 } from "@/app/event-store";
 import { InvalidUploadHeadersError, parseUploadHeaders } from "@/app/upload-contract";
 import { boothOrAdminOk, isImage, MAX_UPLOAD_BYTES } from "@/app/upload-auth";
@@ -64,6 +66,20 @@ export async function handleUpload(req: NextRequest, deps: UploadHandlerDeps): P
   }
   if (auth !== "ok") return jsonError("unauthorized", 401);
 
+  if (intent.kind === "stable" && intent.rehearsalId) {
+    try {
+      await deps.store.readRehearsal(event, intent.rehearsalId);
+    } catch (error) {
+      if (error instanceof RehearsalNotFoundError) {
+        return jsonError("rehearsal unavailable", 409);
+      }
+      if (error instanceof InvalidStoredRehearsalError) {
+        return jsonError("rehearsal evidence unavailable", 503, { "Retry-After": "1" });
+      }
+      throw error;
+    }
+  }
+
   const body = await req.arrayBuffer();
   if (body.byteLength === 0) return jsonError("empty body", 400);
   if (body.byteLength > MAX_UPLOAD_BYTES) return jsonError("too large", 413);
@@ -73,6 +89,21 @@ export async function handleUpload(req: NextRequest, deps: UploadHandlerDeps): P
     const photo = await deps.store.putPhoto(event, body, {
       ...(intent.kind === "stable" ? { upload: intent } : {}),
     });
+    if (intent.kind === "stable" && intent.rehearsalId) {
+      try {
+        await deps.store.recordRehearsalUpload(
+          event,
+          intent.rehearsalId,
+          intent,
+          photo,
+        );
+      } catch {
+        return NextResponse.json(
+          { error: "rehearsal evidence unavailable", retryable: true },
+          { status: 503, headers: { "Retry-After": "1" } },
+        );
+      }
+    }
     // `url` remains first-class for older Booth clients; identity fields are
     // additive for stable clients and moderation/retry diagnostics.
     return NextResponse.json({ url: photo.url, key: photo.key, duplicate: photo.duplicate });

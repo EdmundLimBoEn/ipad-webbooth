@@ -17,6 +17,7 @@ const ADMIN_KEY = "admin";
 const CAPTURE_ID = "018f0000-0000-4000-8000-000000000001";
 const CAPTURED_AT = "1753315200000";
 const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0]);
+const REHEARSAL_ID = "018f0000-0000-4000-8000-000000000501";
 
 function request(
   event = "launch",
@@ -52,6 +53,10 @@ class FailPrivateWrites implements ObjectStore {
 
   allowWrites(): void {
     this.failing = false;
+  }
+
+  failWrites(): void {
+    this.failing = true;
   }
 
   has(key: string): boolean {
@@ -239,5 +244,63 @@ describe("upload route", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ duplicate: false });
+  });
+
+  test("acknowledges a tracked upload only after private rehearsal evidence exists", async () => {
+    const { deps } = memoryDeps();
+    await deps.store.startRehearsal("launch", { rehearsalId: REHEARSAL_ID });
+    const response = await handleUpload(request("launch", {
+      headers: stableHeaders({
+        "x-rehearsal-id": REHEARSAL_ID,
+        "x-capture-source": "framed",
+        "x-frame-key": "square",
+      }),
+    }), deps);
+
+    expect(response.status).toBe(200);
+    const photo = await response.json() as { key: string };
+    expect((await deps.store.readRehearsal("launch", REHEARSAL_ID)).evidence)
+      .toMatchObject([{
+        id: `upload-${CAPTURE_ID}`,
+        kind: "photo-acknowledged",
+        photoKey: photo.key,
+      }]);
+  });
+
+  test("rejects an unknown rehearsal before writing public photo bytes", async () => {
+    const { photos, deps } = memoryDeps();
+    const response = await handleUpload(request("launch", {
+      headers: stableHeaders({ "x-rehearsal-id": REHEARSAL_ID }),
+    }), deps);
+
+    expect(response.status).toBe(409);
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(0);
+  });
+
+  test("retries missing rehearsal evidence without duplicating the public image", async () => {
+    const state = new FailPrivateWrites(
+      `events/launch/rehearsals/${REHEARSAL_ID}/evidence/`,
+    );
+    const { photos, deps } = memoryDeps({ state });
+    await deps.store.startRehearsal("launch", { rehearsalId: REHEARSAL_ID });
+
+    const first = await handleUpload(request("launch", {
+      headers: stableHeaders({ "x-rehearsal-id": REHEARSAL_ID }),
+    }), deps);
+    expect(first.status).toBe(503);
+    expect(first.headers.get("Retry-After")).toBe("1");
+    expect(await first.json()).toEqual({
+      error: "rehearsal evidence unavailable",
+      retryable: true,
+    });
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(1);
+
+    state.allowWrites();
+    const retry = await handleUpload(request("launch", {
+      headers: stableHeaders({ "x-rehearsal-id": REHEARSAL_ID }),
+    }), deps);
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ duplicate: true });
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(1);
   });
 });

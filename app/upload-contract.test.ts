@@ -20,6 +20,7 @@ describe("stable upload headers", () => {
       source: "framed" as const,
       frameKey: "square",
       configRevisionId: "018f0000-0000-7000-8000-000000000002",
+      rehearsalId: "018f0000-0000-4000-8000-000000000501",
     };
 
     expect(stableUploadHeaders(stable)).toEqual({
@@ -28,6 +29,7 @@ describe("stable upload headers", () => {
       "x-capture-source": "framed",
       "x-frame-key": "square",
       "x-config-revision-id": "018f0000-0000-7000-8000-000000000002",
+      "x-rehearsal-id": "018f0000-0000-4000-8000-000000000501",
     });
     expect(parseUploadHeaders(headers(stableUploadHeaders(stable)))).toEqual({ kind: "stable", ...stable });
   });
@@ -46,6 +48,9 @@ describe("stable upload headers", () => {
   test("rejects metadata without capture identity", () => {
     expect(() => parseUploadHeaders(headers({ "x-capture-source": "framed" })))
       .toThrow(InvalidUploadHeadersError);
+    expect(() => parseUploadHeaders(headers({
+      "x-rehearsal-id": "018f0000-0000-4000-8000-000000000501",
+    }))).toThrow(InvalidUploadHeadersError);
   });
 
   test("rejects non-lowercase UUID-v4 capture IDs", () => {
@@ -67,6 +72,8 @@ describe("stable upload headers", () => {
       { ...identity, "x-frame-key": "../frame" },
       { ...identity, "x-config-revision-id": "-revision" },
       { ...identity, "x-frame-key": "a".repeat(129) },
+      { ...identity, "x-rehearsal-id": "018F0000-0000-4000-8000-000000000501" },
+      { ...identity, "x-rehearsal-id": "../rehearsal" },
     ]) {
       expect(() => parseUploadHeaders(headers(invalid))).toThrow(InvalidUploadHeadersError);
     }
