@@ -51,6 +51,22 @@ function request(path: string, init: RequestOptions = {}): NextRequest {
   });
 }
 
+function rawJsonRequest(
+  path: string,
+  method: "POST" | "PUT",
+  body: string,
+  key = ADMIN_KEY
+): NextRequest {
+  return new NextRequest(`https://app.test${path}`, {
+    method,
+    headers: {
+      "content-type": "application/json",
+      "x-booth-key": key,
+    },
+    body,
+  });
+}
+
 function controlDeps(options: { adminKey?: string } = {}) {
   const state = new InMemoryObjectStore();
   const store = new EventStore(
@@ -90,7 +106,190 @@ class OpaqueCursorStore extends EventStore {
   }
 }
 
+type QueryHandlerCase = {
+  name: string;
+  missingAdminRegression?: boolean;
+  wrongCredentialRegression?: boolean;
+  invoke: (
+    query: string,
+    deps: BoothControlHandlerDeps,
+    key?: string
+  ) => Promise<Response>;
+};
+
+const queryHandlerCases: QueryHandlerCase[] = [
+  {
+    name: "preflight",
+    wrongCredentialRegression: true,
+    invoke: (query, deps, key = ADMIN_KEY) => postBoothPreflight(request(
+      `/api/booth/preflight?${query}`,
+      { method: "POST", headers: { "x-booth-key": key } }
+    ), deps),
+  },
+  {
+    name: "heartbeat",
+    missingAdminRegression: true,
+    wrongCredentialRegression: true,
+    invoke: (query, deps, key = ADMIN_KEY) => postBoothHeartbeat(request(
+      `/api/booths?${query}`,
+      { method: "POST", headers: { "x-booth-key": key }, body: heartbeat }
+    ), deps),
+  },
+  {
+    name: "Booth list",
+    missingAdminRegression: true,
+    wrongCredentialRegression: true,
+    invoke: (query, deps, key = ADMIN_KEY) => getBoothHeartbeats(request(
+      `/api/booths?${query}`,
+      { headers: { "x-booth-key": key } }
+    ), deps),
+  },
+  {
+    name: "public pause read",
+    invoke: (query, deps) => getBoothState(request(`/api/booth-state?${query}`), deps),
+  },
+  {
+    name: "pause mutation",
+    missingAdminRegression: true,
+    wrongCredentialRegression: true,
+    invoke: (query, deps, key = ADMIN_KEY) => putBoothState(request(
+      `/api/booth-state?${query}`,
+      { method: "PUT", headers: { "x-booth-key": key }, body: { paused: true } }
+    ), deps),
+  },
+];
+
+type JsonHandlerCase = {
+  name: string;
+  invoke: (req: NextRequest, deps: BoothControlHandlerDeps) => Promise<Response>;
+  method: "POST" | "PUT";
+  path: string;
+  oversizedBody: unknown;
+};
+
+const jsonHandlerCases: JsonHandlerCase[] = [
+  {
+    name: "heartbeat",
+    invoke: postBoothHeartbeat,
+    method: "POST",
+    path: "/api/booths?event=launch",
+    oversizedBody: { ...heartbeat, buildId: "x".repeat(16 * 1024) },
+  },
+  {
+    name: "pause mutation",
+    invoke: putBoothState,
+    method: "PUT",
+    path: "/api/booth-state?event=launch",
+    oversizedBody: { paused: true, messages: { en: "x".repeat(16 * 1024) } },
+  },
+];
+
 describe("Booth control handlers", () => {
+  for (const handlerCase of queryHandlerCases) {
+    test(`${handlerCase.name} rejects duplicate and unknown query keys`, async () => {
+      const controls = controlDeps();
+      const queries = [
+        "event=launch&event=launch",
+        "event=launch&unknown=value",
+      ];
+
+      for (const query of queries) {
+        expect((await handlerCase.invoke(query, controls.deps)).status).toBe(400);
+      }
+    });
+  }
+
+  test("Booth list rejects duplicate cursor and limit query keys", async () => {
+    const controls = controlDeps();
+    const queries = [
+      "event=launch&cursor=first&cursor=second",
+      "event=launch&limit=1&limit=100",
+    ];
+
+    for (const query of queries) {
+      expect((await getBoothHeartbeats(request(`/api/booths?${query}`, {
+        headers: { "x-booth-key": ADMIN_KEY },
+      }), controls.deps)).status).toBe(400);
+    }
+  });
+
+  for (const limit of [1, 100]) {
+    test(`Booth list accepts the exact ${limit} limit boundary`, async () => {
+      const store = new OpaqueCursorStore(
+        new InMemoryObjectStore(),
+        new InMemoryObjectStore(),
+        "https://photos.example"
+      );
+      const response = await getBoothHeartbeats(request(
+        `/api/booths?event=launch&limit=${limit}`,
+        { headers: { "x-booth-key": ADMIN_KEY } }
+      ), { store, adminKey: ADMIN_KEY });
+
+      expect(response.status).toBe(200);
+      expect(store.receivedOptions).toEqual({ limit });
+    });
+  }
+
+  for (const limit of ["0", "101", "-1", "1.5", "01", "invalid"]) {
+    test(`Booth list rejects out-of-range limit ${limit}`, async () => {
+      const controls = controlDeps();
+      const response = await getBoothHeartbeats(request(
+        `/api/booths?event=launch&limit=${encodeURIComponent(limit)}`,
+        { headers: { "x-booth-key": ADMIN_KEY } }
+      ), controls.deps);
+
+      expect(response.status).toBe(400);
+    });
+  }
+
+  for (const handlerCase of jsonHandlerCases) {
+    test(`${handlerCase.name} rejects malformed JSON with 400`, async () => {
+      const controls = controlDeps();
+      const response = await handlerCase.invoke(
+        rawJsonRequest(handlerCase.path, handlerCase.method, "{"),
+        controls.deps
+      );
+
+      expect(response.status).toBe(400);
+    });
+
+    test(`${handlerCase.name} rejects oversized JSON with 413`, async () => {
+      const controls = controlDeps();
+      const response = await handlerCase.invoke(request(handlerCase.path, {
+        method: handlerCase.method,
+        headers: { "x-booth-key": ADMIN_KEY },
+        body: handlerCase.oversizedBody,
+      }), controls.deps);
+
+      expect(response.status).toBe(413);
+    });
+  }
+
+  test("authenticated Booth handlers consistently fail closed without the Admin secret", async () => {
+    const previous = process.env.ALLOW_KEYLESS;
+    process.env.ALLOW_KEYLESS = "1";
+    try {
+      const controls = controlDeps({ adminKey: undefined });
+      const cases = queryHandlerCases.filter(({ missingAdminRegression }) => missingAdminRegression);
+
+      for (const handlerCase of cases) {
+        expect((await handlerCase.invoke("event=launch", controls.deps)).status).toBe(503);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.ALLOW_KEYLESS;
+      else process.env.ALLOW_KEYLESS = previous;
+    }
+  });
+
+  test("authenticated Booth handlers reject wrong credentials", async () => {
+    const controls = await configuredDeps();
+    const cases = queryHandlerCases.filter(({ wrongCredentialRegression }) => wrongCredentialRegression);
+
+    for (const handlerCase of cases) {
+      expect((await handlerCase.invoke("event=launch", controls.deps, "wrong-key")).status).toBe(401);
+    }
+  });
+
   test("preflight accepts a matching Booth Key or the Admin Key", async () => {
     const controls = await configuredDeps();
     await controls.deps.store.writeBoothOperationalState("launch", {
