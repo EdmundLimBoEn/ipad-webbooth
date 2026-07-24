@@ -5,11 +5,14 @@ import { useParams } from "next/navigation";
 import QRCode from "qrcode";
 import { TEMPLATES } from "../../templates";
 import type { ConfigRevision, PublicEventConfig } from "../../event-config";
+import type { AdminBoothRecord, BoothOperationalState } from "../../booth-control";
 import {
   BoothKeyControls,
   FrameProgrammeControls,
   SaveConfigurationButton,
 } from "./admin-config-controls";
+import { boothOperationalStateInput, mergeBoothPages } from "./booth-operations";
+import { BoothOperationsPanel } from "./booth-operations-panel";
 import { ConfigHistoryPanel } from "./config-history-panel";
 import {
   clearRestoreRequestAfterReconciliation,
@@ -25,6 +28,7 @@ type Photo = { key: string; url: string; uploadedAt: string };
 type AuthState = "missing" | "ready" | "invalid";
 type Probe = { status: "up" | "degraded" | "down"; detail: string };
 type Health = { upload: Probe; live: Probe };
+type BoothPage = { booths: AdminBoothRecord[]; cursor: string | null };
 type FilePickerWindow = Window & { showSaveFilePicker?: (options: { suggestedName: string; types: { description: string; accept: Record<string, string[]> }[] }) => Promise<{ createWritable(): Promise<WritableStream<Uint8Array>> }> };
 const CONFIG_CONFLICT_MESSAGE = "Configuration changed; review the latest version before saving.";
 
@@ -56,7 +60,18 @@ export default function Admin() {
   const [copied, setCopied] = useState("");
   const [health, setHealth] = useState<Health | null>(null);
   const [checkingHealth, setCheckingHealth] = useState(false);
+  const [boothRecords, setBoothRecords] = useState<AdminBoothRecord[]>([]);
+  const [boothCursor, setBoothCursor] = useState<string | null>(null);
+  const [boothOperationalState, setBoothOperationalState] = useState<BoothOperationalState | null>(null);
+  const [boothStatusLoading, setBoothStatusLoading] = useState(false);
+  const [boothLoadingMore, setBoothLoadingMore] = useState(false);
+  const [boothMutationBusy, setBoothMutationBusy] = useState(false);
+  const [boothStatusError, setBoothStatusError] = useState(false);
+  const [boothMessageDraft, setBoothMessageDraft] = useState("");
   const photoCursor = useRef<string | null>(null);
+  const boothCursorRef = useRef<string | null>(null);
+  const boothRequestBusy = useRef(false);
+  const boothMessageEditing = useRef(false);
   const configMutationBusy = useRef(false);
   const pendingSaveMutationId = useRef<string | null>(null);
   const pendingRestoreRequests = useRef(new Map<string, RestoreRequest>());
@@ -68,6 +83,11 @@ export default function Admin() {
   const clearPendingSave = () => {
     pendingSaveMutationId.current = null;
     setError((current) => current === CONFIG_CONFLICT_MESSAGE ? "" : current);
+  };
+
+  const invalidateAuth = () => {
+    sessionStorage.removeItem("adminKey");
+    setAuth("invalid");
   };
 
   const runHealth = useCallback(async (key = adminKey) => {
@@ -159,6 +179,134 @@ export default function Admin() {
     }
   }, [event]);
 
+  const loadBoothStatus = useCallback(async () => {
+    if (boothRequestBusy.current) return;
+    boothRequestBusy.current = true;
+    setBoothStatusLoading(true);
+    setBoothStatusError(false);
+    try {
+      const stateUrl = `/api/booth-state?event=${encodeURIComponent(event)}`;
+      const devicesUrl = `/api/booths?event=${encodeURIComponent(event)}`;
+      const headers = { "x-booth-key": adminKey };
+      const [stateResult, devicesResult] = await Promise.allSettled([
+        fetch(stateUrl, { cache: "no-store", headers }),
+        fetch(devicesUrl, { cache: "no-store", headers }),
+      ]);
+
+      let failed = false;
+      if (stateResult.status === "rejected") {
+        failed = true;
+      } else if (stateResult.value.status === 401) {
+        invalidateAuth();
+        failed = true;
+      } else if (!stateResult.value.ok) {
+        failed = true;
+      } else {
+        const nextState = await stateResult.value.json() as BoothOperationalState;
+        setBoothOperationalState(nextState);
+        setBoothMessageDraft((current) => boothMessageEditing.current
+          ? current
+          : nextState.messages?.en ?? "");
+      }
+
+      if (devicesResult.status === "rejected") {
+        failed = true;
+      } else if (devicesResult.value.status === 401) {
+        invalidateAuth();
+        failed = true;
+      } else if (!devicesResult.value.ok) {
+        failed = true;
+      } else {
+        const page = await devicesResult.value.json() as BoothPage;
+        if (!Array.isArray(page.booths) || (page.cursor !== null && typeof page.cursor !== "string")) {
+          failed = true;
+        } else {
+          setBoothRecords((current) => mergeBoothPages(current, page.booths));
+          boothCursorRef.current = page.cursor;
+          setBoothCursor(page.cursor);
+        }
+      }
+      setBoothStatusError(failed);
+    } catch {
+      setBoothStatusError(true);
+    } finally {
+      boothRequestBusy.current = false;
+      setBoothStatusLoading(false);
+    }
+  }, [adminKey, event]);
+
+  const loadMoreBooths = useCallback(async () => {
+    const cursor = boothCursorRef.current;
+    if (cursor === null || boothRequestBusy.current) return;
+    boothRequestBusy.current = true;
+    setBoothLoadingMore(true);
+    setBoothStatusError(false);
+    try {
+      const query = new URLSearchParams({ event, cursor });
+      const response = await fetch(`/api/booths?${query}`, {
+        cache: "no-store",
+        headers: { "x-booth-key": adminKey },
+      });
+      if (response.status === 401) {
+        invalidateAuth();
+        setBoothStatusError(true);
+        return;
+      }
+      if (!response.ok) {
+        setBoothStatusError(true);
+        return;
+      }
+      const page = await response.json() as BoothPage;
+      if (!Array.isArray(page.booths) || (page.cursor !== null && typeof page.cursor !== "string")) {
+        setBoothStatusError(true);
+        return;
+      }
+      setBoothRecords((current) => mergeBoothPages(current, page.booths));
+      boothCursorRef.current = page.cursor;
+      setBoothCursor(page.cursor);
+    } catch {
+      setBoothStatusError(true);
+    } finally {
+      boothRequestBusy.current = false;
+      setBoothLoadingMore(false);
+    }
+  }, [adminKey, event]);
+
+  const updateBoothOperationalState = useCallback(async (paused: boolean) => {
+    if (boothMutationBusy || !boothOperationalState) return;
+    setBoothMutationBusy(true);
+    setBoothStatusError(false);
+    try {
+      const response = await fetch(`/api/booth-state?event=${encodeURIComponent(event)}`, {
+        method: "PUT",
+        cache: "no-store",
+        headers: { "x-booth-key": adminKey, "content-type": "application/json" },
+        body: JSON.stringify(boothOperationalStateInput(
+          boothOperationalState.messages,
+          boothMessageDraft,
+          paused
+        )),
+      });
+      if (response.status === 401) {
+        invalidateAuth();
+        setBoothStatusError(true);
+        return;
+      }
+      if (!response.ok) {
+        setBoothStatusError(true);
+        return;
+      }
+      const nextState = await response.json() as BoothOperationalState;
+      setBoothOperationalState(nextState);
+      boothMessageEditing.current = false;
+      setBoothMessageDraft(nextState.messages?.en ?? "");
+    } catch {
+      setBoothStatusError(true);
+    } finally {
+      setBoothMutationBusy(false);
+    }
+  }, [adminKey, boothMessageDraft, boothMutationBusy, boothOperationalState, event]);
+
   useEffect(() => {
     photoCursor.current = null;
     void loadPhotos(true);
@@ -171,6 +319,27 @@ export default function Admin() {
     void loadConfig();
   }, [adminKey, auth, loadConfig]);
 
+  useEffect(() => {
+    if (auth !== "ready" || !adminKey) return;
+    boothCursorRef.current = null;
+    boothMessageEditing.current = false;
+    setBoothRecords([]);
+    setBoothCursor(null);
+    setBoothOperationalState(null);
+    setBoothStatusError(false);
+    let cancelled = false;
+    let nextPoll: number | undefined;
+    const poll = async () => {
+      await loadBoothStatus();
+      if (!cancelled) nextPoll = window.setTimeout(() => void poll(), 15_000);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (nextPoll !== undefined) window.clearTimeout(nextPoll);
+    };
+  }, [adminKey, auth, event, loadBoothStatus]);
+
   const authenticate = (submitEvent: FormEvent) => {
     submitEvent.preventDefault();
     const next = adminKey.trim();
@@ -180,11 +349,6 @@ export default function Admin() {
     setAuth("ready");
     setError("");
     void runHealth(next);
-  };
-
-  const invalidateAuth = () => {
-    sessionStorage.removeItem("adminKey");
-    setAuth("invalid");
   };
 
   const toggle = (key: string) => {
@@ -443,8 +607,27 @@ export default function Admin() {
             onRestore={(revisionId) => void restoreRevision(revisionId)}
           />
 
+          <BoothOperationsPanel
+            records={boothRecords}
+            cursor={boothCursor}
+            operationalState={boothOperationalState}
+            loading={boothStatusLoading}
+            loadingMore={boothLoadingMore}
+            mutationBusy={boothMutationBusy}
+            hasError={boothStatusError}
+            englishMessageDraft={boothMessageDraft}
+            onEnglishMessageChange={(message) => {
+              boothMessageEditing.current = true;
+              setBoothMessageDraft(message);
+            }}
+            onRefresh={() => void loadBoothStatus()}
+            onLoadMore={() => void loadMoreBooths()}
+            onPause={() => void updateBoothOperationalState(true)}
+            onResume={() => void updateBoothOperationalState(false)}
+          />
+
           <section className={styles.section}>
-            <div className={styles.sectionHead}><div><span>03</span><h2>Recent contact sheet</h2></div><p>{photos.length} photograph{photos.length === 1 ? "" : "s"} currently in this event.</p></div>
+            <div className={styles.sectionHead}><div><span>04</span><h2>Recent contact sheet</h2></div><p>{photos.length} photograph{photos.length === 1 ? "" : "s"} currently in this event.</p></div>
             {photosError && photos.length === 0 ? <div className={styles.failure}><strong>Photo feed unavailable</strong><p>{photosError}</p><button onClick={() => void loadPhotos(true)}>Retry photos</button></div> : photosLoaded && photos.length === 0 ?
               <div className={styles.emptySheet}><strong>No exposures yet.</strong><p>Open the booth link and take a test photo before doors open.</p></div> :
               <div className={styles.contactSheet}>{photos.slice(0, 16).map((photo) => <article key={photo.key} className={styles.contactPhoto}>
@@ -457,7 +640,7 @@ export default function Admin() {
 
         <aside className={styles.sideColumn}>
           <section className={styles.sideCard}>
-            <span className={styles.cardNumber}>04</span><h2>Booth credential</h2>
+            <span className={styles.cardNumber}>05</span><h2>Booth credential</h2>
             <p>{hasBoothKey ? "A booth key is installed. Generate a replacement only when rotating iPad access." : "No booth key yet. Generate one before the booth can upload."}</p>
             <BoothKeyControls
               value={boothKey}
