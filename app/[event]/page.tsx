@@ -41,6 +41,18 @@ import {
   type BoothPreflightResult,
 } from "./booth-session/lifecycle";
 import { BoothUnlock } from "./booth-unlock";
+import {
+  ScreenWakeController,
+  isStandalone,
+  shouldWarnBeforeUnload,
+  type WakeLockProviderLike,
+  type WakeRequestState,
+} from "./booth-session/installed-mode";
+import {
+  OperatorControls,
+  performVerifiedOperatorExit,
+  type OperatorExitResult,
+} from "./operator-controls";
 
 type Status = "starting" | "picking" | "ready" | "denied" | "running";
 type OperationalState = BoothOperationalClientState;
@@ -58,13 +70,6 @@ function uploadErrorClass(status: number): UploadErrorClass {
   if (status >= 500) return "server";
   if (status === 400 || status === 403 || status === 413 || status === 415) return "payload";
   return "unknown";
-}
-
-function isInstalled() {
-  if (typeof window === "undefined") return false;
-  const navigatorWithStandalone = navigator as Navigator & { standalone?: boolean };
-  return window.matchMedia("(display-mode: standalone)").matches
-    || navigatorWithStandalone.standalone === true;
 }
 
 function heartbeatCamera(status: Status, paused: boolean): BoothHeartbeatInput["camera"] {
@@ -123,9 +128,17 @@ export default function Booth() {
   const cameraRequestRef = useRef(0);
   const unmountedRef = useRef(false);
   const deviceIdRef = useRef("");
+  const credentialRef = useRef<BoothCredentialHolder | null>(null);
   const sessionStartedAtRef = useRef(0);
   const operationalRef = useRef<OperationalState>({ paused: false, connected: false });
   const uploadStateRef = useRef<UploadState>(INITIAL_UPLOAD_STATE);
+  const wakeController = useMemo(() => {
+    if (typeof navigator === "undefined") return new ScreenWakeController();
+    const provider = (navigator as Navigator & {
+      wakeLock?: WakeLockProviderLike;
+    }).wakeLock;
+    return new ScreenWakeController(provider);
+  }, []);
   const [status, setStatus] = useState<Status>("starting");
   const [accessState, setAccessState] = useState<BoothAccessState>("locked");
   const [accessFeedback, setAccessFeedback] =
@@ -148,6 +161,9 @@ export default function Booth() {
   const [online, setOnline] = useState(false);
   const [uploadState, setUploadState] =
     useState<UploadState>(INITIAL_UPLOAD_STATE);
+  const [wakeState, setWakeState] =
+    useState<WakeRequestState | "idle">("idle");
+  const [durableHandoffActive, setDurableHandoffActive] = useState(false);
   // Frames remain unavailable until authenticated preflight returns the safe
   // Event experience. `null` is never shown while the Booth is locked.
   const [enabled, setEnabled] = useState<string[] | null>(null);
@@ -209,6 +225,12 @@ export default function Booth() {
     streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
   }, []);
+
+  const requestWake = useCallback(async () => {
+    const next = await wakeController.request();
+    setWakeState(next);
+    return next;
+  }, [wakeController]);
 
   const clearFrame = useCallback(() => {
     setMode(null);
@@ -303,7 +325,10 @@ export default function Booth() {
             pendingCount: upload.pendingCount,
             durableStorage: upload.durable,
             online: navigator.onLine,
-            installed: isInstalled(),
+            installed: isStandalone(
+              window.matchMedia.bind(window),
+              (navigator as Navigator & { standalone?: boolean }).standalone
+            ),
             camera: operationalRef.current.paused ? "stopped" : "starting",
             upload: heartbeatUpload(upload),
             ...(heartbeatError("starting", null, upload) === undefined
@@ -321,13 +346,14 @@ export default function Booth() {
         heartbeatReporterRef.current?.stop();
         pauseBoundary.reset();
         stopCamera();
+        void wakeController.release().then(() => setWakeState("idle"));
       },
       onUploaded: ({ url }) => {
         setLastUrl(url);
         setLastSuccessfulUploadAt(Date.now());
       },
     }),
-    [applyOperationalState, pauseBoundary, startCamera, stopCamera]
+    [applyOperationalState, pauseBoundary, startCamera, stopCamera, wakeController]
   );
 
   useEffect(() => {
@@ -337,6 +363,32 @@ export default function Booth() {
       stopCamera();
     };
   }, [stopCamera]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (accessState !== "ready") return;
+      void wakeController.handleVisibilityChange(document.visibilityState)
+        .then((next) => {
+          if (next) setWakeState(next);
+        });
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [accessState, wakeController]);
+
+  useEffect(() => {
+    if (!shouldWarnBeforeUnload({
+      captureActive: status === "running",
+      durableHandoffActive,
+      pendingCount: uploadState.pendingCount,
+    })) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [durableHandoffActive, status, uploadState.pendingCount]);
 
   // grab the current video frame, mirrored to match the preview, at full res
   const grabFrame = useCallback((): HTMLCanvasElement => {
@@ -353,6 +405,7 @@ export default function Booth() {
 
   useEffect(() => {
     const credential: BoothCredentialHolder = { key: "" };
+    credentialRef.current = credential;
     const uploadOne = async (item: OutboxItem) => {
       const res = await fetch(`/api/upload?event=${encodeURIComponent(event)}`, {
         method: "POST",
@@ -422,6 +475,7 @@ export default function Booth() {
       document.removeEventListener("visibilitychange", reconsiderForeground);
       if (sessionRef.current === session) sessionRef.current = null;
       stopBoothOperationalClients(poller, reporter);
+      if (credentialRef.current === credential) credentialRef.current = null;
       if (statePollerRef.current === poller) statePollerRef.current = null;
       if (heartbeatReporterRef.current === reporter) heartbeatReporterRef.current = null;
       void lifecycle.leaveEvent(session);
@@ -439,7 +493,10 @@ export default function Booth() {
       pendingCount: uploadState.pendingCount,
       durableStorage: uploadState.durable,
       online,
-      installed: isInstalled(),
+      installed: isStandalone(
+        window.matchMedia.bind(window),
+        (navigator as Navigator & { standalone?: boolean }).standalone
+      ),
       camera: heartbeatCamera(status, operational.paused),
       upload: heartbeatUpload(uploadState),
       ...(lastSuccessfulUploadAt === null ? {} : { lastSuccessfulUploadAt }),
@@ -456,6 +513,7 @@ export default function Booth() {
   ]);
 
   const unlock = useCallback((key: string, remember: boolean) => {
+    void requestWake();
     saveBoothCredential(
       event,
       key,
@@ -464,7 +522,7 @@ export default function Booth() {
       window.localStorage
     );
     void lifecycle.unlock(key);
-  }, [event, lifecycle]);
+  }, [event, lifecycle, requestWake]);
 
   const retryPreflight = useCallback(() => {
     void lifecycle.retryPreflight();
@@ -491,6 +549,7 @@ export default function Booth() {
     const session = sessionRef.current;
     try {
       if (!session) throw new Error("Photo queue is still starting — please try again");
+      setDurableHandoffActive(true);
       await session.enqueueCapture(
         async (signal) => {
           const frames = await runCaptureSequence({
@@ -514,6 +573,7 @@ export default function Booth() {
           },
         }
       );
+      setDurableHandoffActive(false);
       if (controller.signal.aborted || !lifecycle.isActive(session)) return;
       // Durable handoff is complete. Return to the picker before uploading so
       // the next guest is never trapped on the previous guest's frame.
@@ -534,6 +594,7 @@ export default function Booth() {
         setStatus(streamRef.current ? "picking" : "denied");
       }
     } finally {
+      setDurableHandoffActive(false);
       if (captureRef.current === controller) captureRef.current = null;
     }
   }, [
@@ -564,6 +625,7 @@ export default function Booth() {
       const session = sessionRef.current;
       try {
         if (!session) throw new Error("Photo queue is still starting — please try again");
+        setDurableHandoffActive(true);
         await session.enqueueCapture(async (signal) => {
           if (signal?.aborted) throw new DOMException("Capture aborted", "AbortError");
           let blob: Blob = file;
@@ -586,6 +648,7 @@ export default function Booth() {
             source: "camera-fallback",
           },
         });
+        setDurableHandoffActive(false);
         if (controller.signal.aborted || !lifecycle.isActive(session)) return;
         setError(null);
         pauseBoundary.completeOperation();
@@ -595,6 +658,7 @@ export default function Booth() {
         setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
         pauseBoundary.completeOperation();
       } finally {
+        setDurableHandoffActive(false);
         if (captureRef.current === controller) captureRef.current = null;
       }
     },
@@ -607,13 +671,55 @@ export default function Booth() {
     setStatus("ready");
   };
 
+  const operatorExit = useCallback(async (
+    freshKey: string
+  ): Promise<OperatorExitResult> => performVerifiedOperatorExit(freshKey, {
+    verify: async (key) => {
+      const result = await requestBoothPreflight(
+        event,
+        key,
+        new AbortController().signal
+      );
+      return result.kind === "ready";
+    },
+    stopCamera,
+    releaseWake: async () => {
+      await wakeController.release();
+      setWakeState("idle");
+    },
+    stopHeartbeat: () => heartbeatReporterRef.current?.stop(),
+    stopPoller: () => statePollerRef.current?.stop(),
+    stopSession: async () => {
+      await sessionRef.current?.stop();
+    },
+    clearCredentials: () => clearBoothCredential(
+      event,
+      window.sessionStorage,
+      window.localStorage
+    ),
+    clearActiveCredential: () => {
+      if (credentialRef.current) credentialRef.current.key = "";
+    },
+    markExited: () => {
+      pauseBoundary.reset();
+      setDurableHandoffActive(false);
+      setEnabled(null);
+      setMode(null);
+      setStatus("starting");
+      setAccessFeedback("locked");
+      setAccessState("exited");
+    },
+  }), [event, pauseBoundary, stopCamera, wakeController]);
+
   // preview crops to the chosen frame's photo aspect (w/h of its first slot),
   // so guests see exactly what will be captured. Fullscreen until a mode is set.
   const previewAspect = mode ? TEMPLATES[mode].slots[0].w / TEMPLATES[mode].slots[0].h : null;
   const framed = mode !== null && status !== "picking";
 
   return (
-    <main className={styles.booth}>
+    <>
+      <link rel="manifest" href={`/${event}/manifest.webmanifest`} />
+      <main className={styles.booth}>
       {/* framed box is exactly the slot's aspect at the largest size that fits,
           so the cover-cropped preview is edge-to-edge what composite() captures */}
       <video
@@ -763,6 +869,38 @@ export default function Booth() {
           </div>
         </section>
       )}
-    </main>
+      {accessState === "ready" && (
+        <OperatorControls
+          event={event}
+          pendingCount={uploadState.pendingCount}
+          onOperatorGesture={() => {
+            void requestWake();
+          }}
+          onExit={operatorExit}
+        />
+      )}
+      {accessState === "ready"
+        && (wakeState === "unsupported" || wakeState === "denied") && (
+        <div className={styles.wakeFallback} role="status">
+          Screen Wake Lock is unavailable. In iPad Settings, set Display &amp;
+          Brightness → Auto-Lock to Never for Booth operation.
+        </div>
+      )}
+      {accessState === "exited" && (
+        <section className={styles.exited} aria-labelledby="booth-exited-title">
+          <div>
+            <p className={styles.operatorEyebrow}>Event operator · {event}</p>
+            <h1 id="booth-exited-title">Booth exited</h1>
+            <p>Camera and Booth activity are stopped.</p>
+            <strong>
+              {uploadState.pendingCount} pending photo
+              {uploadState.pendingCount === 1 ? "" : "s"} remain in the Photo Outbox.
+            </strong>
+            <p>Reload this canonical Event address to unlock the Booth again.</p>
+          </div>
+        </section>
+      )}
+      </main>
+    </>
   );
 }

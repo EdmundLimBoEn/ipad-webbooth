@@ -3,6 +3,11 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Photo Booth",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "Photo Booth",
+  },
 };
 
 // pinch-zoom stays enabled (accessibility; phone viewers zoom gallery photos)
