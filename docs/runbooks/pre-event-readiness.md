@@ -93,6 +93,40 @@ For moderation cleanup, first copy the complete throwaway image key and verify
 that it belongs to the staging Event. Delete only that exact key; never use a
 prefix, filename fragment, or production Event.
 
+## Post-event package rehearsal
+
+Use a throwaway canonical staging Event with a configured timezone and a
+fixture containing a current framed photo, a camera-fallback photo, a legacy
+photo without a receipt, and a removed/unknown historical Frame.
+
+1. Download the photo-only ZIP and confirm every photo remains at the archive
+   root with no generated entries.
+2. Download the enriched package and confirm it contains `photos/`,
+   `manifest.csv`, `summary.json`, and `contact-sheet.html`.
+3. Run `unzip -t <event>-package.zip` and require a clean result.
+4. Extract the package, disable networking, and open
+   `contact-sheet.html`. Confirm every image loads through its relative
+   `photos/` path.
+5. Open print preview and inspect the grid, page breaks, captions, and target
+   paper size.
+6. Import `manifest.csv` into Excel, Numbers, or Google Sheets and confirm
+   formula-looking fixture cells remain text.
+7. Compare the configured timezone, first/last capture, hourly and busiest
+   periods, Frame usage, byte totals, and metadata-coverage totals against the
+   fixture.
+8. Delete only one designated throwaway photo by its complete Event-owned key,
+   export again, and confirm it is absent from photos, manifest, summary, and
+   contact sheet.
+9. Search the extracted package for `photo-metadata`, `photo-index`, revision
+   IDs, Booth records, rehearsal evidence, health state, hashes, credentials,
+   and private storage prefixes. None may be present.
+
+The automated suite cannot certify native desktop file-picker streaming,
+production-like R2 behavior during a long response, spreadsheet application
+imports, offline extracted-file policy, or the operator's actual printer.
+Record those manual desktop/staging results before relying on the post-event
+package.
+
 ## Operational checks
 
 - Confirm the production and staging domains show the intended build and do not share Event data.

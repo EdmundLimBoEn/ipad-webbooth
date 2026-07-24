@@ -80,6 +80,30 @@ Only after recording a passing iPad rehearsal should you promote explicitly:
 bun run deploy:production
 ```
 
+### Release 5 staging export gate
+
+Use a canonical throwaway staging Event that is distinct from every production
+Event. Upload designated current and legacy canaries, including one missing a
+private receipt. Export the legacy photo-only ZIP and confirm its root-photo
+layout is unchanged. Export the enriched package, run `unzip -t`, and complete
+the offline contact-sheet, print-preview, spreadsheet, timezone/analytics, and
+private-data checks in `pre-event-readiness.md`.
+
+Delete only the designated staging canary by its complete Event-owned key.
+Export again and confirm that exact photo is absent from all package sections.
+Confirm neither export can return production photos and that no staging state
+is visible through the production Worker.
+
+- `413` is the single STORE ZIP/Worker safety limit. It is not permission to
+  delete stored photos; use photo-only export or arrange operator-assisted
+  splitting.
+- `422` means private photo metadata needs investigation. The compatibility
+  photo-only export remains available.
+- `503` is a retryable private/export infrastructure failure.
+- Never exercise large-Event limits by filling production storage.
+- Rollback changes Worker code only. It never deletes or rewrites `PHOTOS` or
+  `STATE`.
+
 After production deployment, verify the home page, Event config read/write, one exact-key throwaway upload/delete, incremental Live Gallery arrival, export, Worker logs, and the next health cron tick. The canary proves R2 write/read and public delivery; external uptime proves the Worker can be reached.
 
 ## Lazy legacy-state migration
