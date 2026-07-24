@@ -6,6 +6,7 @@ import {
   EventStore,
   InMemoryObjectStore,
   eventConfigKey,
+  eventConfigMutationKey,
   eventConfigRevisionKey,
   legacyEventConfigKey,
 } from "./event-store";
@@ -78,8 +79,16 @@ class GateFirstConfigHeadWriteStore extends InMemoryObjectStore {
   }
 }
 
-const eventConfigMutationKey = (event: string, mutationId: string) =>
-  `events/${event}/config-mutations/${mutationId}.json`;
+function stateWithUnfinishedMutation(mutationId: string): InMemoryObjectStore {
+  return new InMemoryObjectStore({
+    [eventConfigMutationKey("launch", mutationId)]: JSON.stringify({
+      version: 1,
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      boothKeyMutationFingerprint: null,
+    }),
+  });
+}
 
 describe("ObjectStore", () => {
   test("compareAndSwap rejects a stale etag", async () => {
@@ -198,9 +207,13 @@ describe("EventStore", () => {
     expect((await store.saveConfigRevision("launch", input)).idempotent).toBe(false);
     expect(await (await store.state.get(eventConfigMutationKey("launch", input.mutationId)))?.json<{
       version: number;
+      config: { frames: string[] };
+      baseRevisionId: string | null;
       boothKeyMutationFingerprint: null;
     }>()).toEqual({
       version: 1,
+      config: { frames: ["one"] },
+      baseRevisionId: null,
       boothKeyMutationFingerprint: null,
     });
     expect((await store.saveConfigRevision("launch", input)).idempotent).toBe(true);
@@ -295,8 +308,15 @@ describe("EventStore", () => {
     expect((await store.saveConfigRevision("launch", input)).idempotent).toBe(false);
     expect((await store.saveConfigRevision("launch", input)).idempotent).toBe(true);
     const intent = await state.get(eventConfigMutationKey("launch", mutationId));
-    expect(await intent?.json<{ version: number; boothKeyMutationFingerprint: string }>()).toEqual({
+    expect(await intent?.json<{
+      version: number;
+      config: { frames: string[] };
+      baseRevisionId: string | null;
+      boothKeyMutationFingerprint: string;
+    }>()).toEqual({
       version: 1,
+      config: { frames: ["one"] },
+      baseRevisionId: null,
       boothKeyMutationFingerprint: fingerprint,
     });
     expect(await intent!.text()).not.toContain("replacement-hash");
@@ -335,6 +355,52 @@ describe("EventStore", () => {
     const rejected = results.filter((result) => result.status === "rejected");
     expect(rejected).toHaveLength(1);
     expect(rejected[0]).toMatchObject({ reason: expect.any(ConfigMutationConflictError) });
+  });
+
+  test("an unfinished mutation intent rejects a changed experience without writing a revision", async () => {
+    const mutationId = "018f0000-0000-7000-8000-000000000027";
+    const state = stateWithUnfinishedMutation(mutationId);
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+
+    await expect(store.saveConfigRevision("launch", {
+      config: { frames: ["two"] },
+      baseRevisionId: null,
+      mutationId,
+    })).rejects.toBeInstanceOf(ConfigMutationConflictError);
+    expect(state.has(eventConfigRevisionKey("launch", mutationId))).toBe(false);
+    expect(state.has(eventConfigKey("launch"))).toBe(false);
+  });
+
+  test("an unfinished mutation intent rejects a changed base without writing a revision", async () => {
+    const mutationId = "018f0000-0000-7000-8000-000000000028";
+    const state = stateWithUnfinishedMutation(mutationId);
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+
+    await expect(store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: "018f0000-0000-7000-8000-000000000099",
+      mutationId,
+    })).rejects.toBeInstanceOf(ConfigMutationConflictError);
+    expect(state.has(eventConfigRevisionKey("launch", mutationId))).toBe(false);
+    expect(state.has(eventConfigKey("launch"))).toBe(false);
+  });
+
+  test("an unfinished identical mutation intent proceeds to the revision and head", async () => {
+    const mutationId = "018f0000-0000-7000-8000-000000000029";
+    const state = stateWithUnfinishedMutation(mutationId);
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+
+    const recovered = await store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      mutationId,
+    });
+    expect(recovered).toMatchObject({
+      config: { frames: ["one"], currentRevisionId: mutationId },
+      revision: { id: mutationId, parentRevisionId: null },
+      idempotent: false,
+    });
+    expect(state.has(eventConfigRevisionKey("launch", mutationId))).toBe(true);
   });
 
   test("invalid mutation IDs and credential fingerprints write nothing", async () => {
@@ -448,9 +514,13 @@ describe("EventStore", () => {
     expect(recovered.revision.parentRevisionId).not.toBeNull();
     expect(await (await state.get(eventConfigMutationKey("launch", input.mutationId)))?.json<{
       version: number;
+      config: { frames: string[] };
+      baseRevisionId: string | null;
       boothKeyMutationFingerprint: string;
     }>()).toEqual({
       version: 1,
+      config: { frames: ["new"] },
+      baseRevisionId: null,
       boothKeyMutationFingerprint: input.boothKeyMutationFingerprint,
     });
   });

@@ -31,6 +31,8 @@ type ConfigSaveInput = {
 };
 type ConfigMutationIntent = {
   version: typeof EVENT_CONFIG_VERSION;
+  config: EventExperience;
+  baseRevisionId: string | null;
   boothKeyMutationFingerprint: string | null;
 };
 
@@ -201,7 +203,7 @@ export const eventConfigRevisionPrefix = (event: string) =>
   `events/${event}/config-revisions/`;
 export const eventConfigRevisionKey = (event: string, id: string) =>
   `${eventConfigRevisionPrefix(event)}${id}.json`;
-const eventConfigMutationKey = (event: string, mutationId: string) =>
+export const eventConfigMutationKey = (event: string, mutationId: string) =>
   `events/${event}/config-mutations/${mutationId}.json`;
 export const legacyEventConfigKey = (event: string) => `_config/${event}.json`;
 export const eventPhotoPrefix = (event: string) => `${event}/`;
@@ -310,7 +312,13 @@ export class EventStore {
     if (!requested) throw new TypeError("invalid event configuration");
     const requestedExperience = configExperience(requested);
     const head = await this.readConfigHead(event);
-    await this.ensureConfigMutationIntent(event, input.mutationId, boothKeyMutationFingerprint);
+    await this.ensureConfigMutationIntent(
+      event,
+      input.mutationId,
+      requestedExperience,
+      input.baseRevisionId,
+      boothKeyMutationFingerprint
+    );
     const existing = await this.readRevision(event, input.mutationId);
 
     if (existing) {
@@ -490,10 +498,14 @@ export class EventStore {
   private async ensureConfigMutationIntent(
     event: string,
     mutationId: string,
+    config: EventExperience,
+    baseRevisionId: string | null,
     boothKeyMutationFingerprint: string | null
   ): Promise<void> {
     const intent: ConfigMutationIntent = {
       version: EVENT_CONFIG_VERSION,
+      config,
+      baseRevisionId,
       boothKeyMutationFingerprint,
     };
     const key = eventConfigMutationKey(event, mutationId);
@@ -513,7 +525,13 @@ export class EventStore {
     } catch {
       throw new ConfigMutationConflictError();
     }
-    if (!isConfigMutationIntent(value) || value.boothKeyMutationFingerprint !== boothKeyMutationFingerprint) {
+    const parsed = parseConfigMutationIntent(value);
+    if (
+      !parsed
+      || parsed.baseRevisionId !== baseRevisionId
+      || parsed.boothKeyMutationFingerprint !== boothKeyMutationFingerprint
+      || !sameExperience(parsed.config, config)
+    ) {
       throw new ConfigMutationConflictError();
     }
   }
@@ -626,18 +644,45 @@ function validateConfigMutationInput(input: ConfigSaveInput): string | null {
   return input.boothKeyMutationFingerprint ?? null;
 }
 
-function isConfigMutationIntent(value: unknown): value is ConfigMutationIntent {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+function parseConfigMutationIntent(value: unknown): ConfigMutationIntent | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const intent = value as Record<string, unknown>;
-  return Object.keys(intent).length === 2
-    && intent.version === EVENT_CONFIG_VERSION
-    && (
-      intent.boothKeyMutationFingerprint === null
-      || (
-        typeof intent.boothKeyMutationFingerprint === "string"
-        && BOOTH_KEY_MUTATION_FINGERPRINT.test(intent.boothKeyMutationFingerprint)
+  if (
+    Object.keys(intent).length !== 4
+    || intent.version !== EVENT_CONFIG_VERSION
+    || (
+      intent.baseRevisionId !== null
+      && !isRevisionId(intent.baseRevisionId)
+    )
+    || (
+      intent.boothKeyMutationFingerprint !== null
+      && (
+        typeof intent.boothKeyMutationFingerprint !== "string"
+        || !BOOTH_KEY_MUTATION_FINGERPRINT.test(intent.boothKeyMutationFingerprint)
       )
-    );
+    )
+    || !intent.config
+    || typeof intent.config !== "object"
+    || Array.isArray(intent.config)
+  ) {
+    return null;
+  }
+  const rawConfig = intent.config as Record<string, unknown>;
+  if (
+    "version" in rawConfig
+    || "boothKeyHash" in rawConfig
+    || "currentRevisionId" in rawConfig
+  ) {
+    return null;
+  }
+  const parsed = parseEventConfig({ version: EVENT_CONFIG_VERSION, ...rawConfig });
+  if (!parsed) return null;
+  return {
+    version: EVENT_CONFIG_VERSION,
+    config: configExperience(parsed),
+    baseRevisionId: intent.baseRevisionId as string | null,
+    boothKeyMutationFingerprint: intent.boothKeyMutationFingerprint as string | null,
+  };
 }
 
 function memoryBytes(value: ArrayBuffer | ArrayBufferView | string): Uint8Array {
