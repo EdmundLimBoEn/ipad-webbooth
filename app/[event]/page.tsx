@@ -7,8 +7,17 @@ import { TEMPLATES, availableTemplates, composite } from "../templates";
 import { createOutboxStore, type OutboxItem } from "./booth-session/outbox";
 import { BoothSession, runCaptureSequence, type UploadState } from "./booth-session/session";
 import { outboxUploadHeaders } from "./booth-session/upload";
+import { HttpUploadError, type UploadErrorClass } from "./booth-session/retry-policy";
 
 type Status = "starting" | "picking" | "ready" | "denied" | "running";
+
+function uploadErrorClass(status: number): UploadErrorClass {
+  if (status === 401) return "auth";
+  if (status === 408 || status === 425 || status === 429) return "timeout";
+  if (status >= 500) return "server";
+  if (status === 400 || status === 403 || status === 413 || status === 415) return "payload";
+  return "unknown";
+}
 
 export default function Booth() {
   const { event } = useParams<{ event: string }>();
@@ -123,32 +132,58 @@ export default function Booth() {
         },
         body: item.blob,
       });
-      if (res.status === 401) {
-        localStorage.removeItem(storageKey);
-        keyRef.current = "";
-        throw new Error("Wrong booth key — tap Retry to re-enter it");
+      if (!res.ok) {
+        throw new HttpUploadError(
+          res.status,
+          res.headers.get("retry-after"),
+          uploadErrorClass(res.status)
+        );
       }
-      if (!res.ok) throw new Error(`Upload failed (${res.status}) — tap Retry`);
       return res.json() as Promise<{ url: string; key?: string; duplicate?: boolean }>;
     },
-    [event, storageKey]
+    [event]
   );
 
   useEffect(() => {
+    let active = true;
     const session = new BoothSession(
       event,
       createOutboxStore(),
       uploadOne,
-      ({ url }) => setLastUrl(url)
+      ({ url }) => setLastUrl(url),
+      undefined,
+      undefined,
+      {
+        onAuthRequired: () => {
+          // Keep the existing credential lifecycle: clear the rejected Booth
+          // Key and let the retained manual Retry control prompt for a new one.
+          localStorage.removeItem(storageKey);
+          keyRef.current = "";
+        },
+      }
     );
     sessionRef.current = session;
     const unsubscribe = session.subscribe(setUploadState);
-    void session.recover().then(() => session.process());
-    return () => {
-      unsubscribe();
-      if (sessionRef.current === session) sessionRef.current = null;
+    const reconsiderConnectivity = () => void session.reconsider("connectivity");
+    const reconsiderForeground = () => {
+      if (document.visibilityState === "visible") void session.reconsider("foreground");
     };
-  }, [event, uploadOne]);
+    window.addEventListener("online", reconsiderConnectivity);
+    document.addEventListener("visibilitychange", reconsiderForeground);
+    // Task 4 will add strict preflight. Until then, recovery plus the existing
+    // Booth Key lifecycle is the only available start condition.
+    void session.recover().then(() => {
+      if (active) void session.start();
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+      window.removeEventListener("online", reconsiderConnectivity);
+      document.removeEventListener("visibilitychange", reconsiderForeground);
+      if (sessionRef.current === session) sessionRef.current = null;
+      void session.stop();
+    };
+  }, [event, storageKey, uploadOne]);
 
   const retryUpload = useCallback(() => {
     if (!uploadState.pendingCount) return;

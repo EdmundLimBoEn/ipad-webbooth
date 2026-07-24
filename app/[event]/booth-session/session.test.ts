@@ -2,9 +2,114 @@ import { describe, expect, test } from "bun:test";
 import { createOutboxStore, MemoryOutboxStore, type OutboxItem } from "./outbox";
 import { BoothSession, runCaptureSequence } from "./session";
 import { outboxUploadHeaders } from "./upload";
+import { HttpUploadError } from "./retry-policy";
 
 const photo = (name: string) => new Blob([name], { type: "image/jpeg" });
 const text = (blob: Blob) => blob.text();
+
+class ManualScheduler {
+  private nextId = 0;
+  readonly timers = new Map<number, { callback: () => void; delayMs: number }>();
+
+  setTimer = (callback: () => void, delayMs: number) => {
+    const id = ++this.nextId;
+    this.timers.set(id, { callback, delayMs });
+    return id;
+  };
+
+  clearTimer = (id: unknown) => {
+    this.timers.delete(id as number);
+  };
+
+  runNext() {
+    const next = [...this.timers.entries()].sort((a, b) => a[0] - b[0])[0];
+    if (!next) throw new Error("No scheduled BoothSession wake");
+    this.timers.delete(next[0]);
+    next[1].callback();
+    return next[1].delayMs;
+  }
+}
+
+function versionOneIndexedDb(rows: OutboxItem[]) {
+  const names = new Set(["photo-outbox"]);
+  const openedVersions: number[] = [];
+  const createdStores: string[] = [];
+  const oldOutboxWrites: string[] = [];
+
+  type FakeRequest<T> = {
+    result: T;
+    error: Error | null;
+    onsuccess: ((event: Event) => void) | null;
+    onerror: ((event: Event) => void) | null;
+  };
+  type FakeTransaction = {
+    oncomplete: ((event: Event) => void) | null;
+    onerror: ((event: Event) => void) | null;
+    onabort: ((event: Event) => void) | null;
+    objectStore: (name: string) => IDBObjectStore;
+  };
+
+  const transaction = (): IDBTransaction => {
+    const fake: FakeTransaction = {
+      oncomplete: null,
+      onerror: null,
+      onabort: null,
+      objectStore: () => ({
+        getAll: () => {
+          const request: FakeRequest<OutboxItem[]> = {
+            result: rows,
+            error: null,
+            onsuccess: null,
+            onerror: null,
+          };
+          queueMicrotask(() => {
+            request.onsuccess?.(new Event("success"));
+            queueMicrotask(() => fake.oncomplete?.(new Event("complete")));
+          });
+          return request as unknown as IDBRequest<OutboxItem[]>;
+        },
+        put: () => {
+          oldOutboxWrites.push("put");
+          throw new Error("v1 rows must not be rewritten during upgrade");
+        },
+        delete: () => {
+          oldOutboxWrites.push("delete");
+          throw new Error("v1 rows must not be deleted during upgrade");
+        },
+      } as unknown as IDBObjectStore),
+    };
+    return fake as unknown as IDBTransaction;
+  };
+  const database = {
+    objectStoreNames: { contains: (name: string) => names.has(name) },
+    createObjectStore: (name: string) => {
+      createdStores.push(name);
+      names.add(name);
+      return {} as IDBObjectStore;
+    },
+    transaction: () => transaction(),
+  } as unknown as IDBDatabase;
+  const factory = {
+    open: (_name: string, version?: number) => {
+      openedVersions.push(version ?? 0);
+      const request = {
+        result: database,
+        error: null as Error | null,
+        onupgradeneeded: null as ((event: Event) => void) | null,
+        onsuccess: null as ((event: Event) => void) | null,
+        onerror: null as ((event: Event) => void) | null,
+        onblocked: null as ((event: Event) => void) | null,
+      };
+      queueMicrotask(() => {
+        request.onupgradeneeded?.(new Event("upgradeneeded"));
+        queueMicrotask(() => request.onsuccess?.(new Event("success")));
+      });
+      return request as unknown as IDBOpenDBRequest;
+    },
+  } as unknown as IDBFactory;
+
+  return { factory, openedVersions, createdStores, oldOutboxWrites };
+}
 
 describe("BoothSession outbox", () => {
   test("reserves strictly increasing FIFO order across concurrent durable puts", async () => {
@@ -286,6 +391,402 @@ describe("BoothSession outbox", () => {
     expect(store.isDurable()).toBe(false);
     await store.remove(item.id);
     expect(await store.list("party")).toEqual([]);
+  });
+
+  test("upgrades IndexedDB v1 by adding only the lease store without rewriting old rows", async () => {
+    const legacy = {
+      id: "legacy",
+      event: "party",
+      blob: photo("legacy"),
+      createdAt: 1,
+      attempts: 2,
+      lastError: "offline",
+    };
+    const fake = versionOneIndexedDb([legacy]);
+    const store = createOutboxStore(fake.factory);
+
+    expect(await store.list("party")).toEqual([legacy]);
+    expect(fake.openedVersions).toEqual([2]);
+    expect(fake.createdStores).toEqual(["photo-outbox-leases"]);
+    expect(fake.oldOutboxWrites).toEqual([]);
+  });
+
+  test("persists retry eligibility and failure classification across Session reload", async () => {
+    const store = new MemoryOutboxStore();
+    let now = 10_000;
+    const first = new BoothSession(
+      "party",
+      store,
+      async () => {
+        throw new HttpUploadError(503, null, "server");
+      },
+      () => {},
+      () => "018f0000-0000-4000-8000-000000000001",
+      () => now,
+      { random: () => 0.5 }
+    );
+    await first.enqueueCapture(async () => photo("one"), {
+      metadata: { source: "camera-fallback" },
+    });
+    await first.process();
+
+    expect(await store.list("party")).toMatchObject([{
+      attempts: 1,
+      failureKind: "retryable",
+      errorClass: "server",
+      nextAttemptAt: 11_000,
+    }]);
+
+    const states: string[] = [];
+    const reloaded = new BoothSession(
+      "party",
+      store,
+      async () => ({ url: "/photo" }),
+      () => {},
+      undefined,
+      () => now
+    );
+    reloaded.subscribe((state) => states.push(`${state.status}:${state.error ?? ""}`));
+    await reloaded.recover();
+
+    expect(states.at(-1)).toBe("failed:upload failed with status 503");
+    expect(await store.list("party")).toMatchObject([{
+      failureKind: "retryable",
+      errorClass: "server",
+      nextAttemptAt: 11_000,
+    }]);
+  });
+
+  test("the oldest blocked item prevents later uploads until manual retry", async () => {
+    const store = new MemoryOutboxStore();
+    await store.put({
+      id: "oldest",
+      event: "party",
+      blob: photo("oldest"),
+      createdAt: 1,
+      attempts: 1,
+      lastError: "invalid payload",
+      failureKind: "permanent",
+      errorClass: "payload",
+    });
+    await store.put({
+      id: "later",
+      event: "party",
+      blob: photo("later"),
+      createdAt: 2,
+      attempts: 0,
+    });
+    const uploads: string[] = [];
+    const session = new BoothSession("party", store, async (item) => {
+      uploads.push(await text(item.blob));
+      return { url: "/photo" };
+    });
+
+    await session.process();
+    expect(uploads).toEqual([]);
+    expect((await store.list("party")).map((item) => item.id)).toEqual(["oldest", "later"]);
+
+    await session.retry();
+    expect(uploads).toEqual(["oldest", "later"]);
+    expect(await store.list("party")).toEqual([]);
+  });
+
+  test("connectivity and foreground wakes immediately reconsider an oldest retryable item", async () => {
+    for (const reason of ["connectivity", "foreground"] as const) {
+      const store = new MemoryOutboxStore();
+      await store.put({
+        id: `oldest-${reason}`,
+        event: "party",
+        blob: photo(reason),
+        createdAt: 1,
+        attempts: 1,
+        lastError: "offline",
+        nextAttemptAt: 50_000,
+        failureKind: "retryable",
+        errorClass: "network",
+      });
+      const uploads: string[] = [];
+      const session = new BoothSession(
+        "party",
+        store,
+        async (item) => {
+          uploads.push(await text(item.blob));
+          return { url: "/photo" };
+        },
+        () => {},
+        undefined,
+        () => 10_000
+      );
+
+      await session.start();
+      expect(uploads).toEqual([]);
+      await session.reconsider(reason);
+      expect(uploads).toEqual([reason]);
+      await session.stop();
+    }
+  });
+
+  test("automatic wakes retry the oldest retryable item when it becomes eligible", async () => {
+    const store = new MemoryOutboxStore();
+    const scheduler = new ManualScheduler();
+    let now = 1_000;
+    let uploads = 0;
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => {
+        uploads++;
+        if (uploads === 1) throw new TypeError("offline");
+        return { url: "/photo" };
+      },
+      () => {},
+      () => "018f0000-0000-4000-8000-000000000001",
+      () => now,
+      {
+        random: () => 0.5,
+        setTimer: scheduler.setTimer,
+        clearTimer: scheduler.clearTimer,
+        leaseTtlMs: 60_000,
+      }
+    );
+    await session.enqueueCapture(async () => photo("one"), {
+      metadata: { source: "camera-fallback" },
+    });
+
+    await session.start();
+    expect(uploads).toBe(1);
+    expect([...scheduler.timers.values()].map((timer) => timer.delayMs)).toContain(1_000);
+
+    now = 2_000;
+    scheduler.runNext();
+    await session.process();
+
+    expect(uploads).toBe(2);
+    expect(await store.list("party")).toEqual([]);
+    await session.stop();
+  });
+
+  test("permanent and auth failures do not automatically restart on environmental wakes", async () => {
+    for (const failureKind of ["permanent", "auth"] as const) {
+      const store = new MemoryOutboxStore();
+      await store.put({
+        id: failureKind,
+        event: "party",
+        blob: photo(failureKind),
+        createdAt: 1,
+        attempts: 1,
+        lastError: failureKind,
+        failureKind,
+        errorClass: failureKind === "auth" ? "auth" : "payload",
+      });
+      let uploads = 0;
+      const session = new BoothSession("party", store, async () => {
+        uploads++;
+        return { url: "/photo" };
+      });
+
+      await session.start();
+      await session.reconsider("connectivity");
+      await session.reconsider("foreground");
+      expect(uploads).toBe(0);
+      await session.stop();
+    }
+  });
+
+  test("persists auth failure before notifying the credential owner", async () => {
+    const store = new MemoryOutboxStore();
+    let persistedBeforeCallback = false;
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => {
+        throw new HttpUploadError(401, null, "auth");
+      },
+      () => {},
+      () => "018f0000-0000-4000-8000-000000000001",
+      () => 1_000,
+      {
+        onAuthRequired: async () => {
+          const [item] = await store.list("party");
+          persistedBeforeCallback =
+            item.failureKind === "auth" && item.errorClass === "auth";
+        },
+      }
+    );
+    await session.enqueueCapture(async () => photo("one"), {
+      metadata: { source: "camera-fallback" },
+    });
+
+    await session.process();
+
+    expect(persistedBeforeCallback).toBe(true);
+    expect(await store.list("party")).toMatchObject([{
+      attempts: 1,
+      failureKind: "auth",
+      errorClass: "auth",
+    }]);
+  });
+
+  test("one Event lease prevents two Sessions from draining simultaneously", async () => {
+    const store = new MemoryOutboxStore();
+    await store.put({
+      id: "one",
+      event: "party",
+      blob: photo("one"),
+      createdAt: 1,
+      attempts: 0,
+    });
+    let releaseUpload!: () => void;
+    const uploadBarrier = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+    let firstUploads = 0;
+    let secondUploads = 0;
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const first = new BoothSession(
+      "party",
+      store,
+      async () => {
+        firstUploads++;
+        firstStarted();
+        await uploadBarrier;
+        return { url: "/photo" };
+      },
+      () => {},
+      undefined,
+      () => 1_000,
+      { ownerId: "first" }
+    );
+    const second = new BoothSession(
+      "party",
+      store,
+      async () => {
+        secondUploads++;
+        return { url: "/photo" };
+      },
+      () => {},
+      undefined,
+      () => 1_000,
+      { ownerId: "second" }
+    );
+
+    const firstDrain = first.process();
+    await started;
+    await second.process();
+    expect(firstUploads).toBe(1);
+    expect(secondUploads).toBe(0);
+
+    releaseUpload();
+    await firstDrain;
+    await Promise.all([first.stop(), second.stop()]);
+  });
+
+  test("renews a long-running direct drain lease before another owner can acquire it", async () => {
+    const store = new MemoryOutboxStore();
+    const scheduler = new ManualScheduler();
+    let now = 0;
+    let releaseUpload!: () => void;
+    const uploadBlocked = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+    let uploadStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      uploadStarted = resolve;
+    });
+    await store.put({
+      id: "one",
+      event: "party",
+      blob: photo("one"),
+      createdAt: 1,
+      attempts: 0,
+    });
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => {
+        uploadStarted();
+        await uploadBlocked;
+        return { url: "/photo" };
+      },
+      () => {},
+      undefined,
+      () => now,
+      {
+        ownerId: "first",
+        leaseTtlMs: 100,
+        setTimer: scheduler.setTimer,
+        clearTimer: scheduler.clearTimer,
+      }
+    );
+
+    const drain = session.process();
+    await started;
+    expect([...scheduler.timers.values()].map((timer) => timer.delayMs)).toContain(50);
+
+    now = 50;
+    scheduler.runNext();
+    await Promise.resolve();
+    await Promise.resolve();
+    now = 101;
+    expect(await store.acquireLease("party", "second", now, 100)).toBe(false);
+
+    releaseUpload();
+    await drain;
+  });
+
+  test("an expired lease can be acquired by another owner and Events stay independent", async () => {
+    const store = new MemoryOutboxStore();
+
+    expect(await store.acquireLease("party", "first", 1_000, 500)).toBe(true);
+    expect(await store.acquireLease("party", "second", 1_499, 500)).toBe(false);
+    expect(await store.acquireLease("other", "second", 1_499, 500)).toBe(true);
+    expect(await store.acquireLease("party", "second", 1_500, 500)).toBe(true);
+    expect(await store.renewLease("party", "first", 1_501, 500)).toBe(false);
+    await store.releaseLease("party", "first");
+    expect(await store.acquireLease("party", "third", 1_600, 500)).toBe(false);
+    await store.releaseLease("party", "second");
+    expect(await store.acquireLease("party", "third", 1_600, 500)).toBe(true);
+  });
+
+  test("stop clears scheduled work and releases only its own lease", async () => {
+    const store = new MemoryOutboxStore();
+    const scheduler = new ManualScheduler();
+    await store.put({
+      id: "one",
+      event: "party",
+      blob: photo("one"),
+      createdAt: 1,
+      attempts: 1,
+      lastError: "offline",
+      nextAttemptAt: 50_000,
+      failureKind: "retryable",
+      errorClass: "network",
+    });
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => ({ url: "/photo" }),
+      () => {},
+      undefined,
+      () => 1_000,
+      {
+        ownerId: "first",
+        setTimer: scheduler.setTimer,
+        clearTimer: scheduler.clearTimer,
+      }
+    );
+
+    await session.start();
+    expect(scheduler.timers.size).toBe(1);
+    expect(await store.acquireLease("party", "second", 1_000, 30_000)).toBe(false);
+
+    await session.stop();
+
+    expect(scheduler.timers.size).toBe(0);
+    expect(await store.acquireLease("party", "second", 1_000, 30_000)).toBe(true);
   });
 });
 
