@@ -28,6 +28,7 @@ import {
   photoIndexRebuildCompleteKey,
   photoReceiptKey,
   eventPresetKey,
+  eventPresetIndexKey,
   eventPresetPrefix,
   type ListOptions,
   type ListResult,
@@ -213,6 +214,26 @@ class InstrumentedStateStore extends InMemoryObjectStore {
 
   resetReads(): void {
     this.reads = 0;
+  }
+}
+
+class PresetAccessStore extends InMemoryObjectStore {
+  gets = 0;
+  lists = 0;
+
+  override async get(key: string): Promise<StoredObjectBody | null> {
+    this.gets += 1;
+    return super.get(key);
+  }
+
+  override async list(options: ListOptions = {}): Promise<ListResult> {
+    this.lists += 1;
+    return super.list(options);
+  }
+
+  resetAccess(): void {
+    this.gets = 0;
+    this.lists = 0;
   }
 }
 
@@ -2556,6 +2577,7 @@ describe("EventStore", () => {
       });
       expect(state.has(eventPresetKey("launch"))).toBeTrue();
       expect((await state.list()).objects.map((object) => object.key)).toEqual([
+        eventPresetIndexKey("launch", "Launch"),
         "presets/launch.json",
       ]);
       expect((await photos.list()).objects).toEqual([]);
@@ -2570,6 +2592,8 @@ describe("EventStore", () => {
       expect(updated.updatedAt).toBe(now.toISOString());
       expect(updated.config.frames).toEqual(["strip"]);
       expect(await store.getEventPreset("launch")).toEqual(updated);
+      expect(state.has(eventPresetIndexKey("launch", "Launch"))).toBeFalse();
+      expect(state.has(eventPresetIndexKey("launch", "Launch updated"))).toBeTrue();
     });
 
     test("enforces create-only and exact observed update conflicts", async () => {
@@ -2627,11 +2651,32 @@ describe("EventStore", () => {
       await expect(store.listEventPresets({ limit: 0 })).rejects.toThrow("1 to 100");
       await expect(store.listEventPresets({ limit: 101 })).rejects.toThrow("1 to 100");
       await expect(store.listEventPresets({ cursor: "" })).rejects.toThrow("cursor");
+      await expect(store.listEventPresets({ cursor: "1" })).rejects.toThrow("cursor");
       expect(eventPresetPrefix()).toBe("presets/");
+    });
+
+    test("bounds list work to the requested sortable index page", async () => {
+      const state = new PresetAccessStore();
+      const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+      for (let index = 0; index < 101; index += 1) {
+        await store.putEventPreset(`preset-${index}`, {
+          label: `Label ${String(100 - index).padStart(3, "0")}`,
+          config: experience,
+          expectedUpdatedAt: null,
+        });
+      }
+      state.resetAccess();
+
+      const page = await store.listEventPresets({ limit: 1 });
+      expect(page.presets).toHaveLength(1);
+      expect(page.cursor).not.toBeNull();
+      expect(state.lists).toBe(1);
+      expect(state.gets).toBe(1);
     });
 
     test("fails explicitly for corrupt stored presets and never offers deletion", async () => {
       const state = new InMemoryObjectStore({
+        [eventPresetIndexKey("broken", "Broken")]: "{}",
         [eventPresetKey("broken")]: JSON.stringify({
           version: 2,
           id: "broken",

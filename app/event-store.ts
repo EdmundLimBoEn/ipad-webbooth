@@ -267,6 +267,16 @@ export const eventPresetKey = (presetId: string) => {
   return `presets/${presetId}.json`;
 };
 export const eventPresetPrefix = () => "presets/";
+const eventPresetIndexPrefix = () => `${eventPresetPrefix()}_index/v1/`;
+export const eventPresetIndexKey = (presetId: string, label: string) => {
+  if (!isPresetId(presetId)) throw new TypeError("invalid preset ID");
+  validatePresetLabel(label);
+  let encodedLabel = "";
+  for (let index = 0; index < label.length; index += 1) {
+    encodedLabel += label.charCodeAt(index).toString(16).padStart(4, "0");
+  }
+  return `${eventPresetIndexPrefix()}${encodedLabel}/${presetId}.json`;
+};
 export const legacyEventConfigKey = (event: string) => `_config/${event}.json`;
 export const eventPhotoPrefix = (event: string) => `${event}/`;
 export const stablePhotoKey = (event: string, id: StableCaptureIdentity) =>
@@ -352,40 +362,43 @@ export type PutEventPresetInput = {
   expectedUpdatedAt: string | null;
 };
 
-type EventPresetCursor = Pick<EventPreset, "label" | "id">;
 const EVENT_PRESET_CURSOR_PREFIX = "preset-v1:";
 
-function compareEventPresets(left: EventPresetCursor, right: EventPresetCursor): number {
-  if (left.label < right.label) return -1;
-  if (left.label > right.label) return 1;
-  if (left.id < right.id) return -1;
-  if (left.id > right.id) return 1;
-  return 0;
+function parseEventPresetIndexKey(
+  key: string,
+): Pick<EventPreset, "label" | "id"> | null {
+  const prefix = eventPresetIndexPrefix();
+  if (!key.startsWith(prefix)) return null;
+  const match = /^([0-9a-f]+)\/([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.json$/.exec(
+    key.slice(prefix.length),
+  );
+  if (!match || match[1]!.length % 4 !== 0) return null;
+  let label = "";
+  for (let offset = 0; offset < match[1]!.length; offset += 4) {
+    label += String.fromCharCode(Number.parseInt(match[1]!.slice(offset, offset + 4), 16));
+  }
+  try {
+    validatePresetLabel(label);
+  } catch {
+    return null;
+  }
+  const id = match[2]!;
+  return eventPresetIndexKey(id, label) === key ? { label, id } : null;
 }
 
-function encodeEventPresetCursor(preset: EventPresetCursor): string {
-  return `${EVENT_PRESET_CURSOR_PREFIX}${encodeURIComponent(preset.label)}:${preset.id}`;
+function encodeEventPresetCursor(afterIndexKey: string): string {
+  return `${EVENT_PRESET_CURSOR_PREFIX}${afterIndexKey}`;
 }
 
-function parseEventPresetCursor(value: string): EventPresetCursor {
+function parseEventPresetCursor(value: string): string {
   if (!value.startsWith(EVENT_PRESET_CURSOR_PREFIX)) {
     throw new TypeError("preset cursor is invalid");
   }
-  const payload = value.slice(EVENT_PRESET_CURSOR_PREFIX.length);
-  const separator = payload.lastIndexOf(":");
-  if (separator <= 0) throw new TypeError("preset cursor is invalid");
-  const encodedLabel = payload.slice(0, separator);
-  const id = payload.slice(separator + 1);
-  try {
-    const label = decodeURIComponent(encodedLabel);
-    validatePresetLabel(label);
-    if (encodeURIComponent(label) !== encodedLabel || !isPresetId(id)) {
-      throw new TypeError("preset cursor is invalid");
-    }
-    return { label, id };
-  } catch {
+  const afterIndexKey = value.slice(EVENT_PRESET_CURSOR_PREFIX.length);
+  if (!parseEventPresetIndexKey(afterIndexKey)) {
     throw new TypeError("preset cursor is invalid");
   }
+  return afterIndexKey;
 }
 
 export class ConfigConflictError extends Error {
@@ -562,44 +575,29 @@ export class EventStore {
     ) {
       throw new TypeError("preset cursor is invalid");
     }
-    const after = options.cursor === undefined
-      ? null
+    const afterIndexKey = options.cursor === undefined
+      ? undefined
       : parseEventPresetCursor(options.cursor);
+    const page = await this.state.list({
+      prefix: eventPresetIndexPrefix(),
+      ...(afterIndexKey !== undefined ? { startAfter: afterIndexKey } : {}),
+      limit,
+    });
     const presets: EventPreset[] = [];
-    let storageCursor: string | undefined;
-    do {
-      const page = await this.state.list({
-        prefix: eventPresetPrefix(),
-        ...(storageCursor !== undefined ? { cursor: storageCursor } : {}),
-        limit: PAGE_SIZE,
-      });
-      const pagePresets = await Promise.all(page.objects.map(async (listed) => {
-        const match = /^presets\/([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.json$/.exec(
-          listed.key,
-        );
-        if (!match) throw new InvalidStoredEventPresetError(listed.key);
-        const object = await this.state.get(listed.key);
-        if (!object) throw new InvalidStoredEventPresetError(match[1]!);
-        return this.readEventPresetObject(match[1]!, object);
-      }));
-      presets.push(...pagePresets);
-      if (!page.truncated) {
-        storageCursor = undefined;
-        break;
-      }
-      if (!page.cursor) throw new InvalidStoredEventPresetError(eventPresetPrefix());
-      storageCursor = page.cursor;
-    } while (storageCursor !== undefined);
-
-    presets.sort(compareEventPresets);
-    const remaining = after === null
-      ? presets
-      : presets.filter((preset) => compareEventPresets(preset, after) > 0);
-    const result = remaining.slice(0, limit);
+    let lastScannedKey: string | null = null;
+    for (const listed of page.objects) {
+      lastScannedKey = listed.key;
+      const index = parseEventPresetIndexKey(listed.key);
+      if (!index) throw new InvalidStoredEventPresetError(listed.key);
+      const object = await this.state.get(eventPresetKey(index.id));
+      if (!object) continue;
+      const preset = await this.readEventPresetObject(index.id, object);
+      if (preset.label === index.label) presets.push(preset);
+    }
     return {
-      presets: result,
-      cursor: remaining.length > limit
-        ? encodeEventPresetCursor(result[result.length - 1]!)
+      presets,
+      cursor: page.truncated && lastScannedKey !== null
+        ? encodeEventPresetCursor(lastScannedKey)
         : null,
     };
   }
@@ -648,6 +646,12 @@ export class EventStore {
       updatedAt: serverTime,
       config,
     };
+    const indexKey = eventPresetIndexKey(presetId, label);
+    await this.state.put(
+      indexKey,
+      JSON.stringify({ version: EVENT_PRESET_VERSION, id: presetId, label }),
+      jsonWriteOptions(),
+    );
     const written = await this.state.compareAndSwap(
       key,
       currentObject?.etag ?? null,
@@ -656,11 +660,27 @@ export class EventStore {
     );
     if (!written) {
       const raced = await this.getEventPreset(presetId);
+      if (raced?.label !== label) {
+        try {
+          await this.state.delete(indexKey);
+        } catch {
+          // A stale private index entry is harmless and bounded list paging
+          // skips it after checking the authoritative preset.
+        }
+      }
       throw new PresetConflictError(
         presetId,
         input.expectedUpdatedAt,
         raced?.updatedAt ?? null,
       );
+    }
+    if (current && current.label !== label) {
+      try {
+        await this.state.delete(eventPresetIndexKey(presetId, current.label));
+      } catch {
+        // The new authoritative preset and index are already durable. A stale
+        // exact index entry is skipped by listEventPresets.
+      }
     }
     return preset;
   }

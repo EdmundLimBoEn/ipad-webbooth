@@ -85,6 +85,7 @@ describe("Event presets", () => {
     expect(parseEventPreset({ ...storedPreset, id: "../launch" })).toBeNull();
     expect(parseEventPreset({ ...storedPreset, label: "   " })).toBeNull();
     expect(parseEventPreset({ ...storedPreset, label: "x".repeat(81) })).toBeNull();
+    expect(parseEventPreset({ ...storedPreset, label: "\ud800" })).toBeNull();
     expect(parseEventPreset({ ...storedPreset, boothKeyHash: "leak" })).toBeNull();
     expect(parseEventPreset({ ...storedPreset, config: { frames: ["bad/frame"] } })).toBeNull();
   });
