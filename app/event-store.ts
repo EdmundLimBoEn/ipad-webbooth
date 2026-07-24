@@ -24,6 +24,8 @@ const PAGE_SIZE = 1000;
 const BOOTH_KEY_MUTATION_FINGERPRINT = /^[0-9a-f]{64}$/;
 const PHOTO_FEED_VERSION = 1 as const;
 const PHOTO_FEED_APPEND_ATTEMPTS = 16;
+const PHOTO_FEED_PAGE_SIZE = 1000;
+const PHOTO_FEED_SEQUENCE_WIDTH = 16;
 
 type StoredEventConfig = EventConfig & { version: typeof EVENT_CONFIG_VERSION };
 type ConfigSaveInput = {
@@ -234,14 +236,19 @@ export const photoIndexKey = (event: string, key: string, sortTime: number) =>
 export const photoFeedHeadKey = (event: string) => `events/${event}/photo-feed/v1/head.json`;
 const photoFeedEntryKey = (event: string, key: string) =>
   `events/${event}/photo-feed/v1/entries/${base64url(key)}.json`;
-const photoFeedCommitKey = (event: string, key: string) =>
-  `events/${event}/photo-feed/v1/commits/${base64url(key)}.json`;
+export const photoFeedMarkerKey = (event: string, key: string) =>
+  `events/${event}/photo-feed/v1/markers/${base64url(key)}.json`;
+export const photoFeedCommittedKey = (event: string, sequence: number) =>
+  `events/${event}/photo-feed/v1/committed/${String(sequence).padStart(PHOTO_FEED_SEQUENCE_WIDTH, "0")}.json`;
 const photoFeedNodePrefix = (event: string) => `events/${event}/photo-feed/v1/nodes/`;
 const photoFeedNodeKey = (event: string) =>
   `${photoFeedNodePrefix(event)}${crypto.randomUUID()}.json`;
 
 function isPhotoKey(event: string, key: string): boolean {
-  return key.startsWith(eventPhotoPrefix(event)) && /\.(?:jpe?g|png|gif|webp|hei[cf]|avif)$/i.test(key);
+  const prefix = eventPhotoPrefix(event);
+  if (!key.startsWith(prefix)) return false;
+  const filename = key.slice(prefix.length);
+  return /^[^/\\?#]+\.(?:jpe?g|png|gif|webp|hei[cf]|avif)$/i.test(filename);
 }
 
 export type Photo = { key: string; url: string; uploadedAt: Date };
@@ -567,54 +574,71 @@ export class EventStore {
 
   async listPhotos(event: string, after: string | null = null): Promise<PhotoFeed> {
     if (after === null) return this.initialPhotoFeed(event);
+    if (isPhotoKey(event, after)) {
+      // One-release compatibility bridge: a Gallery already open during the
+      // deploy may still hold the former raw complete-key cursor. Rebase it
+      // through one safe initial snapshot and return the new sequence cursor.
+      // Structural ownership is sufficient: moderation may already have
+      // deleted the exact photo while that Gallery still held its old cursor.
+      return this.initialPhotoFeed(event);
+    }
     return this.incrementalPhotoFeed(event, parsePhotoFeedCursor(event, after));
   }
 
   /**
    * The initial scan remains the compatibility path for photos created before
-   * the private arrival feed existed. Capture a feed waterline first, then
-   * omit any image committed after it so the immediate delta returns it once.
+   * the private arrival feed existed. Capture the sequence waterline first.
+   * A photo racing the public scan may also arrive in the immediate delta;
+   * clients already deduplicate exact keys, while omission would risk a miss.
    */
   private async initialPhotoFeed(event: string): Promise<PhotoFeed> {
     const waterline = await this.readPhotoFeedHead(event);
-    const objects = await this.listEventPhotoObjects(event);
-    const current = await this.readPhotoFeedHead(event);
-    const afterWaterline = new Set(
-      (await this.photoFeedNodesAfter(event, current.head.nodeKey, waterline.head.nodeKey))
-        .map((node) => node.entryKey)
-    );
-    const visible = objects
-      .filter((object) => !afterWaterline.has(photoFeedEntryKey(event, object.key)))
-      .sort(newestPublicObjectFirst);
+    const visible = (await this.listEventPhotoObjects(event)).sort(newestPublicObjectFirst);
 
     return {
       photos: visible.map((object) => this.toPhoto(object)),
-      cursor: encodePhotoFeedCursor(event, waterline.head.nodeKey),
+      cursor: encodePhotoFeedCursor(event, waterline.head.sequence),
       unchanged: visible.length === 0,
       truncated: false,
     };
   }
 
-  /** Deltas traverse only private arrival nodes and the exact public images. */
+  /** Deltas read a bounded contiguous sequence page and exact public images. */
   private async incrementalPhotoFeed(event: string, cursor: PhotoFeedCursor): Promise<PhotoFeed> {
     const current = await this.readPhotoFeedHead(event);
-    const nodes = await this.photoFeedNodesAfter(event, current.head.nodeKey, cursor.nodeKey);
+    if (cursor.sequence > current.head.sequence) throw new InvalidPhotoCursorError();
+    let previous = await this.validatePhotoFeedCursorProof(event, cursor.sequence, current.head);
+    let advancedSequence = cursor.sequence;
     const photos: Photo[] = [];
-    const seen = new Set<string>();
-    for (const node of nodes) {
-      const entry = await this.readPhotoFeedEntry(event, node.entryKey);
-      if (seen.has(entry.key)) continue;
-      seen.add(entry.key);
+    const upperSequence = Math.min(
+      current.head.sequence,
+      cursor.sequence + PHOTO_FEED_PAGE_SIZE
+    );
+
+    for (let sequence = cursor.sequence + 1; sequence <= upperSequence; sequence += 1) {
+      const committed = await this.readPhotoFeedCommitted(event, sequence);
+      // Head CAS happens before the exact committed record. Never advance
+      // across that short repair window or a later repair would be skipped.
+      if (!committed) break;
+      const { entry, node } = await this.validateCommittedArrival(event, committed);
+      if (
+        (previous === null && node.previousNodeKey !== null)
+        || (previous !== null && node.previousNodeKey !== previous.nodeKey)
+      ) {
+        throw new InvalidStoredPhotoFeedError(event);
+      }
       const object = await this.photos.get(entry.key);
-      // Exact-key deletion or a stale record must never resurrect an image.
-      if (!object || !isPhotoKey(event, object.key)) continue;
-      photos.push(this.toPhoto(object));
+      if (object && isPhotoKey(event, object.key)) photos.push(this.toPhoto(object));
+      advancedSequence = sequence;
+      previous = committed;
     }
+
+    photos.reverse();
     return {
       photos,
-      cursor: encodePhotoFeedCursor(event, current.head.nodeKey),
+      cursor: encodePhotoFeedCursor(event, advancedSequence),
       unchanged: photos.length === 0,
-      truncated: false,
+      truncated: advancedSequence < current.head.sequence,
     };
   }
 
@@ -635,9 +659,9 @@ export class EventStore {
 
   /**
    * Creates one immutable entry per public key, then atomically appends an
-   * immutable linked node by CASing the Event head. The normal lost-ack path
-   * reads the per-photo commit marker in O(1); a chain walk happens only when
-   * recovering a successful head CAS whose marker write was interrupted.
+   * immutable linked node by CASing the Event head. A sequence-derived exact
+   * committed record makes paging bounded. The per-photo marker is only an
+   * O(1) lookup hint and must prove itself against committed state.
    */
   private async ensurePhotoFeedRecord(
     event: string,
@@ -657,22 +681,21 @@ export class EventStore {
       if (existing.key !== key || !samePrivatePhotoMetadata(existing.metadata, metadata)) {
         throw new InvalidStoredPhotoFeedError(event);
       }
-      const committed = await this.readPhotoFeedCommit(event, key);
-      if (committed) return;
-      // A prior request might have advanced the head and then lost its marker
-      // write. Recover that exact node before ever attempting a new append.
-      const head = await this.readPhotoFeedHead(event);
-      const recovered = await this.findPhotoFeedEntryNode(event, head.head.nodeKey, entryKey);
-      if (recovered) {
-        await this.writePhotoFeedCommit(event, key, recovered);
-        return;
-      }
+    }
+
+    if (await this.hasValidPhotoFeedMarker(event, key, entryKey)) return;
+    if (!entryCreated && await this.recoverPhotoFeedRecord(event, key, entryKey)) {
+      return;
     }
 
     for (let attempt = 0; attempt < PHOTO_FEED_APPEND_ATTEMPTS; attempt += 1) {
-      const committed = await this.readPhotoFeedCommit(event, key);
-      if (committed) return;
+      if (await this.hasValidPhotoFeedMarker(event, key, entryKey)) return;
       const head = await this.readPhotoFeedHead(event);
+      await this.ensurePhotoFeedHeadCommitted(event, head.head);
+      // Another identical attempt may have advanced this exact entry before
+      // its marker became visible. Repairing the head above completes that
+      // proof, so recheck before appending the same entry a second time.
+      if (await this.hasValidPhotoFeedMarker(event, key, entryKey)) return;
       const nodeKey = photoFeedNodeKey(event);
       const node: PrivatePhotoFeedNode = {
         version: PHOTO_FEED_VERSION,
@@ -694,20 +717,13 @@ export class EventStore {
         jsonWriteOptions()
       );
       if (advanced) {
-        await this.writePhotoFeedCommit(event, key, nodeKey);
+        await this.writePhotoFeedCommitted(event, nodeKey, node, entry);
+        await this.writePhotoFeedMarker(event, key, node.sequence);
         return;
       }
 
-      // Another duplicate request may have won the head CAS. Its normal path
-      // records a marker; if that write was interrupted, recover by chain.
-      const racedCommit = await this.readPhotoFeedCommit(event, key);
-      if (racedCommit) return;
-      const current = await this.readPhotoFeedHead(event);
-      const recovered = await this.findPhotoFeedEntryNode(event, current.head.nodeKey, entryKey);
-      if (recovered) {
-        await this.writePhotoFeedCommit(event, key, recovered);
-        return;
-      }
+      if (await this.hasValidPhotoFeedMarker(event, key, entryKey)) return;
+      if (await this.recoverPhotoFeedRecord(event, key, entryKey)) return;
     }
     throw new Error("photo feed append contention exceeded retry budget");
   }
@@ -773,8 +789,8 @@ export class EventStore {
     return node;
   }
 
-  private async readPhotoFeedCommit(event: string, key: string): Promise<string | null> {
-    const object = await this.state.get(photoFeedCommitKey(event, key));
+  private async readPhotoFeedMarker(event: string, key: string): Promise<PrivatePhotoFeedMarker | null> {
+    const object = await this.state.get(photoFeedMarkerKey(event, key));
     if (!object) return null;
     let value: unknown;
     try {
@@ -782,54 +798,160 @@ export class EventStore {
     } catch {
       throw new InvalidStoredPhotoFeedError(event);
     }
-    const marker = parsePhotoFeedCommit(event, value);
+    const marker = parsePhotoFeedMarker(value);
     if (!marker) throw new InvalidStoredPhotoFeedError(event);
-    return marker.nodeKey;
+    return marker;
   }
 
-  private async writePhotoFeedCommit(event: string, key: string, nodeKey: string): Promise<void> {
+  private async readPhotoFeedCommitted(
+    event: string,
+    sequence: number
+  ): Promise<PrivatePhotoFeedCommitted | null> {
+    const object = await this.state.get(photoFeedCommittedKey(event, sequence));
+    if (!object) return null;
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredPhotoFeedError(event);
+    }
+    const committed = parsePhotoFeedCommitted(event, value);
+    if (!committed || committed.sequence !== sequence) throw new InvalidStoredPhotoFeedError(event);
+    return committed;
+  }
+
+  private async writePhotoFeedMarker(event: string, key: string, sequence: number): Promise<void> {
     const created = await this.state.compareAndSwap(
-      photoFeedCommitKey(event, key),
+      photoFeedMarkerKey(event, key),
       null,
-      JSON.stringify({ version: PHOTO_FEED_VERSION, nodeKey }),
+      JSON.stringify({ version: PHOTO_FEED_VERSION, sequence }),
       jsonWriteOptions()
     );
     if (created) return;
-    const existing = await this.readPhotoFeedCommit(event, key);
-    if (existing !== nodeKey) throw new InvalidStoredPhotoFeedError(event);
+    const existing = await this.readPhotoFeedMarker(event, key);
+    if (existing?.sequence !== sequence) throw new InvalidStoredPhotoFeedError(event);
   }
 
-  private async photoFeedNodesAfter(
+  private async writePhotoFeedCommitted(
     event: string,
-    headNodeKey: string | null,
-    afterNodeKey: string | null
-  ): Promise<PrivatePhotoFeedNode[]> {
-    const nodes: PrivatePhotoFeedNode[] = [];
-    const visited = new Set<string>();
-    let nodeKey = headNodeKey;
-    while (nodeKey !== null && nodeKey !== afterNodeKey) {
-      if (visited.has(nodeKey)) throw new InvalidStoredPhotoFeedError(event);
-      visited.add(nodeKey);
-      const node = await this.readPhotoFeedNode(event, nodeKey);
-      nodes.push(node);
-      nodeKey = node.previousNodeKey;
+    nodeKey: string,
+    node: PrivatePhotoFeedNode,
+    entry: PrivatePhotoFeedEntry
+  ): Promise<PrivatePhotoFeedCommitted> {
+    const committed: PrivatePhotoFeedCommitted = {
+      version: PHOTO_FEED_VERSION,
+      sequence: node.sequence,
+      key: entry.key,
+      entryKey: node.entryKey,
+      nodeKey,
+    };
+    const created = await this.state.compareAndSwap(
+      photoFeedCommittedKey(event, node.sequence),
+      null,
+      JSON.stringify(committed),
+      jsonWriteOptions()
+    );
+    if (created) return committed;
+    const existing = await this.readPhotoFeedCommitted(event, node.sequence);
+    if (!existing || !samePhotoFeedCommitted(existing, committed)) {
+      throw new InvalidStoredPhotoFeedError(event);
     }
-    if (afterNodeKey !== null && nodeKey !== afterNodeKey) throw new InvalidPhotoCursorError();
-    return nodes;
+    return existing;
+  }
+
+  private async validateCommittedArrival(
+    event: string,
+    committed: PrivatePhotoFeedCommitted
+  ): Promise<{ node: PrivatePhotoFeedNode; entry: PrivatePhotoFeedEntry }> {
+    if (committed.entryKey !== photoFeedEntryKey(event, committed.key)) {
+      throw new InvalidStoredPhotoFeedError(event);
+    }
+    const node = await this.readPhotoFeedNode(event, committed.nodeKey);
+    if (node.sequence !== committed.sequence || node.entryKey !== committed.entryKey) {
+      throw new InvalidStoredPhotoFeedError(event);
+    }
+    const entry = await this.readPhotoFeedEntry(event, committed.entryKey);
+    if (entry.key !== committed.key) throw new InvalidStoredPhotoFeedError(event);
+    return { node, entry };
+  }
+
+  private async validatePhotoFeedCursorProof(
+    event: string,
+    sequence: number,
+    head: PrivatePhotoFeedHead
+  ): Promise<PrivatePhotoFeedCommitted | null> {
+    if (sequence === 0) return null;
+    try {
+      const committed = await this.readPhotoFeedCommitted(event, sequence);
+      if (!committed) throw new InvalidPhotoCursorError();
+      await this.validateCommittedArrival(event, committed);
+      if (sequence === head.sequence) {
+        if (head.nodeKey !== committed.nodeKey) throw new InvalidPhotoCursorError();
+      } else {
+        const successor = await this.readPhotoFeedCommitted(event, sequence + 1);
+        // A head CAS may be visible just before its exact successor commit.
+        // The caller's prior committed record is still valid; paging below
+        // must stop at the gap without invalidating or advancing its cursor.
+        if (successor) {
+          const { node } = await this.validateCommittedArrival(event, successor);
+          if (node.previousNodeKey !== committed.nodeKey) throw new InvalidPhotoCursorError();
+        }
+      }
+      return committed;
+    } catch (error) {
+      if (error instanceof InvalidPhotoCursorError) throw error;
+      throw new InvalidPhotoCursorError();
+    }
+  }
+
+  private async hasValidPhotoFeedMarker(event: string, key: string, entryKey: string): Promise<boolean> {
+    const marker = await this.readPhotoFeedMarker(event, key);
+    if (!marker) return false;
+    const head = await this.readPhotoFeedHead(event);
+    if (marker.sequence > head.head.sequence) return false;
+    const committed = await this.readPhotoFeedCommitted(event, marker.sequence);
+    if (!committed || committed.key !== key || committed.entryKey !== entryKey) return false;
+    await this.validateCommittedArrival(event, committed);
+    if (marker.sequence === head.head.sequence) return head.head.nodeKey === committed.nodeKey;
+    const successor = await this.readPhotoFeedCommitted(event, marker.sequence + 1);
+    if (!successor) return false;
+    const { node: successorNode } = await this.validateCommittedArrival(event, successor);
+    return successorNode.previousNodeKey === committed.nodeKey;
+  }
+
+  private async ensurePhotoFeedHeadCommitted(event: string, head: PrivatePhotoFeedHead): Promise<void> {
+    if (head.sequence === 0) return;
+    if (!head.nodeKey) throw new InvalidStoredPhotoFeedError(event);
+    const node = await this.readPhotoFeedNode(event, head.nodeKey);
+    if (node.sequence !== head.sequence) throw new InvalidStoredPhotoFeedError(event);
+    const entry = await this.readPhotoFeedEntry(event, node.entryKey);
+    await this.writePhotoFeedCommitted(event, head.nodeKey, node, entry);
+    await this.writePhotoFeedMarker(event, entry.key, node.sequence);
+  }
+
+  private async recoverPhotoFeedRecord(event: string, key: string, entryKey: string): Promise<boolean> {
+    const head = await this.readPhotoFeedHead(event);
+    const recovered = await this.findPhotoFeedEntryNode(event, head.head.nodeKey, entryKey);
+    if (!recovered) return false;
+    const entry = await this.readPhotoFeedEntry(event, entryKey);
+    if (entry.key !== key) throw new InvalidStoredPhotoFeedError(event);
+    await this.writePhotoFeedCommitted(event, recovered.nodeKey, recovered.node, entry);
+    await this.writePhotoFeedMarker(event, key, recovered.node.sequence);
+    return true;
   }
 
   private async findPhotoFeedEntryNode(
     event: string,
     headNodeKey: string | null,
     entryKey: string
-  ): Promise<string | null> {
+  ): Promise<{ nodeKey: string; node: PrivatePhotoFeedNode } | null> {
     const visited = new Set<string>();
     let nodeKey = headNodeKey;
     while (nodeKey !== null) {
       if (visited.has(nodeKey)) throw new InvalidStoredPhotoFeedError(event);
       visited.add(nodeKey);
       const node = await this.readPhotoFeedNode(event, nodeKey);
-      if (node.entryKey === entryKey) return nodeKey;
+      if (node.entryKey === entryKey) return { nodeKey, node };
       nodeKey = node.previousNodeKey;
     }
     return null;
@@ -1225,15 +1347,23 @@ type PrivatePhotoFeedNode = {
   previousNodeKey: string | null;
 };
 
-type PrivatePhotoFeedCommit = {
+type PrivatePhotoFeedMarker = {
   version: typeof PHOTO_FEED_VERSION;
+  sequence: number;
+};
+
+type PrivatePhotoFeedCommitted = {
+  version: typeof PHOTO_FEED_VERSION;
+  sequence: number;
+  key: string;
+  entryKey: string;
   nodeKey: string;
 };
 
 type PhotoFeedCursor = {
   version: typeof PHOTO_FEED_VERSION;
   event: string;
-  nodeKey: string | null;
+  sequence: number;
 };
 
 type PrivatePhotoMetadata = {
@@ -1266,6 +1396,7 @@ function parsePhotoFeedHead(event: string, value: unknown): PrivatePhotoFeedHead
     || !Number.isSafeInteger(value.sequence)
     || value.sequence < 0
     || (value.nodeKey !== null && (typeof value.nodeKey !== "string" || !value.nodeKey.startsWith(photoFeedNodePrefix(event))))
+    || (value.sequence === 0) !== (value.nodeKey === null)
   ) {
     return null;
   }
@@ -1289,6 +1420,7 @@ function parsePhotoFeedNode(event: string, value: unknown): PrivatePhotoFeedNode
     || typeof value.entryKey !== "string"
     || !value.entryKey.startsWith(`events/${event}/photo-feed/v1/entries/`)
     || (value.previousNodeKey !== null && (typeof value.previousNodeKey !== "string" || !value.previousNodeKey.startsWith(photoFeedNodePrefix(event))))
+    || (value.sequence === 1) !== (value.previousNodeKey === null)
   ) {
     return null;
   }
@@ -1300,16 +1432,42 @@ function parsePhotoFeedNode(event: string, value: unknown): PrivatePhotoFeedNode
   };
 }
 
-function parsePhotoFeedCommit(event: string, value: unknown): PrivatePhotoFeedCommit | null {
+function parsePhotoFeedMarker(value: unknown): PrivatePhotoFeedMarker | null {
   if (
     !isRecord(value)
     || value.version !== PHOTO_FEED_VERSION
+    || typeof value.sequence !== "number"
+    || !Number.isSafeInteger(value.sequence)
+    || value.sequence < 1
+  ) {
+    return null;
+  }
+  return { version: PHOTO_FEED_VERSION, sequence: value.sequence };
+}
+
+function parsePhotoFeedCommitted(event: string, value: unknown): PrivatePhotoFeedCommitted | null {
+  if (
+    !isRecord(value)
+    || value.version !== PHOTO_FEED_VERSION
+    || typeof value.sequence !== "number"
+    || !Number.isSafeInteger(value.sequence)
+    || value.sequence < 1
+    || typeof value.key !== "string"
+    || !isPhotoKey(event, value.key)
+    || typeof value.entryKey !== "string"
+    || !value.entryKey.startsWith(`events/${event}/photo-feed/v1/entries/`)
     || typeof value.nodeKey !== "string"
     || !value.nodeKey.startsWith(photoFeedNodePrefix(event))
   ) {
     return null;
   }
-  return { version: PHOTO_FEED_VERSION, nodeKey: value.nodeKey };
+  return {
+    version: PHOTO_FEED_VERSION,
+    sequence: value.sequence,
+    key: value.key,
+    entryKey: value.entryKey,
+    nodeKey: value.nodeKey,
+  };
 }
 
 function parsePrivatePhotoMetadata(event: string, value: unknown): PrivatePhotoMetadata | null {
@@ -1355,8 +1513,19 @@ function isBoundedToken(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
 }
 
-function encodePhotoFeedCursor(event: string, nodeKey: string | null): string {
-  return `pf1.${base64url(JSON.stringify({ version: PHOTO_FEED_VERSION, event, nodeKey }))}`;
+function samePhotoFeedCommitted(
+  left: PrivatePhotoFeedCommitted,
+  right: PrivatePhotoFeedCommitted
+): boolean {
+  return left.version === right.version
+    && left.sequence === right.sequence
+    && left.key === right.key
+    && left.entryKey === right.entryKey
+    && left.nodeKey === right.nodeKey;
+}
+
+function encodePhotoFeedCursor(event: string, sequence: number): string {
+  return `pf1.${base64url(JSON.stringify({ version: PHOTO_FEED_VERSION, event, sequence }))}`;
 }
 
 function parsePhotoFeedCursor(event: string, value: string): PhotoFeedCursor {
@@ -1367,16 +1536,20 @@ function parsePhotoFeedCursor(event: string, value: string): PhotoFeedCursor {
   } catch {
     throw new InvalidPhotoCursorError();
   }
-  if (!isRecord(decoded) || decoded.version !== PHOTO_FEED_VERSION || decoded.event !== event) {
-    throw new InvalidPhotoCursorError();
-  }
-  if (decoded.nodeKey !== null && (typeof decoded.nodeKey !== "string" || !decoded.nodeKey.startsWith(photoFeedNodePrefix(event)))) {
+  if (
+    !isRecord(decoded)
+    || decoded.version !== PHOTO_FEED_VERSION
+    || decoded.event !== event
+    || typeof decoded.sequence !== "number"
+    || !Number.isSafeInteger(decoded.sequence)
+    || decoded.sequence < 0
+  ) {
     throw new InvalidPhotoCursorError();
   }
   return {
     version: PHOTO_FEED_VERSION,
     event,
-    nodeKey: decoded.nodeKey as string | null,
+    sequence: decoded.sequence,
   };
 }
 

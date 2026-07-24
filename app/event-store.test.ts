@@ -13,7 +13,9 @@ import {
   eventConfigRevisionKey,
   legacyEventConfigKey,
   PhotoIndexWriteError,
+  photoFeedCommittedKey,
   photoFeedHeadKey,
+  photoFeedMarkerKey,
   photoIndexKey,
   photoReceiptKey,
   type ListOptions,
@@ -81,15 +83,23 @@ class MissingDuplicatePhotoMetadataStore extends InMemoryObjectStore {
   }
 }
 
-class MarkerOnlyRetryStateStore extends InMemoryObjectStore {
-  rejectFeedNodeReads = false;
+class InstrumentedStateStore extends InMemoryObjectStore {
+  reads = 0;
 
   override async get(key: string): Promise<StoredObjectBody | null> {
-    if (this.rejectFeedNodeReads && key.includes("/photo-feed/v1/nodes/")) {
-      throw new Error("normal duplicate retry must use its O(1) commit marker");
-    }
+    this.reads += 1;
     return super.get(key);
   }
+
+  resetReads(): void {
+    this.reads = 0;
+  }
+}
+
+function decodePhotoFeedCursor(cursor: string): Record<string, unknown> {
+  const encoded = cursor.slice("pf1.".length).replaceAll("-", "+").replaceAll("_", "/");
+  const padded = encoded + "=".repeat((4 - encoded.length % 4) % 4);
+  return JSON.parse(atob(padded)) as Record<string, unknown>;
 }
 
 class FailNextConfigHeadCasStore extends InMemoryObjectStore {
@@ -1174,15 +1184,24 @@ describe("EventStore", () => {
     expect(delta.photos.map((photo) => photo.key)).toEqual([repaired.key]);
   });
 
-  test("a normal lost-ack retry uses its exact private commit marker without scanning feed history", async () => {
-    const state = new MarkerOnlyRetryStateStore();
+  test("a normal lost-ack retry validates its exact commit proof in bounded O(1) reads", async () => {
+    const state = new InstrumentedStateStore();
     const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
     const upload = { captureId: "018f0000-0000-4000-8000-000000000111", capturedAt: 1753315200006 };
 
     await store.putPhoto("launch", new Uint8Array([1]).buffer, { upload });
-    state.rejectFeedNodeReads = true;
+    for (let index = 0; index < 50; index += 1) {
+      await store.putPhoto("launch", new Uint8Array([index]).buffer, {
+        upload: {
+          captureId: `018f0000-0000-4000-8000-${String(index + 200).padStart(12, "0")}`,
+          capturedAt: 1753315200100 + index,
+        },
+      });
+    }
+    state.resetReads();
 
     await expect(store.putPhoto("launch", new Uint8Array([2]).buffer, { upload })).resolves.toMatchObject({ duplicate: true });
+    expect(state.reads).toBeLessThanOrEqual(10);
   });
 
   test("receipt failure is observable but does not reject an acknowledged stable photo", async () => {
@@ -1291,8 +1310,163 @@ describe("EventStore", () => {
     const initial = await store.listPhotos("launch");
     const delta = await store.listPhotos("launch", initial.cursor);
 
-    expect(initial.photos).toEqual([]);
+    // A concurrent post-waterline photo may be in the public snapshot. The
+    // next sequence delta deliberately repeats it so no arrival can be missed;
+    // Gallery clients already deduplicate exact keys.
+    expect(initial.photos.map((photo) => photo.key)).toEqual([duringSnapshot!.key]);
     expect(delta.photos.map((photo) => photo.key)).toEqual([duringSnapshot!.key]);
+  });
+
+  test("opaque cursors expose only an Event-bound bounded sequence", async () => {
+    const store = new EventStore(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
+    await store.putPhoto("launch", new Uint8Array([1]).buffer, {
+      upload: { captureId: "018f0000-0000-4000-8000-000000000112", capturedAt: 1753315200007 },
+    });
+
+    const feed = await store.listPhotos("launch");
+    const decoded = decodePhotoFeedCursor(feed.cursor!);
+
+    expect(decoded).toEqual({ version: 1, event: "launch", sequence: 1 });
+    expect(JSON.stringify(decoded)).not.toContain("events/");
+    expect(decoded).not.toHaveProperty("nodeKey");
+  });
+
+  test("bounds fabricated-head delta work and stops before a missing committed sequence", async () => {
+    const state = new InstrumentedStateStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const before = await store.listPhotos("launch");
+    state.set(photoFeedHeadKey("launch"), JSON.stringify({
+      version: 1,
+      sequence: 1_000_000,
+      nodeKey: "events/launch/photo-feed/v1/nodes/fabricated.json",
+    }));
+    state.resetReads();
+
+    const delta = await store.listPhotos("launch", before.cursor);
+
+    expect(delta).toMatchObject({ photos: [], cursor: before.cursor, unchanged: true, truncated: true });
+    expect(state.reads).toBeLessThanOrEqual(3);
+  });
+
+  test("pages more than one feed page without gaps or duplicate keys", async () => {
+    const store = new EventStore(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
+    const before = await store.listPhotos("launch");
+    const uploaded: string[] = [];
+    for (let index = 1; index <= 1002; index += 1) {
+      const photo = await store.putPhoto("launch", new Uint8Array([index % 255]).buffer, {
+        upload: {
+          captureId: `018f0000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+          capturedAt: 1753315300000 + index,
+        },
+      });
+      uploaded.push(photo.key);
+    }
+
+    const first = await store.listPhotos("launch", before.cursor);
+    const second = await store.listPhotos("launch", first.cursor);
+    const keys = [...first.photos, ...second.photos].map((photo) => photo.key);
+
+    expect(first).toMatchObject({ truncated: true, unchanged: false });
+    expect(first.photos).toHaveLength(1000);
+    expect(decodePhotoFeedCursor(first.cursor!).sequence).toBe(1000);
+    expect(second).toMatchObject({ truncated: false, unchanged: false });
+    expect(second.photos).toHaveLength(2);
+    expect(decodePhotoFeedCursor(second.cursor!).sequence).toBe(1002);
+    expect(new Set(keys).size).toBe(1002);
+    expect(keys).toEqual([...uploaded.slice(0, 1000).reverse(), ...uploaded.slice(1000).reverse()]);
+  });
+
+  test("does not advance past a missing committed sequence and retry repairs it", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new FailPrivatePhotoWriteStore("events/launch/photo-feed/v1/committed/");
+    const store = new EventStore(photos, state, "https://photos.example");
+    const before = await store.listPhotos("launch");
+    const upload = { captureId: "018f0000-0000-4000-8000-000000000113", capturedAt: 1753315200008 };
+
+    await expect(store.putPhoto("launch", new Uint8Array([1]).buffer, { upload })).rejects.toBeInstanceOf(PhotoIndexWriteError);
+    const blocked = await store.listPhotos("launch", before.cursor);
+    expect(blocked).toMatchObject({ photos: [], cursor: before.cursor, truncated: true });
+
+    state.allowWrites();
+    const repaired = await store.putPhoto("launch", new Uint8Array([2]).buffer, { upload });
+    const delta = await store.listPhotos("launch", before.cursor);
+
+    expect(delta.photos.map((photo) => photo.key)).toEqual([repaired.key]);
+    expect(decodePhotoFeedCursor(delta.cursor!).sequence).toBe(1);
+    expect(delta.truncated).toBe(false);
+  });
+
+  test("keeps a valid prior cursor usable while its successor commit is repaired", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const before = await store.listPhotos("launch");
+    await store.putPhoto("launch", new Uint8Array([1]).buffer, {
+      upload: { captureId: "018f0000-0000-4000-8000-000000000117", capturedAt: 1753315200012 },
+    });
+    const throughFirst = await store.listPhotos("launch", before.cursor);
+    const secondUpload = {
+      captureId: "018f0000-0000-4000-8000-000000000118",
+      capturedAt: 1753315200013,
+    };
+    const second = await store.putPhoto("launch", new Uint8Array([2]).buffer, { upload: secondUpload });
+    await state.delete(photoFeedCommittedKey("launch", 2));
+
+    const blocked = await store.listPhotos("launch", throughFirst.cursor);
+    expect(blocked).toMatchObject({
+      photos: [],
+      cursor: throughFirst.cursor,
+      unchanged: true,
+      truncated: true,
+    });
+
+    await store.putPhoto("launch", new Uint8Array([3]).buffer, { upload: secondUpload });
+    const repaired = await store.listPhotos("launch", throughFirst.cursor);
+    expect(repaired.photos.map((photo) => photo.key)).toEqual([second.key]);
+    expect(decodePhotoFeedCursor(repaired.cursor!).sequence).toBe(2);
+  });
+
+  test("fails closed on a corrupt per-photo sequence marker", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const upload = { captureId: "018f0000-0000-4000-8000-000000000114", capturedAt: 1753315200009 };
+    const photo = await store.putPhoto("launch", new Uint8Array([1]).buffer, { upload });
+    state.set(photoFeedMarkerKey("launch", photo.key), JSON.stringify({ version: 1, sequence: "1" }));
+
+    await expect(store.putPhoto("launch", new Uint8Array([2]).buffer, { upload })).rejects.toBeInstanceOf(PhotoIndexWriteError);
+  });
+
+  test("fails closed when a marker sequence is inconsistent with the Event head", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const upload = { captureId: "018f0000-0000-4000-8000-000000000115", capturedAt: 1753315200010 };
+    const photo = await store.putPhoto("launch", new Uint8Array([1]).buffer, { upload });
+    state.set(photoFeedMarkerKey("launch", photo.key), JSON.stringify({ version: 1, sequence: 2 }));
+
+    await expect(store.putPhoto("launch", new Uint8Array([2]).buffer, { upload })).rejects.toBeInstanceOf(PhotoIndexWriteError);
+  });
+
+  test("fails closed when exact committed proof points at an orphan node", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const upload = { captureId: "018f0000-0000-4000-8000-000000000116", capturedAt: 1753315200011 };
+    const photo = await store.putPhoto("launch", new Uint8Array([1]).buffer, { upload });
+    const entryKey = (await state.list({ prefix: "events/launch/photo-feed/v1/entries/" })).objects[0]!.key;
+    const orphanNodeKey = "events/launch/photo-feed/v1/nodes/orphan.json";
+    state.set(orphanNodeKey, JSON.stringify({
+      version: 1,
+      sequence: 1,
+      entryKey,
+      previousNodeKey: null,
+    }));
+    state.set(photoFeedCommittedKey("launch", 1), JSON.stringify({
+      version: 1,
+      sequence: 1,
+      key: photo.key,
+      entryKey,
+      nodeKey: orphanNodeKey,
+    }));
+
+    await expect(store.putPhoto("launch", new Uint8Array([2]).buffer, { upload })).rejects.toBeInstanceOf(PhotoIndexWriteError);
   });
 
   test("pages a delta through private feed records and exact public gets without relisting PHOTOS", async () => {

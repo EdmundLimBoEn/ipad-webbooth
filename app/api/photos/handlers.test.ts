@@ -37,4 +37,55 @@ describe("photos handler", () => {
     expect(crossEvent.status).toBe(400);
     expect(await crossEvent.json()).toEqual({ error: "photo feed cursor is invalid for this Event" });
   });
+
+  test("rebases an already-open Gallery's legacy raw photo-key cursor", async () => {
+    const store = new EventStore(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
+    const uploaded = await store.putPhoto("launch", new Uint8Array([1]).buffer, {
+      upload: { captureId: "018f0000-0000-4000-8000-000000000202", capturedAt: 1753315200001 },
+    });
+
+    const response = await getPhotos(
+      request(`event=launch&after=${encodeURIComponent(uploaded.key)}`),
+      { store }
+    );
+    const body = await response.json() as { photos: Array<{ key: string }>; cursor: string };
+
+    expect(response.status).toBe(200);
+    expect(body.photos.map((photo) => photo.key)).toEqual([uploaded.key]);
+    expect(body.cursor).toStartWith("pf1.");
+
+    const crossEvent = await getPhotos(
+      request(`event=other&after=${encodeURIComponent(uploaded.key)}`),
+      { store }
+    );
+    const traversal = await getPhotos(
+      request(`event=launch&after=${encodeURIComponent("launch/../other/photo.jpg")}`),
+      { store }
+    );
+    const fragment = await getPhotos(
+      request(`event=launch&after=${encodeURIComponent(uploaded.key.split("/")[1]!)}`),
+      { store }
+    );
+    expect(crossEvent.status).toBe(400);
+    expect(traversal.status).toBe(400);
+    expect(fragment.status).toBe(400);
+  });
+
+  test("rebases a legacy raw cursor after its exact photo was moderated", async () => {
+    const store = new EventStore(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
+    const uploaded = await store.putPhoto("launch", new Uint8Array([1]).buffer, {
+      upload: { captureId: "018f0000-0000-4000-8000-000000000203", capturedAt: 1753315200002 },
+    });
+    await store.deletePhoto("launch", uploaded.key);
+
+    const response = await getPhotos(
+      request(`event=launch&after=${encodeURIComponent(uploaded.key)}`),
+      { store }
+    );
+    const body = await response.json() as { photos: Array<{ key: string }>; cursor: string };
+
+    expect(response.status).toBe(200);
+    expect(body.photos).toEqual([]);
+    expect(body.cursor).toStartWith("pf1.");
+  });
 });
