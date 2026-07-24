@@ -38,6 +38,13 @@ export function exactGalleryUrl(
   return url.toString();
 }
 
+export function isCurrentPhotoAction(
+  actionGeneration: number,
+  currentGeneration: number,
+): boolean {
+  return actionGeneration === currentGeneration;
+}
+
 export function browserPhotoActionDeps(): PhotoActionDeps {
   return {
     async fetchBlob(url) {
@@ -51,7 +58,9 @@ export function browserPhotoActionDeps(): PhotoActionDeps {
       && navigator.canShare(data),
     share: (data) => navigator.share(data),
     createObjectURL: (blob) => URL.createObjectURL(blob),
-    revokeObjectURL: (url) => URL.revokeObjectURL(url),
+    revokeObjectURL: (url) => {
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    },
     download(objectUrl, filename) {
       const link = document.createElement("a");
       link.href = objectUrl;
@@ -105,12 +114,12 @@ async function tryFileShare(
   input: PhotoActionInput,
   blob: Blob,
 ): Promise<PhotoActionResult | null> {
-  const file = new File([blob], photoFilename(input.photo), {
-    type: blob.type || "image/jpeg",
-  });
-  const data: ShareData = { files: [file], title: "Event photo", url: input.exactUrl };
-  if (!input.deps.canShare(data)) return null;
   try {
+    const file = new File([blob], photoFilename(input.photo), {
+      type: blob.type || "image/jpeg",
+    });
+    const data: ShareData = { files: [file], title: "Event photo", url: input.exactUrl };
+    if (!input.deps.canShare(data)) return null;
     await input.deps.share(data);
     return { kind: "shared" };
   } catch (error) {

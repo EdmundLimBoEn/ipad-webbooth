@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   exactGalleryUrl,
+  isCurrentPhotoAction,
   savePhoto,
   sharePhoto,
   type PhotoActionDeps,
@@ -127,5 +128,26 @@ describe("exact Gallery actions", () => {
     });
 
     expect(result).toEqual({ kind: "cancelled" });
+  });
+
+  test("fences a completed action after the open photo generation changes", () => {
+    expect(isCurrentPhotoAction(4, 4)).toBe(true);
+    expect(isCurrentPhotoAction(4, 5)).toBe(false);
+  });
+
+  test("falls back safely if native file capability detection throws", async () => {
+    const runtime = deps({
+      canShare: () => {
+        throw new DOMException("unsupported data", "DataError");
+      },
+    });
+    const result = await savePhoto({
+      photo,
+      prefetched: { key: photo.key, url: photo.url, blob: new Blob(["photo"]) },
+      exactUrl: exactGalleryUrl("https://booth.example", "show", photo.key),
+      deps: runtime,
+    });
+
+    expect(result).toEqual({ kind: "downloaded" });
   });
 });

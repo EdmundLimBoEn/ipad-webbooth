@@ -12,6 +12,7 @@ import type { FeedPhoto } from "@/app/photo-feed/types";
 import {
   browserPhotoActionDeps,
   exactGalleryUrl,
+  isCurrentPhotoAction,
   savePhoto,
   sharePhoto,
   type PhotoActionDeps,
@@ -91,6 +92,7 @@ export function PhotoLightbox({
   useEffect(() => {
     const generation = ++generationRef.current;
     setPrefetched(null);
+    setBusy(false);
     setError("");
     let active = true;
     void deps.fetchBlob(photo.url).then((blob) => {
@@ -109,7 +111,7 @@ export function PhotoLightbox({
     setError("");
     const input = { photo, prefetched, exactUrl, deps };
     const result = kind === "save" ? await savePhoto(input) : await sharePhoto(input);
-    if (generationRef.current !== generation) return;
+    if (!isCurrentPhotoAction(generation, generationRef.current)) return;
     setBusy(false);
     if (result.kind === "error") setError(labels.actionError);
   }, [deps, exactUrl, labels.actionError, photo, prefetched]);
