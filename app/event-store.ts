@@ -268,14 +268,40 @@ export const eventPresetKey = (presetId: string) => {
 };
 export const eventPresetPrefix = () => "presets/";
 const eventPresetIndexPrefix = () => `${eventPresetPrefix()}_index/v1/`;
-export const eventPresetIndexKey = (presetId: string, label: string) => {
+function utf16Hex(value: string): string {
+  let encoded = "";
+  for (let index = 0; index < value.length; index += 1) {
+    encoded += value.charCodeAt(index).toString(16).padStart(4, "0");
+  }
+  return encoded;
+}
+
+function decodeUtf16Hex(value: string): string | null {
+  if (value.length === 0 || value.length % 4 !== 0 || !/^[0-9a-f]+$/.test(value)) {
+    return null;
+  }
+  let decoded = "";
+  for (let offset = 0; offset < value.length; offset += 4) {
+    decoded += String.fromCharCode(Number.parseInt(value.slice(offset, offset + 4), 16));
+  }
+  return decoded;
+}
+
+export const eventPresetIndexKey = (
+  presetId: string,
+  label: string,
+  updatedAt: string,
+) => {
   if (!isPresetId(presetId)) throw new TypeError("invalid preset ID");
   validatePresetLabel(label);
-  let encodedLabel = "";
-  for (let index = 0; index < label.length; index += 1) {
-    encodedLabel += label.charCodeAt(index).toString(16).padStart(4, "0");
+  const updatedTime = Date.parse(updatedAt);
+  if (
+    !Number.isFinite(updatedTime)
+    || new Date(updatedTime).toISOString() !== updatedAt
+  ) {
+    throw new TypeError("invalid preset timestamp");
   }
-  return `${eventPresetIndexPrefix()}${encodedLabel}/${presetId}.json`;
+  return `${eventPresetIndexPrefix()}${utf16Hex(label)}/${presetId}/${utf16Hex(updatedAt)}.json`;
 };
 export const legacyEventConfigKey = (event: string) => `_config/${event}.json`;
 export const eventPhotoPrefix = (event: string) => `${event}/`;
@@ -366,24 +392,29 @@ const EVENT_PRESET_CURSOR_PREFIX = "preset-v1:";
 
 function parseEventPresetIndexKey(
   key: string,
-): Pick<EventPreset, "label" | "id"> | null {
+): Pick<EventPreset, "label" | "id" | "updatedAt"> | null {
   const prefix = eventPresetIndexPrefix();
   if (!key.startsWith(prefix)) return null;
-  const match = /^([0-9a-f]+)\/([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.json$/.exec(
+  const match = /^([0-9a-f]+)\/([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\/([0-9a-f]+)\.json$/.exec(
     key.slice(prefix.length),
   );
-  if (!match || match[1]!.length % 4 !== 0) return null;
-  let label = "";
-  for (let offset = 0; offset < match[1]!.length; offset += 4) {
-    label += String.fromCharCode(Number.parseInt(match[1]!.slice(offset, offset + 4), 16));
-  }
+  if (!match) return null;
+  const label = decodeUtf16Hex(match[1]!);
+  const updatedAt = decodeUtf16Hex(match[3]!);
+  if (label === null || updatedAt === null) return null;
   try {
     validatePresetLabel(label);
   } catch {
     return null;
   }
   const id = match[2]!;
-  return eventPresetIndexKey(id, label) === key ? { label, id } : null;
+  try {
+    return eventPresetIndexKey(id, label, updatedAt) === key
+      ? { label, id, updatedAt }
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function encodeEventPresetCursor(afterIndexKey: string): string {
@@ -592,7 +623,12 @@ export class EventStore {
       const object = await this.state.get(eventPresetKey(index.id));
       if (!object) continue;
       const preset = await this.readEventPresetObject(index.id, object);
-      if (preset.label === index.label) presets.push(preset);
+      if (
+        preset.label === index.label
+        && preset.updatedAt === index.updatedAt
+      ) {
+        presets.push(preset);
+      }
     }
     return {
       presets,
@@ -646,10 +682,15 @@ export class EventStore {
       updatedAt: serverTime,
       config,
     };
-    const indexKey = eventPresetIndexKey(presetId, label);
+    const indexKey = eventPresetIndexKey(presetId, label, preset.updatedAt);
     await this.state.put(
       indexKey,
-      JSON.stringify({ version: EVENT_PRESET_VERSION, id: presetId, label }),
+      JSON.stringify({
+        version: EVENT_PRESET_VERSION,
+        id: presetId,
+        label,
+        updatedAt: preset.updatedAt,
+      }),
       jsonWriteOptions(),
     );
     const written = await this.state.compareAndSwap(
@@ -674,9 +715,11 @@ export class EventStore {
         raced?.updatedAt ?? null,
       );
     }
-    if (current && current.label !== label) {
+    if (current) {
       try {
-        await this.state.delete(eventPresetIndexKey(presetId, current.label));
+        await this.state.delete(
+          eventPresetIndexKey(presetId, current.label, current.updatedAt),
+        );
       } catch {
         // The new authoritative preset and index are already durable. A stale
         // exact index entry is skipped by listEventPresets.

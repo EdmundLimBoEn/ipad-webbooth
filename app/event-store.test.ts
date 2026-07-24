@@ -237,6 +237,35 @@ class PresetAccessStore extends InMemoryObjectStore {
   }
 }
 
+class DeferredPresetIndexDeleteStore extends InMemoryObjectStore {
+  readonly deletionStarted: Promise<void>;
+  private markDeletionStarted!: () => void;
+  private readonly deletionReleased: Promise<void>;
+  private releaseDeletion!: () => void;
+
+  constructor(private readonly blockedKey: string) {
+    super();
+    this.deletionStarted = new Promise((resolve) => {
+      this.markDeletionStarted = resolve;
+    });
+    this.deletionReleased = new Promise((resolve) => {
+      this.releaseDeletion = resolve;
+    });
+  }
+
+  override async delete(key: string): Promise<void> {
+    if (key === this.blockedKey) {
+      this.markDeletionStarted();
+      await this.deletionReleased;
+    }
+    return super.delete(key);
+  }
+
+  resumeDeletion(): void {
+    this.releaseDeletion();
+  }
+}
+
 class BoothStateAccessStore extends InMemoryObjectStore {
   readonly reads: string[] = [];
   readonly writes: string[] = [];
@@ -2577,7 +2606,7 @@ describe("EventStore", () => {
       });
       expect(state.has(eventPresetKey("launch"))).toBeTrue();
       expect((await state.list()).objects.map((object) => object.key)).toEqual([
-        eventPresetIndexKey("launch", "Launch"),
+        eventPresetIndexKey("launch", "Launch", created.updatedAt),
         "presets/launch.json",
       ]);
       expect((await photos.list()).objects).toEqual([]);
@@ -2592,8 +2621,8 @@ describe("EventStore", () => {
       expect(updated.updatedAt).toBe(now.toISOString());
       expect(updated.config.frames).toEqual(["strip"]);
       expect(await store.getEventPreset("launch")).toEqual(updated);
-      expect(state.has(eventPresetIndexKey("launch", "Launch"))).toBeFalse();
-      expect(state.has(eventPresetIndexKey("launch", "Launch updated"))).toBeTrue();
+      expect(state.has(eventPresetIndexKey("launch", "Launch", created.updatedAt))).toBeFalse();
+      expect(state.has(eventPresetIndexKey("launch", "Launch updated", updated.updatedAt))).toBeTrue();
     });
 
     test("enforces create-only and exact observed update conflicts", async () => {
@@ -2674,9 +2703,58 @@ describe("EventStore", () => {
       expect(state.gets).toBe(1);
     });
 
+    test("an older delayed cleanup cannot delete a newer live label index", async () => {
+      let now = new Date("2026-07-24T00:00:00.000Z");
+      const oldAlphaIndex = eventPresetIndexKey(
+        "launch",
+        "Alpha",
+        now.toISOString(),
+      );
+      const state = new DeferredPresetIndexDeleteStore(oldAlphaIndex);
+      const store = new EventStore(
+        new InMemoryObjectStore(),
+        state,
+        "https://photos.example",
+        () => now,
+      );
+      const created = await store.putEventPreset("launch", {
+        label: "Alpha",
+        config: experience,
+        expectedUpdatedAt: null,
+      });
+
+      now = new Date("2026-07-24T00:00:01.000Z");
+      const betaWrite = store.putEventPreset("launch", {
+        label: "Beta",
+        config: experience,
+        expectedUpdatedAt: created.updatedAt,
+      });
+      await state.deletionStarted;
+      const beta = await store.getEventPreset("launch");
+      expect(beta?.label).toBe("Beta");
+
+      now = new Date("2026-07-24T00:00:02.000Z");
+      const alpha = await store.putEventPreset("launch", {
+        label: "Alpha",
+        config: experience,
+        expectedUpdatedAt: beta!.updatedAt,
+      });
+      state.resumeDeletion();
+      await betaWrite;
+
+      expect(alpha.label).toBe("Alpha");
+      expect((await store.listEventPresets()).presets.map(({ label }) => label)).toEqual([
+        "Alpha",
+      ]);
+    });
+
     test("fails explicitly for corrupt stored presets and never offers deletion", async () => {
       const state = new InMemoryObjectStore({
-        [eventPresetIndexKey("broken", "Broken")]: "{}",
+        [eventPresetIndexKey(
+          "broken",
+          "Broken",
+          "2026-07-24T00:00:00.000Z",
+        )]: "{}",
         [eventPresetKey("broken")]: JSON.stringify({
           version: 2,
           id: "broken",

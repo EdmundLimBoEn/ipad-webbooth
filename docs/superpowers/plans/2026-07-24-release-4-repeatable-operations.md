@@ -216,9 +216,12 @@ Test:
 - Lists accept opaque cursors and limits `1..100`, default `50`.
 - Corrupt or unsupported stored versions fail explicitly.
 - Presets are sorted by label then ID without trusting client locale.
-- Only `STATE/presets/{id}.json` is written.
+- The authoritative record is only `STATE/presets/{id}.json`; bounded global
+  ordering may additionally write version-unique derived entries under the
+  private `STATE/presets/_index/v1/` namespace.
 - `PHOTOS`, Events, config revisions, and adjacent presets stay untouched.
-- No delete method or prefix cleanup exists.
+- No preset delete method or prefix cleanup exists. Updating a preset may
+  delete only the exact superseded derived index key.
 
 - [ ] **Step 5: Implement CAS-backed private preset methods**
 
@@ -227,6 +230,12 @@ compare against `null`. For update, read and validate the record, compare
 `expectedUpdatedAt`, then CAS against its etag. A lost response followed by a
 retry may return a conflict; the Admin reconciles by reloading and comparing
 the safe content rather than overwriting a newer change.
+
+Keep list work bounded with a private sortable index whose key encodes the
+label, preset ID, and exact `updatedAt`. The opaque cursor carries the last
+scanned derived key and resumes with `startAfter`. Readers validate every
+entry against the authoritative preset and advance across stale entries.
+Version-unique index keys make exact cleanup safe from delayed ABA updates.
 
 - [ ] **Step 6: Run focused and full checks**
 
