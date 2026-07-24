@@ -6,6 +6,7 @@ import {
   type EventExperience,
 } from "../../event-config";
 import type { BoothAccessState } from "./access";
+import type { OutboxItem } from "./outbox";
 
 export type BoothAccessFeedback =
   | "recovering"
@@ -29,6 +30,7 @@ export type BoothPreflightResult =
 
 export type BoothSessionRecovery = {
   authBlockedItemId: string | null;
+  items?: readonly OutboxItem[];
 };
 
 export interface BoothLifecycleSession {
@@ -61,7 +63,7 @@ type BoothLifecycleDependencies<Result> = {
   loadCredential: (event: string) => { key: string } | null;
   clearCredential: (event: string) => void;
   onReset: (event: string) => void;
-  onOutboxRecovered: () => void;
+  onOutboxRecovered: (recovery: BoothSessionRecovery) => void;
   onAccess: (state: BoothAccessState, feedback: BoothAccessFeedback) => void;
   onFrames: (frames: string[] | null) => void;
   onExperience?: (experience: EventExperience | null) => void;
@@ -151,14 +153,14 @@ export class BoothLifecycleCoordinator<Result> {
       recovery = await session.recover();
     } catch {
       if (!this.isCurrent(active)) return;
-      this.deps.onOutboxRecovered();
+      this.deps.onOutboxRecovered({ authBlockedItemId: null, items: [] });
       this.deps.onAccess("recovery-only", "network");
       return;
     }
     if (!this.isCurrent(active)) return;
     active.authBlockedItemId = recovery.authBlockedItemId;
 
-    this.deps.onOutboxRecovered();
+    this.deps.onOutboxRecovered(recovery);
     this.deps.onAccess("locked", "locked");
     const stored = this.deps.loadCredential(event);
     if (!stored) return;

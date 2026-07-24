@@ -116,6 +116,7 @@ export class BoothSession {
     return {
       authBlockedItemId:
         pending[0]?.failureKind === "auth" ? pending[0].id : null,
+      items: pending,
     };
   }
 

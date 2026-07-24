@@ -20,6 +20,10 @@ type WithoutEvidenceEnvelope<T> = T extends unknown
   ? Omit<T, "version" | "id" | "rehearsalId" | "observedAt">
   : never;
 type EvidenceFields = WithoutEvidenceEnvelope<RehearsalEvidenceInput>;
+type ConfirmedDeletion = {
+  kind: "canary" | "delete";
+  cleanupPending: boolean;
+};
 
 const requirements: RehearsalRequirement[] = [
   "booth-ready", "frames-covered", "two-network-failures", "reload-recovered",
@@ -66,11 +70,13 @@ export function RehearsalPanel({
   const [error, setError] = useState("");
   const [confirmStart, setConfirmStart] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmCanary, setConfirmCanary] = useState<string | null>(null);
   const [qr, setQr] = useState("");
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const readInFlight = useRef(false);
   const stopped = useRef(false);
-  const confirmedCanaryDeletes = useRef(new Map<string, boolean>());
+  const confirmedDeletes = useRef(new Map<string, ConfirmedDeletion>());
+  const confirmedDeleteScope = useRef("");
   const deleteTrigger = useRef<HTMLButtonElement | null>(null);
 
   const label = useCallback(
@@ -181,15 +187,100 @@ export function RehearsalPanel({
     await load();
   };
 
+  const confirmedDeleteMap = () => {
+    if (!view) return confirmedDeletes.current;
+    const scope = `webbooth:${event}:rehearsal:${view.session.id}:confirmed-deletes`;
+    if (confirmedDeleteScope.current === scope) return confirmedDeletes.current;
+    confirmedDeleteScope.current = scope;
+    confirmedDeletes.current.clear();
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(scope) ?? "[]") as unknown;
+      if (Array.isArray(stored)) {
+        for (const entry of stored) {
+          if (
+            Array.isArray(entry)
+            && entry.length === 3
+            && typeof entry[0] === "string"
+            && (entry[1] === "canary" || entry[1] === "delete")
+            && typeof entry[2] === "boolean"
+          ) {
+            confirmedDeletes.current.set(entry[0], {
+              kind: entry[1],
+              cleanupPending: entry[2],
+            });
+          }
+        }
+      }
+    } catch {
+      // The in-memory marker still prevents a repeated delete in this page.
+    }
+    return confirmedDeletes.current;
+  };
+
+  const persistConfirmedDeletes = () => {
+    if (!confirmedDeleteScope.current) return;
+    try {
+      window.localStorage.setItem(
+        confirmedDeleteScope.current,
+        JSON.stringify([...confirmedDeletes.current].map(([key, value]) => [
+          key,
+          value.kind,
+          value.cleanupPending,
+        ])),
+      );
+    } catch {
+      // Storage denial is visible operationally through a retained in-page marker.
+    }
+  };
+
+  const deletePublicPhoto = async (
+    photoKey: string,
+    kind: ConfirmedDeletion["kind"],
+  ) => {
+    const retained = confirmedDeleteMap().get(photoKey);
+    if (retained) {
+      if (retained.kind !== kind) throw new Error(label("rehearsalActionError"));
+      return retained.cleanupPending;
+    }
+    const query = new URLSearchParams({ event, key: photoKey });
+    const response = await request(`/api/photos?${query}`, { method: "DELETE" });
+    const result = await response.json() as {
+      deleted?: unknown;
+      cleanupPending?: unknown;
+      key?: unknown;
+    };
+    if (
+      !response.ok
+      || result.deleted !== true
+      || result.key !== photoKey
+      || typeof result.cleanupPending !== "boolean"
+    ) {
+      throw new Error(label("rehearsalActionError"));
+    }
+    const confirmed = {
+      kind,
+      cleanupPending: result.cleanupPending,
+    } satisfies ConfirmedDeletion;
+    confirmedDeleteMap().set(photoKey, confirmed);
+    persistConfirmedDeletes();
+    return confirmed.cleanupPending;
+  };
+
+  const clearConfirmedDelete = (photoKey: string) => {
+    confirmedDeleteMap().delete(photoKey);
+    persistConfirmedDeletes();
+  };
+
   const disposition = async (photoKey: string, action: "retain" | "delete") => {
     setBusy(`${action}:${photoKey}`); setError("");
     try {
       if (action === "delete") {
-        const query = new URLSearchParams({ event, key: photoKey });
-        const response = await request(`/api/photos?${query}`, { method: "DELETE" });
-        if (!response.ok) throw new Error(label("rehearsalActionError"));
+        await deletePublicPhoto(photoKey, "delete");
+      } else if (confirmedDeleteMap().has(photoKey)) {
+        throw new Error(label("rehearsalActionError"));
       }
       await append({ kind: action === "retain" ? "photo-retained" : "photo-deleted", photoKey });
+      if (action === "delete") clearConfirmedDelete(photoKey);
       setConfirmDelete(null);
       requestAnimationFrame(() => deleteTrigger.current?.focus());
     } catch (cause) {
@@ -218,18 +309,16 @@ export function RehearsalPanel({
   const deleteCanary = async (photoKey: string) => {
     setBusy("canary"); setError("");
     try {
-      let cleanupPending = confirmedCanaryDeletes.current.get(photoKey);
-      if (cleanupPending === undefined) {
+      const retained = confirmedDeleteMap().get(photoKey);
+      if (retained?.kind !== "canary") {
+        if (retained) throw new Error(label("rehearsalActionError"));
         await append({ kind: "canary-designated", photoKey });
-        const query = new URLSearchParams({ event, key: photoKey });
-        const response = await request(`/api/photos?${query}`, { method: "DELETE" });
-        const result = await response.json() as { deleted?: boolean; cleanupPending?: boolean };
-        if (!response.ok || result.deleted !== true) throw new Error(label("rehearsalActionError"));
-        cleanupPending = result.cleanupPending === true;
-        confirmedCanaryDeletes.current.set(photoKey, cleanupPending);
       }
+      const cleanupPending = await deletePublicPhoto(photoKey, "canary");
       await append({ kind: "canary-deleted", photoKey, cleanupPending });
-      confirmedCanaryDeletes.current.delete(photoKey);
+      clearConfirmedDelete(photoKey);
+      setConfirmCanary(null);
+      requestAnimationFrame(() => deleteTrigger.current?.focus());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : label("rehearsalActionError"));
     } finally { setBusy(""); }
@@ -305,15 +394,38 @@ export function RehearsalPanel({
                         <button type="button" disabled={Boolean(busy)} onClick={() => void observeDelivery(photo.photoKey)}>
                           {label("rehearsalObserveDelivery")}
                         </button>
-                        <button type="button" disabled={Boolean(busy)} onClick={() => void deleteCanary(photo.photoKey)}>
+                        <button
+                          type="button"
+                          disabled={Boolean(busy)}
+                          onClick={(event) => {
+                            deleteTrigger.current = event.currentTarget;
+                            setConfirmCanary(photo.photoKey);
+                          }}
+                        >
                           {label("rehearsalUseCanary")}
                         </button>
                         <button type="button" disabled={Boolean(busy)} onClick={() => void disposition(photo.photoKey, "retain")}>
                           {label("rehearsalRetain")}
                         </button>
-                        <button ref={deleteTrigger} type="button" disabled={Boolean(busy)} onClick={() => setConfirmDelete(photo.photoKey)}>
+                        <button
+                          type="button"
+                          disabled={Boolean(busy)}
+                          onClick={(event) => {
+                            deleteTrigger.current = event.currentTarget;
+                            setConfirmDelete(photo.photoKey);
+                          }}
+                        >
                           {label("rehearsalDeleteExact")}
                         </button>
+                      </div>
+                    )}
+                    {confirmCanary === photo.photoKey && (
+                      <div className={styles.rehearsalDeleteConfirm} role="alertdialog" aria-modal="true">
+                        <strong>{label("rehearsalDeleteConfirm")}</strong>
+                        <span>{photo.photoKey.slice(photo.photoKey.indexOf("/") + 1)}</span>
+                        <bdi><code>{photo.photoKey}</code></bdi>
+                        <button type="button" onClick={() => void deleteCanary(photo.photoKey)}>{label("rehearsalUseCanary")}</button>
+                        <button type="button" onClick={() => setConfirmCanary(null)}>{label("moderationCancel")}</button>
                       </div>
                     )}
                     {confirmDelete === photo.photoKey && (

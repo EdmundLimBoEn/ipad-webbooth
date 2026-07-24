@@ -808,7 +808,10 @@ describe("BoothSession outbox", () => {
 
     const recovery = await session.recover();
 
-    expect(recovery).toEqual({ authBlockedItemId: "persisted-auth" });
+    expect(recovery).toEqual({
+      authBlockedItemId: "persisted-auth",
+      items: before,
+    });
     expect(await store.list("party")).toEqual(before);
   });
 
@@ -839,7 +842,10 @@ describe("BoothSession outbox", () => {
 
     const recovery = await session.recover();
 
-    expect(recovery).toEqual({ authBlockedItemId: null });
+    expect(recovery).toEqual({
+      authBlockedItemId: null,
+      items: before,
+    });
     expect(await store.list("party")).toEqual(before);
   });
 

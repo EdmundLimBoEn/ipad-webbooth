@@ -176,6 +176,7 @@ export default function Booth() {
   const streamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<BoothSession | null>(null);
   const photoOutboxRef = useRef<OutboxStore | null>(null);
+  const recoveredOutboxItemsRef = useRef<readonly OutboxItem[]>([]);
   const rehearsalClientRef = useRef<RehearsalClient | null>(null);
   const statePollerRef = useRef<BoothStatePoller | null>(null);
   const heartbeatReporterRef = useRef<BoothHeartbeatReporter | null>(null);
@@ -370,6 +371,7 @@ export default function Booth() {
         ),
       onReset: () => {
         const initial = createBoothOperationalSessionState(Date.now());
+        recoveredOutboxItemsRef.current = [];
         documentLocaleRef.current?.restore(event);
         pauseBoundary.reset();
         clearFrame();
@@ -393,7 +395,10 @@ export default function Booth() {
         setOnline(navigator.onLine);
         setUploadState(INITIAL_UPLOAD_STATE);
       },
-      onOutboxRecovered: () => setOutboxRecovered(true),
+      onOutboxRecovered: (recovery) => {
+        recoveredOutboxItemsRef.current = recovery.items ?? [];
+        setOutboxRecovered(true);
+      },
       onAccess: (state, feedback) => {
         if (state === "locked" && feedback === "rejected-key") {
           clearFrame();
@@ -685,8 +690,18 @@ export default function Booth() {
         await client.join();
         if (cancelled) return;
         try { window.sessionStorage.setItem(storageKey, client.bootId); } catch { /* restricted storage */ }
-        const recovered = await photoOutboxRef.current?.list(event) ?? [];
+        const recovered = recoveredOutboxItemsRef.current;
         await client.recordRecovery(recovered);
+        // The Photo Outbox is intentionally allowed to drain as soon as
+        // authenticated preflight succeeds. Reconcile rows already removed
+        // before the rehearsal join so their recovery proof cannot race the
+        // uploader or be lost.
+        const remaining = await photoOutboxRef.current?.list(event) ?? [];
+        const remainingIds = new Set(remaining.map(({ id }) => id));
+        for (const item of recovered) {
+          if (!remainingIds.has(item.id)) await client.recordAcknowledgement(item);
+        }
+        if (remaining.length === 0) await client.recordEmptyOutbox();
         await client.drainEvidence();
       } catch (cause) {
         if (!cancelled) {
@@ -708,13 +723,15 @@ export default function Booth() {
       !rehearsalState.rehearsal
       || (status !== "picking" && status !== "ready" && status !== "running")
       || !deviceIdRef.current
+      || operational.paused
+      || !streamRef.current?.getVideoTracks().some((track) => track.readyState === "live")
     ) return;
     void rehearsalClientRef.current?.recordReadiness({
       deviceId: deviceIdRef.current,
       cameraReady: true,
       durableStorage: uploadState.durable,
     });
-  }, [rehearsalState.rehearsal, status, uploadState.durable]);
+  }, [operational.paused, rehearsalState.rehearsal, status, uploadState.durable]);
 
   useEffect(() => {
     const reporter = heartbeatReporterRef.current;
