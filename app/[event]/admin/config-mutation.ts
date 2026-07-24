@@ -7,6 +7,7 @@ import {
   type EventExperience,
   type PublicEventConfig,
 } from "../../event-config";
+import { isPresetId } from "../../event-preset";
 /*
  * Keep the runtime parsers in this client-safe helper: Admin responses cross
  * a network trust boundary even though their TypeScript interfaces are local.
@@ -32,6 +33,10 @@ export type ConfigHistoryResponse = {
 export type ConfigMutationResponse = PublicEventConfig & {
   currentRevisionId: string;
   idempotent: boolean;
+};
+
+export type PresetApplyResponse = ConfigMutationResponse & {
+  sourcePresetId: string;
 };
 
 const EXPERIENCE_KEYS = [
@@ -175,6 +180,26 @@ export function parseConfigMutationResponse(
     currentRevisionId,
     idempotent,
   };
+}
+
+export function parsePresetApplyResponse(
+  value: unknown
+): PresetApplyResponse | null {
+  if (
+    !isObject(value)
+    || !hasOnlyKeys(value, [
+      ...PUBLIC_CONFIG_KEYS,
+      "currentRevisionId",
+      "sourcePresetId",
+      "idempotent",
+    ])
+    || !isPresetId(value.sourcePresetId)
+  ) {
+    return null;
+  }
+  const { sourcePresetId, ...mutationValue } = value;
+  const mutation = parseConfigMutationResponse(mutationValue);
+  return mutation ? { ...mutation, sourcePresetId } : null;
 }
 
 export type EditableEventExperience = {

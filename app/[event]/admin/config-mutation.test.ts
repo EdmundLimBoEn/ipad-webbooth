@@ -5,6 +5,7 @@ import {
   getOrCreateRestoreRequest,
   parseConfigHistoryResponse,
   parseConfigMutationResponse,
+  parsePresetApplyResponse,
   rebaseConfigHistory,
   shouldClearRestoreRequest,
   type RestoreRequest,
@@ -286,6 +287,39 @@ test("strictly parses mutation responses before applying restored settings", () 
     defaultLocale: "en",
     capture: { autoAcceptSeconds: "soon" },
     currentRevisionId: SOURCE_REVISION,
+    idempotent: false,
+  })).toBeNull();
+});
+
+test("strictly parses preset apply responses and their exact source", () => {
+  expect(parsePresetApplyResponse({
+    frames: ["one"],
+    hasBoothKey: true,
+    locales: ["en", "ar"],
+    defaultLocale: "ar",
+    currentRevisionId: SOURCE_REVISION,
+    sourcePresetId: "launch-night",
+    idempotent: false,
+  })).toMatchObject({
+    frames: ["one"],
+    sourcePresetId: "launch-night",
+    currentRevisionId: SOURCE_REVISION,
+  });
+
+  expect(parsePresetApplyResponse({
+    frames: ["one"],
+    hasBoothKey: true,
+    currentRevisionId: SOURCE_REVISION,
+    sourcePresetId: "../launch",
+    idempotent: false,
+  })).toBeNull();
+
+  expect(parsePresetApplyResponse({
+    frames: ["one"],
+    hasBoothKey: true,
+    boothKey: "must-not-cross-the-client-boundary",
+    currentRevisionId: SOURCE_REVISION,
+    sourcePresetId: "launch-night",
     idempotent: false,
   })).toBeNull();
 });

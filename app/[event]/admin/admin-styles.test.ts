@@ -16,3 +16,20 @@ test("configuration history is a horizontal square contact strip", async () => {
   expect(record).toContain("aspect-ratio: 1");
   expect(record).toContain("flex:");
 });
+
+test("preset actions remain touch sized and reflow as a call sheet", async () => {
+  const css = await Bun.file(`${import.meta.dir}/admin.module.css`).text();
+  const actions = declarationBlock(
+    css,
+    ".presetSave, .presetLibraryRow button, .presetList button, .presetConfirm button",
+  );
+  const workspace = declarationBlock(css, ".presetWorkspace");
+  const rtl = declarationBlock(css, ".presetPanel[dir=\"rtl\"]");
+
+  expect(actions).toContain("min-height: 44px");
+  expect(workspace).toContain("grid-template-columns");
+  expect(rtl).toContain("text-align: start");
+  expect(css).toContain("@media (max-width: 700px)");
+  expect(css).toContain("@media (forced-colors: active)");
+  expect(css).toContain("@media (prefers-reduced-motion: reduce)");
+});

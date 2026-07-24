@@ -1,5 +1,9 @@
 import type { EventExperience, PublicEventConfig } from "../../event-config";
-import type { EventPreset } from "../../event-preset";
+import {
+  parseEventPreset,
+  serializePresetExperience,
+  type EventPreset,
+} from "../../event-preset";
 import type { ConfigHistoryResponse } from "./config-mutation";
 
 export type PendingPresetApply = Readonly<{
@@ -7,6 +11,44 @@ export type PendingPresetApply = Readonly<{
   mutationId: string;
   baseRevisionId: string | null;
 }>;
+
+export type PresetPageResponse = {
+  presets: EventPreset[];
+  cursor: string | null;
+};
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export function parsePresetPageResponse(value: unknown): PresetPageResponse | null {
+  if (
+    !isObject(value)
+    || Object.keys(value).some((key) => key !== "presets" && key !== "cursor")
+    || !Array.isArray(value.presets)
+    || (value.cursor !== null && typeof value.cursor !== "string")
+  ) {
+    return null;
+  }
+  const presets = value.presets.map(parseEventPreset);
+  if (presets.some((preset) => preset === null)) return null;
+  return {
+    presets: presets as EventPreset[],
+    cursor: value.cursor,
+  };
+}
+
+export function buildPresetSaveBody(input: {
+  label: string;
+  expectedUpdatedAt: string | null;
+  experience: EventExperience;
+}) {
+  return {
+    label: input.label,
+    config: serializePresetExperience(input.experience),
+    expectedUpdatedAt: input.expectedUpdatedAt,
+  };
+}
 
 export function mergePresetPage(
   current: readonly EventPreset[],
@@ -42,6 +84,21 @@ export function getOrCreatePresetApply(
   });
   pending.set(presetId, created);
   return created;
+}
+
+export function shouldClearPresetApply(status: number): boolean {
+  return [400, 401, 404, 409].includes(status);
+}
+
+export async function clearPresetApplyAfterReconciliation(
+  pending: Map<string, PendingPresetApply>,
+  request: PendingPresetApply,
+  reconcile: () => Promise<void>,
+): Promise<void> {
+  await reconcile();
+  if (pending.get(request.presetId) === request) {
+    pending.delete(request.presetId);
+  }
 }
 
 export function reconcileAppliedPreset(input: {

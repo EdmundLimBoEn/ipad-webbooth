@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { EventPreset } from "../../event-preset";
 import {
+  buildPresetSaveBody,
+  clearPresetApplyAfterReconciliation,
   getOrCreatePresetApply,
   mergePresetPage,
+  parsePresetPageResponse,
   reconcileAppliedPreset,
+  shouldClearPresetApply,
 } from "./preset-state";
 
 const preset = (id: string, label: string, updatedAt = "2026-07-24T00:00:00.000Z"): EventPreset => ({
@@ -13,6 +17,95 @@ const preset = (id: string, label: string, updatedAt = "2026-07-24T00:00:00.000Z
   createdAt: "2026-07-24T00:00:00.000Z",
   updatedAt,
   config: { frames: [id] },
+});
+
+test("strictly parses paged preset responses before merging them", () => {
+  const value = preset("launch", "Launch");
+  expect(parsePresetPageResponse({
+    presets: [value],
+    cursor: "opaque-cursor",
+  })).toEqual({
+    presets: [value],
+    cursor: "opaque-cursor",
+  });
+  expect(parsePresetPageResponse({
+    presets: [{ ...value, boothKey: "never" }],
+    cursor: null,
+  })).toBeNull();
+  expect(parsePresetPageResponse({
+    presets: [value],
+    cursor: 4,
+  })).toBeNull();
+});
+
+test("builds preset saves from the complete safe experience only", () => {
+  const body = buildPresetSaveBody({
+    label: "Launch",
+    expectedUpdatedAt: null,
+    experience: {
+      frames: ["square"],
+      locales: ["en", "ar"],
+      defaultLocale: "ar",
+      timeZone: "Asia/Singapore",
+      capture: {
+        reviewEnabled: false,
+        autoAcceptSeconds: 9,
+        countdownAudioDefault: true,
+      },
+      gallery: { title: "Night", accentColor: "#112233" },
+    },
+  });
+
+  expect(body).toEqual({
+    label: "Launch",
+    expectedUpdatedAt: null,
+    config: {
+      frames: ["square"],
+      locales: ["en", "ar"],
+      defaultLocale: "ar",
+      timeZone: "Asia/Singapore",
+      capture: {
+        reviewEnabled: false,
+        autoAcceptSeconds: 9,
+        countdownAudioDefault: true,
+      },
+      gallery: { title: "Night", accentColor: "#112233" },
+    },
+  });
+  expect(JSON.stringify(body)).not.toContain("booth");
+  expect(JSON.stringify(body)).not.toContain("revision");
+});
+
+test("retains ambiguous apply tuples until history reconciliation succeeds", async () => {
+  const pending = new Map();
+  const request = getOrCreatePresetApply(
+    pending,
+    "launch",
+    null,
+    () => "018f0000-0000-7000-8000-000000000030",
+  );
+
+  for (const failedStep of ["response parse", "history refresh"]) {
+    await expect(clearPresetApplyAfterReconciliation(
+      pending,
+      request,
+      async () => {
+        throw new Error(failedStep);
+      },
+    )).rejects.toThrow(failedStep);
+    expect(pending.get("launch")).toBe(request);
+  }
+  await clearPresetApplyAfterReconciliation(pending, request, async () => {});
+  expect(pending.has("launch")).toBe(false);
+});
+
+test("only definitive apply failures clear the retained tuple", () => {
+  for (const status of [400, 401, 404, 409]) {
+    expect(shouldClearPresetApply(status)).toBe(true);
+  }
+  for (const status of [0, 200, 408, 425, 429, 500, 503]) {
+    expect(shouldClearPresetApply(status)).toBe(false);
+  }
 });
 
 describe("Admin preset state", () => {

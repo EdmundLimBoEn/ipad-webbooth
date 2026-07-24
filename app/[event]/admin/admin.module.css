@@ -57,6 +57,8 @@
 .revisionHeadline strong { font: 900 15px/1 "Arial Narrow", Arial, sans-serif; text-transform: uppercase; }
 .currentStamp { padding: 5px 7px 4px; color: var(--ink); background: var(--green); font: 900 9px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .1em; transform: rotate(-1deg); }
 .revisionDetails > code { display: block; max-width: 100%; margin-top: 7px; overflow: hidden; color: var(--ink); font: 9px/1 ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; opacity: .62; }
+.revisionSource { margin-top: 8px; font: 800 10px/1.3 ui-monospace, monospace; overflow-wrap: anywhere; }
+.revisionSource code { font: inherit; }
 .revisionDelta { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
 .revisionDelta span { border: 1px solid var(--ink); padding: 4px 6px; color: var(--paper); background: var(--ink); font: 800 9px/1 ui-monospace, monospace; }
 .revisionDelta span[data-delta="added"] { color: var(--ink); background: var(--green); }
@@ -70,6 +72,46 @@
 .restoreConfirm button { border: 1px solid var(--paper); padding: 8px; color: var(--ink); background: var(--amber); font: 800 10px/1.2 system-ui, sans-serif; cursor: pointer; }
 .restoreConfirm button:last-child { color: var(--paper); background: var(--ink); }
 .restoreConfirm button:disabled { cursor: wait; opacity: .6; }
+.presetPanel { min-width: 0; border-block: 7px solid var(--ink); padding-block: 22px 26px; }
+.presetPanel[dir="rtl"] { text-align: start; }
+.presetHeading { display: grid; grid-template-columns: minmax(190px, .75fr) minmax(240px, 1fr); gap: 24px; align-items: end; }
+.presetHeading > div { display: flex; align-items: baseline; gap: 12px; }
+.presetHeading .cardNumber { color: var(--pink); }
+.presetHeading h2 { font: 900 clamp(32px, 4.5vw, 58px)/.82 Impact, "Arial Narrow", sans-serif; letter-spacing: -.025em; text-transform: uppercase; }
+.presetHeading > p { max-width: 54ch; font-size: 13px; line-height: 1.45; }
+.presetPrivacy { margin-top: 15px; border-inline-start: 7px solid var(--green); padding: 11px 13px; color: #fff; background: var(--ink); font: 800 12px/1.4 system-ui, sans-serif; }
+.presetWorkspace { display: grid; grid-template-columns: minmax(220px, .8fr) minmax(280px, 1.2fr); gap: 8px; margin-top: 8px; }
+.presetEditor { display: grid; grid-template-columns: 1fr; align-content: start; gap: 7px; border: 2px solid var(--ink); padding: 14px; background: #fff; }
+.presetEditor > label { margin-top: 5px; font: 800 10px/1 ui-monospace, monospace; letter-spacing: .07em; text-transform: uppercase; }
+.presetEditor input, .presetEditor select { min-height: 44px; min-width: 0; width: 100%; border: 1px solid var(--ink); padding: 9px 10px; color: var(--ink); background: #fff; font: 700 13px/1.2 system-ui, sans-serif; }
+.presetEditor input:disabled, .presetEditor select:disabled { cursor: wait; opacity: .58; }
+.presetLibraryRow { display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, auto); gap: 6px; }
+.presetSave, .presetLibraryRow button, .presetList button, .presetConfirm button { min-height: 44px; border: 2px solid var(--ink); padding: 10px 12px; color: var(--ink); background: var(--amber); font: 900 12px/1.15 system-ui, sans-serif; cursor: pointer; }
+.presetSave { margin-top: 7px; color: #fff; background: var(--pink); }
+.presetSave:disabled, .presetLibraryRow button:disabled, .presetList button:disabled, .presetConfirm button:disabled { cursor: wait; opacity: .58; }
+.presetSummary { min-width: 0; padding: 18px; color: #fff; background: var(--ink); }
+.presetSummary h3 { max-width: 12ch; color: var(--amber); font: 900 clamp(28px, 4vw, 48px)/.86 Impact, "Arial Narrow", sans-serif; letter-spacing: -.02em; text-transform: uppercase; }
+.presetSummary ul { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 18px; padding: 0; list-style: none; }
+.presetSummary li { min-width: 0; border: 1px solid #777; padding: 7px 8px; font: 800 10px/1.25 ui-monospace, monospace; overflow-wrap: anywhere; }
+.presetList { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 250px), 1fr)); gap: 7px; margin-top: 8px; padding: 0; list-style: none; }
+.presetList li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; border: 2px solid var(--ink); padding: 10px; background: #fff; }
+.presetList li[data-selected="true"] { box-shadow: inset 6px 0 var(--green); }
+.presetList li > div { min-width: 0; }
+.presetList strong, .presetList code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.presetList strong { font: 900 15px/1.1 system-ui, sans-serif; }
+.presetList code { margin-top: 5px; color: #5d5b55; font: 10px/1.2 ui-monospace, monospace; }
+.presetConfirm { margin-top: 8px; border: 3px solid var(--ink); padding: 15px; background: #fff5d6; }
+.presetConfirm > p { font: 800 13px/1.4 system-ui, sans-serif; overflow-wrap: anywhere; }
+.presetConfirm .presetExact { margin-top: 7px; font: 800 11px/1.3 ui-monospace, monospace; }
+.presetConfirm .presetWarning { margin-top: 10px; border-inline-start: 6px solid #be124e; padding: 9px 11px; color: #8f1239; background: #ffe4e6; }
+.presetConfirm > div { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 13px; }
+.presetConfirm > div button:first-child { color: #fff; background: var(--pink); }
+.presetConfirm > div button:last-child { background: #fff; }
+.presetEmpty, .presetLoadError { margin-top: 8px; border: 2px dashed #8c8880; padding: 16px; font: 800 12px/1.4 system-ui, sans-serif; }
+.presetLoadError { border-color: #be124e; color: #8f1239; background: #ffe4e6; }
+.presetStatus, .presetError { min-height: 1.45em; margin-top: 8px; font: 800 12px/1.45 system-ui, sans-serif; }
+.presetStatus { color: #08752f; }
+.presetError { color: #8f1239; }
 .sideCard, .linkCard { border: 2px solid var(--ink); padding: 17px; background: #fff; }.sideCard .cardNumber { color: var(--pink); display: block; margin-bottom: 16px; }.sideCard h2 { font-size: 30px; margin-bottom: 10px; }.sideCard p { margin-bottom: 16px; }
 .exportPanel { border: 3px solid var(--ink); padding: 17px; background: #fff; box-shadow: inset 0 7px var(--green); }
 .exportPanel .cardNumber { display: block; margin: 7px 0 14px; color: var(--pink); }
@@ -139,8 +181,10 @@
 .authPage { display: grid; place-items: center; padding: 20px; background: var(--ink); color: #fff; }.authCard { width: min(500px, 100%); border-top: 8px solid var(--pink); padding: clamp(25px, 5vw, 55px); background: #1a1a19; }.authCard h1 { margin: 25px 0; font: 900 clamp(58px, 10vw, 90px)/.78 Impact, sans-serif; text-transform: uppercase; }.authCard > p:not(.kicker) { color: #bbb; line-height: 1.4; margin-bottom: 28px; }.authCard label { display: block; margin-bottom: 8px; font: 800 11px/1 ui-monospace, monospace; text-transform: uppercase; }.authCard input { width: 100%; padding: 14px; border: 1px solid #777; background: #080808; color: #fff; font: 16px/1 ui-monospace, monospace; }.authCard button { width: 100%; margin-top: 10px; padding: 15px; border: 0; color: #fff; background: var(--pink); font-weight: 900; cursor: pointer; }
 .console button:focus-visible, .console a:focus-visible, .console input:focus-visible, .console select:focus-visible, .console textarea:focus-visible, .authPage button:focus-visible, .authPage input:focus-visible, .frameCard:focus-within { outline: 3px solid var(--amber); outline-offset: 3px; }
 @media (forced-colors: active) { .console button:focus-visible, .console a:focus-visible, .console input:focus-visible, .console select:focus-visible, .console textarea:focus-visible, .authPage button:focus-visible, .authPage input:focus-visible, .moderationDialog button:focus-visible { outline: 3px solid Highlight !important; outline-offset: 3px; }.localeOptions label:has(input:checked), .experienceToggle:has(input:checked) { border: 2px solid Highlight; box-shadow: none; }.exportPanel { border: 3px solid CanvasText; box-shadow: none; }.exportPrimary, .exportSecondary { border: 2px solid ButtonText; } }
+@media (forced-colors: active) { .presetPanel, .presetEditor, .presetList li, .presetConfirm { border-color: CanvasText; }.presetPrivacy, .presetSummary { border: 2px solid CanvasText; }.presetList li[data-selected="true"] { border: 3px solid Highlight; box-shadow: none; }.presetWarning { border-color: Highlight; } }
 @media (max-width: 900px) { .layout { grid-template-columns: 1fr; }.sideColumn { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }.readiness { grid-template-columns: repeat(2, 1fr); }.railLabel { grid-row: span 2; }.sectionHead { grid-template-columns: 1fr; gap: 10px; }.boothOperationsHead { align-items: start; flex-direction: column; }.boothControlState { text-align: start; } }
 @media (max-width: 760px) { .moderationFilters { grid-template-columns: 1fr; }.moderationFilterActions { display: grid; grid-template-columns: 1fr 1fr; }.moderationRebuild { grid-template-columns: 1fr; }.moderationDialog { grid-template-columns: 1fr; }.moderationDialogHead, .moderationCleanup, .moderationDialogError, .moderationRemove, .moderationConfirm { grid-column: 1; } }
 @media (max-width: 600px) { .console { padding: 15px; }.header { align-items: start; flex-direction: column; }.headerActions { justify-content: flex-start; }.readiness { grid-template-columns: 1fr 1fr; }.railLabel { grid-row: auto; }.sideColumn { grid-template-columns: 1fr; }.filmRail { grid-template-columns: repeat(2, minmax(0, 1fr)); }.revisionRail { padding-right: 9px; padding-left: 9px; scroll-padding-inline: 9px; }.revisionRecord { flex-basis: min(78vw, 280px); scroll-margin-inline: 9px; }.contactSheet, .moderationGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.linkCard { grid-template-columns: minmax(0, 1fr) 82px; }.linkCard img { width: 82px; height: 82px; }.boothControlBar { grid-template-columns: 1fr; }.boothActions { display: grid; grid-template-columns: 1fr 1fr; }.boothRoster { grid-template-columns: 1fr; } }
 @media (max-width: 600px) { .experiencePanel { grid-template-columns: 1fr; }.localeOptions { grid-template-columns: 1fr; }.experienceField { grid-template-columns: 1fr; gap: 6px; } }
+@media (max-width: 700px) { .presetHeading, .presetWorkspace { grid-template-columns: 1fr; }.presetLibraryRow { grid-template-columns: 1fr; }.presetList { grid-template-columns: 1fr; }.presetList li { grid-template-columns: 1fr; }.presetList button { width: 100%; }.presetConfirm > div { display: grid; grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { .console *, .console *::before, .console *::after, .authPage *, .authPage *::before, .authPage *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; } }

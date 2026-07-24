@@ -5,10 +5,16 @@ import { useParams } from "next/navigation";
 import QRCode from "qrcode";
 import { TEMPLATES } from "../../templates";
 import type { ConfigRevision, PublicEventConfig } from "../../event-config";
-import { message, type SupportedLocale } from "../../i18n/catalog";
+import { isPresetId, parseEventPreset, type EventPreset } from "../../event-preset";
+import {
+  isSupportedLocale,
+  message,
+  type SupportedLocale,
+} from "../../i18n/catalog";
 import {
   deviceLocaleStorageKey,
   DocumentLocaleLease,
+  resolveEnabledLocales,
   resolveDeviceLocale,
 } from "../../i18n/locale";
 import type { ModerationPhoto } from "../../moderation";
@@ -42,6 +48,7 @@ import {
   removeModeratedPhoto,
   type ModerationFilters,
 } from "./moderation-state";
+import { PresetPanel } from "./preset-panel";
 import {
   buildConfigSaveBody,
   clearRestoreRequestAfterReconciliation,
@@ -49,10 +56,21 @@ import {
   getOrCreateRestoreRequest,
   parseConfigHistoryResponse,
   parseConfigMutationResponse,
+  parsePresetApplyResponse,
   rebaseConfigHistory,
   shouldClearRestoreRequest,
   type RestoreRequest,
 } from "./config-mutation";
+import {
+  buildPresetSaveBody,
+  clearPresetApplyAfterReconciliation,
+  getOrCreatePresetApply,
+  mergePresetPage,
+  parsePresetPageResponse,
+  reconcileAppliedPreset,
+  shouldClearPresetApply,
+  type PendingPresetApply,
+} from "./preset-state";
 import styles from "./admin.module.css";
 
 type AuthState = "missing" | "ready" | "invalid";
@@ -98,6 +116,17 @@ export default function Admin() {
   const [cleanupPending, setCleanupPending] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [presets, setPresets] = useState<EventPreset[]>([]);
+  const [presetsLoading, setPresetsLoading] = useState(false);
+  const [presetsError, setPresetsError] = useState("");
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+  const [presetIdDraft, setPresetIdDraft] = useState("");
+  const [presetLabelDraft, setPresetLabelDraft] = useState("");
+  const [presetSaving, setPresetSaving] = useState(false);
+  const [applyingPresetId, setApplyingPresetId] = useState<string | null>(null);
+  const [confirmingPresetId, setConfirmingPresetId] = useState<string | null>(null);
+  const [presetNotice, setPresetNotice] = useState("");
+  const [presetActionError, setPresetActionError] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [origin, setOrigin] = useState("");
@@ -123,11 +152,37 @@ export default function Admin() {
   const configMutationBusy = useRef(false);
   const pendingSaveMutationId = useRef<string | null>(null);
   const pendingRestoreRequests = useRef(new Map<string, RestoreRequest>());
+  const pendingPresetApplies = useRef(new Map<string, PendingPresetApply>());
 
   const boothUrl = `${origin}/${event}`;
   const liveUrl = `${boothUrl}/live`;
   const defaults = useMemo(() => Object.keys(TEMPLATES).filter((key) => !TEMPLATES[key].group), []);
-  const configBusy = saving || restoringRevisionId !== null;
+  const configBusy =
+    saving
+    || restoringRevisionId !== null
+    || presetSaving
+    || applyingPresetId !== null;
+  const currentExperience = useMemo(() => ({
+    frames: [...frames],
+    locales: [...locales],
+    defaultLocale,
+    ...(timeZone ? { timeZone } : {}),
+    capture: {
+      reviewEnabled,
+      autoAcceptSeconds,
+      countdownAudioDefault,
+    },
+    ...(gallery ? { gallery: { ...gallery } } : {}),
+  }), [
+    autoAcceptSeconds,
+    countdownAudioDefault,
+    defaultLocale,
+    frames,
+    gallery,
+    locales,
+    reviewEnabled,
+    timeZone,
+  ]);
   const clearPendingSave = () => {
     pendingSaveMutationId.current = null;
     setError((current) => current === CONFIG_CONFLICT_MESSAGE ? "" : current);
@@ -179,24 +234,27 @@ export default function Admin() {
     void QRCode.toDataURL(liveUrl, { width: 240, margin: 1 }).then(setLiveQr).catch(() => setLiveQr(""));
   }, [boothUrl, liveUrl, origin]);
 
+  const fetchConfigHistory = useCallback(async () => {
+    const response = await fetch(`/api/config/revisions?event=${encodeURIComponent(event)}`, {
+        cache: "no-store",
+        headers: { "x-booth-key": adminKey },
+    });
+    if (response.status === 401) {
+      sessionStorage.removeItem("adminKey");
+      setAuth("invalid");
+      throw new Error("That admin key was rejected.");
+    }
+    if (!response.ok) throw new Error(`Configuration history returned ${response.status}`);
+    const data = parseConfigHistoryResponse(await response.json());
+    if (!data) throw new Error("Configuration history had an unexpected shape");
+    return data;
+  }, [adminKey, event]);
+
   const loadConfig = useCallback(async () => {
     setConfigLoaded(false);
     setConfigError("");
     try {
-      const response = await fetch(`/api/config/revisions?event=${encodeURIComponent(event)}`, {
-        cache: "no-store",
-        headers: { "x-booth-key": adminKey },
-      });
-      if (response.status === 401) {
-        sessionStorage.removeItem("adminKey");
-        setAuth("invalid");
-        throw new Error("That admin key was rejected.");
-      }
-      if (!response.ok) throw new Error(`Configuration history returned ${response.status}`);
-      const data = parseConfigHistoryResponse(await response.json());
-      if (!data) {
-        throw new Error("Configuration history had an unexpected shape");
-      }
+      const data = await fetchConfigHistory();
       const rebased = rebaseConfigHistory(data, defaults, pendingSaveMutationId);
       setFrames(new Set(rebased.frames));
       setLocales(new Set(rebased.locales));
@@ -217,12 +275,53 @@ export default function Admin() {
       setCurrentRevisionId(rebased.currentRevisionId);
       setRevisions(rebased.revisions);
       setConfigLoaded(true);
-      return true;
+      return data;
     } catch (cause) {
       setConfigError(cause instanceof Error ? cause.message : "Config could not be loaded");
-      return false;
+      return null;
     }
-  }, [adminKey, defaults, event]);
+  }, [defaults, fetchConfigHistory]);
+
+  const loadPresets = useCallback(async () => {
+    setPresetsLoading(true);
+    setPresetsError("");
+    try {
+      let cursor: string | null = null;
+      let merged: EventPreset[] = [];
+      const seen = new Set<string>();
+      do {
+        const query = new URLSearchParams({ limit: "100" });
+        if (cursor !== null) query.set("cursor", cursor);
+        const response = await fetch(`/api/presets?${query}`, {
+          cache: "no-store",
+          headers: { "x-booth-key": adminKey },
+        });
+        if (response.status === 401) {
+          invalidateAuth();
+          throw new Error("That admin key was rejected.");
+        }
+        if (!response.ok) throw new Error(`Presets returned ${response.status}`);
+        const page = parsePresetPageResponse(await response.json());
+        if (!page) throw new Error("Presets had an unexpected shape");
+        merged = mergePresetPage(merged, page.presets);
+        cursor = page.cursor;
+        if (cursor !== null) {
+          if (seen.has(cursor)) throw new Error("Presets returned a repeated cursor");
+          seen.add(cursor);
+        }
+      } while (cursor !== null);
+      setPresets(merged);
+      setPresetsError("");
+      return merged;
+    } catch (cause) {
+      setPresetsError(
+        cause instanceof Error ? cause.message : "Presets could not be loaded",
+      );
+      return null;
+    } finally {
+      setPresetsLoading(false);
+    }
+  }, [adminKey, event]);
 
   const requestModerationPage = useCallback(async (input: {
     reset: boolean;
@@ -497,6 +596,11 @@ export default function Admin() {
   }, [adminKey, auth, loadConfig]);
 
   useEffect(() => {
+    if (auth !== "ready" || !adminKey) return;
+    void loadPresets();
+  }, [adminKey, auth, loadPresets]);
+
+  useEffect(() => {
     const coordinator = boothCoordinator.current;
     if (auth !== "ready" || !adminKey) {
       coordinator.disposeScope();
@@ -748,6 +852,171 @@ export default function Admin() {
     }
   };
 
+  const selectPreset = (presetId: string | null) => {
+    if (configMutationBusy.current) return;
+    setSelectedPresetId(presetId);
+    setConfirmingPresetId(null);
+    setPresetActionError("");
+    setPresetNotice("");
+    const selected = presets.find((preset) => preset.id === presetId);
+    setPresetIdDraft(selected?.id ?? "");
+    setPresetLabelDraft(selected?.label ?? "");
+  };
+
+  const savePreset = async () => {
+    if (!configLoaded || configMutationBusy.current) return;
+    const presetId = presetIdDraft.trim();
+    const label = presetLabelDraft.trim();
+    if (!isPresetId(presetId) || !label) {
+      setPresetActionError(message(defaultLocale, "presetGenericError"));
+      return;
+    }
+    const selected = presets.find((preset) => preset.id === selectedPresetId);
+    configMutationBusy.current = true;
+    setPresetSaving(true);
+    setPresetActionError("");
+    setPresetNotice("");
+    try {
+      const response = await fetch(
+        `/api/presets/${encodeURIComponent(presetId)}`,
+        {
+          method: "PUT",
+          cache: "no-store",
+          headers: {
+            "x-booth-key": adminKey,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(buildPresetSaveBody({
+            label,
+            expectedUpdatedAt: selected?.updatedAt ?? null,
+            experience: currentExperience,
+          })),
+        },
+      );
+      if (response.status === 401) {
+        invalidateAuth();
+        throw new Error("That admin key was rejected.");
+      }
+      if (response.status === 409) {
+        const latest = await loadPresets();
+        const refreshed = latest?.find((preset) => preset.id === presetId);
+        setSelectedPresetId(refreshed?.id ?? null);
+        setPresetIdDraft(refreshed?.id ?? "");
+        setPresetLabelDraft(refreshed?.label ?? "");
+        setPresetActionError(message(defaultLocale, "presetConflict"));
+        return;
+      }
+      if (!response.ok) throw new Error(`Preset save failed (${response.status})`);
+      const saved = parseEventPreset(await response.json());
+      if (!saved) throw new Error("Preset response had an unexpected shape");
+      setPresets((current) => mergePresetPage(current, [saved]));
+      setSelectedPresetId(saved.id);
+      setPresetIdDraft(saved.id);
+      setPresetLabelDraft(saved.label);
+      setPresetNotice(message(defaultLocale, "presetSaved", { preset: saved.label }));
+    } catch (cause) {
+      setPresetActionError(
+        cause instanceof Error
+          ? cause.message
+          : message(defaultLocale, "presetGenericError"),
+      );
+    } finally {
+      configMutationBusy.current = false;
+      setPresetSaving(false);
+    }
+  };
+
+  const applyPreset = async (presetId: string) => {
+    if (!configLoaded || configMutationBusy.current) return;
+    const preset = presets.find((item) => item.id === presetId);
+    if (!preset) return;
+    configMutationBusy.current = true;
+    const pending = pendingPresetApplies.current;
+    const request = getOrCreatePresetApply(
+      pending,
+      presetId,
+      currentRevisionId,
+      () => crypto.randomUUID(),
+    );
+    setApplyingPresetId(presetId);
+    setPresetActionError("");
+    setPresetNotice("");
+    try {
+      const response = await fetch(
+        `/api/presets/apply?event=${encodeURIComponent(event)}`,
+        {
+          method: "POST",
+          cache: "no-store",
+          headers: {
+            "x-booth-key": adminKey,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(request),
+        },
+      );
+      if (shouldClearPresetApply(response.status)) pending.delete(presetId);
+      if (response.status === 401) {
+        invalidateAuth();
+        throw new Error("That admin key was rejected.");
+      }
+      if (response.status === 409) {
+        await Promise.all([loadConfig(), loadPresets()]);
+        setConfirmingPresetId(null);
+        setPresetActionError(message(defaultLocale, "presetConflict"));
+        return;
+      }
+      if (!response.ok) throw new Error(`Preset apply failed (${response.status})`);
+      await clearPresetApplyAfterReconciliation(pending, request, async () => {
+        const applied = parsePresetApplyResponse(await response.json());
+        if (!applied) throw new Error("Preset response had an unexpected shape");
+        const history = await fetchConfigHistory();
+        const rebased = reconcileAppliedPreset({
+          response: applied,
+          history,
+          sourcePresetId: presetId,
+        });
+        setFrames(new Set(rebased.experience.frames));
+        const appliedLocales = resolveEnabledLocales(rebased.experience.locales);
+        setLocales(new Set(appliedLocales));
+        setDefaultLocale(
+          isSupportedLocale(rebased.experience.defaultLocale)
+          && appliedLocales.includes(rebased.experience.defaultLocale)
+            ? rebased.experience.defaultLocale
+            : "en",
+        );
+        setTimeZone(rebased.experience.timeZone);
+        setReviewEnabled(rebased.experience.capture?.reviewEnabled ?? true);
+        setAutoAcceptSeconds(rebased.experience.capture?.autoAcceptSeconds ?? 5);
+        setCountdownAudioDefault(
+          rebased.experience.capture?.countdownAudioDefault ?? false,
+        );
+        setGallery(rebased.experience.gallery);
+        setCurrentRevisionId(rebased.currentRevisionId);
+        setRevisions(history.revisions);
+        setHasBoothKey(rebased.hasBoothKey);
+        pendingSaveMutationId.current = null;
+        setConfigError("");
+        setConfigLoaded(true);
+        setBoothKey("");
+        setBoothKeySaved(false);
+        setCopied((current) => current === "key" ? "" : current);
+      });
+      setConfirmingPresetId(null);
+      setPresetNotice(message(defaultLocale, "presetApplied", {
+        preset: preset.label,
+      }));
+    } catch (cause) {
+      setPresetActionError(
+        cause instanceof Error
+          ? cause.message
+          : message(defaultLocale, "presetGenericError"),
+      );
+    } finally {
+      configMutationBusy.current = false;
+      setApplyingPresetId(null);
+    }
+  };
+
   const deletePhoto = async (photo: ModerationPhoto) => {
     setDeleting(true);
     setPhotosError("");
@@ -926,26 +1195,53 @@ export default function Admin() {
 
           <ConfigHistoryPanel
             currentFrames={[...frames]}
-            currentExperience={{
-              frames: [...frames],
-              locales: [...locales],
-              defaultLocale,
-              ...(timeZone ? { timeZone } : {}),
-              capture: {
-                reviewEnabled,
-                autoAcceptSeconds,
-                countdownAudioDefault,
-              },
-              ...(gallery ? { gallery } : {}),
-            }}
+            currentExperience={currentExperience}
             currentRevisionId={currentRevisionId}
             revisions={revisions}
             loading={!configLoaded && !configError}
             restoringRevisionId={restoringRevisionId}
             mutationBusy={configBusy}
+            locale={defaultLocale}
             error={configError}
             onReload={() => void loadConfig()}
             onRestore={(revisionId) => void restoreRevision(revisionId)}
+          />
+
+          <PresetPanel
+            locale={defaultLocale}
+            event={event}
+            currentExperience={currentExperience}
+            presets={presets}
+            selectedPresetId={selectedPresetId}
+            presetIdDraft={presetIdDraft}
+            presetLabelDraft={presetLabelDraft}
+            loading={presetsLoading}
+            loadError={presetsError}
+            mutationBusy={configBusy || !configLoaded}
+            saving={presetSaving}
+            applyingPresetId={applyingPresetId}
+            confirmingPresetId={confirmingPresetId}
+            hasBoothKey={hasBoothKey}
+            successMessage={presetNotice}
+            errorMessage={presetActionError}
+            onPresetIdChange={(value) => {
+              setPresetIdDraft(value);
+              setPresetActionError("");
+            }}
+            onPresetLabelChange={(value) => {
+              setPresetLabelDraft(value);
+              setPresetActionError("");
+            }}
+            onSelectPreset={selectPreset}
+            onSave={() => void savePreset()}
+            onRequestApply={(presetId) => {
+              setConfirmingPresetId(presetId);
+              setPresetActionError("");
+              setPresetNotice("");
+            }}
+            onConfirmApply={(presetId) => void applyPreset(presetId)}
+            onCancelApply={() => setConfirmingPresetId(null)}
+            onReload={() => void loadPresets()}
           />
 
           <BoothOperationsPanel

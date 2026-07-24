@@ -67,4 +67,14 @@ describe("guest message catalogs", () => {
     expect(message("ar", "moderationOpenPhoto", { filename: "photo.jpg" }))
       .toContain("photo.jpg");
   });
+
+  test("localizes the complete preset workflow in every supported locale", () => {
+    expect(message("en", "presetPanelTitle")).toBe("Event presets");
+    expect(message("zh-SG", "presetCreateAction")).toBe("创建预设");
+    expect(message("ar", "presetApplyAction")).toBe("تطبيق الإعداد المسبق");
+    expect(message("ar", "presetApplyConfirmation", {
+      event: "launch",
+      preset: "Night",
+    })).toContain("launch");
+  });
 });

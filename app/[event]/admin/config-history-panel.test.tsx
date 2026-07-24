@@ -146,3 +146,32 @@ test("history summaries make locale and capture settings visible", () => {
   expect(html).toContain("Countdown audio: on");
   expect(html).toContain('data-experience-changed="true"');
 });
+
+test("preset revisions name their exact source preset without bidi ambiguity", () => {
+  const html = renderToStaticMarkup(
+    <ConfigHistoryPanel
+      currentFrames={["one"]}
+      currentExperience={{ frames: ["one"] }}
+      currentRevisionId="018f0000-0000-7000-8000-000000000030"
+      revisions={[{
+        version: 1,
+        id: "018f0000-0000-7000-8000-000000000030",
+        createdAt: "2026-07-24T00:00:00.000Z",
+        parentRevisionId: null,
+        reason: "preset",
+        sourcePresetId: "launch-night",
+        config: { frames: ["one"] },
+      }]}
+      loading={false}
+      restoringRevisionId={null}
+      mutationBusy={false}
+      locale="ar"
+      error=""
+      onReload={() => {}}
+      onRestore={() => {}}
+    />,
+  );
+
+  expect(html).toContain("الإعداد المسبق المطبق");
+  expect(html).toContain("<bdi><code>launch-night</code></bdi>");
+});

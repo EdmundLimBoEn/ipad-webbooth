@@ -5,6 +5,7 @@ import type { ConfigRevision, EventExperience } from "../../event-config";
 import { resolveEnabledLocales } from "../../i18n/locale";
 import {
   isSupportedLocale,
+  message,
   type SupportedLocale,
 } from "../../i18n/catalog";
 import styles from "./admin.module.css";
@@ -17,6 +18,7 @@ export type ConfigHistoryPanelProps = {
   loading: boolean;
   restoringRevisionId: string | null;
   mutationBusy: boolean;
+  locale?: SupportedLocale;
   error: string;
   onReload: () => void;
   onRestore: (revisionId: string) => void;
@@ -67,6 +69,7 @@ export function ConfigHistoryPanel({
   loading,
   restoringRevisionId,
   mutationBusy,
+  locale = "en",
   error,
   onReload,
   onRestore,
@@ -126,6 +129,12 @@ export function ConfigHistoryPanel({
                     <strong>{reasonLabel[revision.reason]}</strong>
                     {isCurrent && <span className={styles.currentStamp}>Current</span>}
                   </div>
+                  {revision.reason === "preset" && revision.sourcePresetId && (
+                    <p className={styles.revisionSource}>
+                      {message(locale, "presetSourceLabel")}{" "}
+                      <bdi><code>{revision.sourcePresetId}</code></bdi>
+                    </p>
+                  )}
                   <code title={revision.id}>{revision.id}</code>
                   <div className={styles.revisionDelta}>
                     <span>{revision.config.frames.length} Frame{revision.config.frames.length === 1 ? "" : "s"}</span>
