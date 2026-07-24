@@ -352,6 +352,42 @@ export type PutEventPresetInput = {
   expectedUpdatedAt: string | null;
 };
 
+type EventPresetCursor = Pick<EventPreset, "label" | "id">;
+const EVENT_PRESET_CURSOR_PREFIX = "preset-v1:";
+
+function compareEventPresets(left: EventPresetCursor, right: EventPresetCursor): number {
+  if (left.label < right.label) return -1;
+  if (left.label > right.label) return 1;
+  if (left.id < right.id) return -1;
+  if (left.id > right.id) return 1;
+  return 0;
+}
+
+function encodeEventPresetCursor(preset: EventPresetCursor): string {
+  return `${EVENT_PRESET_CURSOR_PREFIX}${encodeURIComponent(preset.label)}:${preset.id}`;
+}
+
+function parseEventPresetCursor(value: string): EventPresetCursor {
+  if (!value.startsWith(EVENT_PRESET_CURSOR_PREFIX)) {
+    throw new TypeError("preset cursor is invalid");
+  }
+  const payload = value.slice(EVENT_PRESET_CURSOR_PREFIX.length);
+  const separator = payload.lastIndexOf(":");
+  if (separator <= 0) throw new TypeError("preset cursor is invalid");
+  const encodedLabel = payload.slice(0, separator);
+  const id = payload.slice(separator + 1);
+  try {
+    const label = decodeURIComponent(encodedLabel);
+    validatePresetLabel(label);
+    if (encodeURIComponent(label) !== encodedLabel || !isPresetId(id)) {
+      throw new TypeError("preset cursor is invalid");
+    }
+    return { label, id };
+  } catch {
+    throw new TypeError("preset cursor is invalid");
+  }
+}
+
 export class ConfigConflictError extends Error {
   constructor(readonly expectedRevisionId: string | null, readonly currentRevisionId: string | null) {
     super("event configuration changed");
@@ -526,30 +562,45 @@ export class EventStore {
     ) {
       throw new TypeError("preset cursor is invalid");
     }
-    const page = await this.state.list({
-      prefix: eventPresetPrefix(),
-      ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
-      limit,
-    });
-    const presets = await Promise.all(page.objects.map(async (listed) => {
-      const match = /^presets\/([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.json$/.exec(
-        listed.key,
-      );
-      if (!match) throw new InvalidStoredEventPresetError(listed.key);
-      const object = await this.state.get(listed.key);
-      if (!object) throw new InvalidStoredEventPresetError(match[1]!);
-      return this.readEventPresetObject(match[1]!, object);
-    }));
-    presets.sort((left, right) => {
-      if (left.label < right.label) return -1;
-      if (left.label > right.label) return 1;
-      if (left.id < right.id) return -1;
-      if (left.id > right.id) return 1;
-      return 0;
-    });
+    const after = options.cursor === undefined
+      ? null
+      : parseEventPresetCursor(options.cursor);
+    const presets: EventPreset[] = [];
+    let storageCursor: string | undefined;
+    do {
+      const page = await this.state.list({
+        prefix: eventPresetPrefix(),
+        ...(storageCursor !== undefined ? { cursor: storageCursor } : {}),
+        limit: PAGE_SIZE,
+      });
+      const pagePresets = await Promise.all(page.objects.map(async (listed) => {
+        const match = /^presets\/([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.json$/.exec(
+          listed.key,
+        );
+        if (!match) throw new InvalidStoredEventPresetError(listed.key);
+        const object = await this.state.get(listed.key);
+        if (!object) throw new InvalidStoredEventPresetError(match[1]!);
+        return this.readEventPresetObject(match[1]!, object);
+      }));
+      presets.push(...pagePresets);
+      if (!page.truncated) {
+        storageCursor = undefined;
+        break;
+      }
+      if (!page.cursor) throw new InvalidStoredEventPresetError(eventPresetPrefix());
+      storageCursor = page.cursor;
+    } while (storageCursor !== undefined);
+
+    presets.sort(compareEventPresets);
+    const remaining = after === null
+      ? presets
+      : presets.filter((preset) => compareEventPresets(preset, after) > 0);
+    const result = remaining.slice(0, limit);
     return {
-      presets,
-      cursor: page.truncated ? page.cursor ?? null : null,
+      presets: result,
+      cursor: remaining.length > limit
+        ? encodeEventPresetCursor(result[result.length - 1]!)
+        : null,
     };
   }
 

@@ -2611,16 +2611,19 @@ describe("EventStore", () => {
       })).rejects.toBeInstanceOf(PresetConflictError);
     });
 
-    test("pages privately, passes opaque cursors, and sorts each page by label then ID", async () => {
+    test("pages privately with global label and ID ordering", async () => {
       const state = new InMemoryObjectStore();
       const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
-      for (const [id, label] of [["z", "Beta"], ["a", "Alpha"], ["b", "Alpha"]] as const) {
+      for (const [id, label] of [["a", "Zulu"], ["b", "Yankee"], ["c", "Alpha"]] as const) {
         await store.putEventPreset(id, { label, config: experience, expectedUpdatedAt: null });
       }
 
-      const page = await store.listEventPresets({ limit: 3 });
-      expect(page.presets.map(({ id }) => id)).toEqual(["a", "b", "z"]);
-      expect(page.cursor).toBeNull();
+      const first = await store.listEventPresets({ limit: 2 });
+      expect(first.presets.map(({ id }) => id)).toEqual(["c", "b"]);
+      expect(first.cursor).not.toBeNull();
+      const second = await store.listEventPresets({ limit: 2, cursor: first.cursor! });
+      expect(second.presets.map(({ id }) => id)).toEqual(["a"]);
+      expect(second.cursor).toBeNull();
       await expect(store.listEventPresets({ limit: 0 })).rejects.toThrow("1 to 100");
       await expect(store.listEventPresets({ limit: 101 })).rejects.toThrow("1 to 100");
       await expect(store.listEventPresets({ cursor: "" })).rejects.toThrow("cursor");
