@@ -62,8 +62,11 @@ export class BoothSession {
     const blob = await capture(options.signal);
     if (options.signal?.aborted) throw abortError();
     // Preserve enqueue order even if two captures share a millisecond or the
-    // device clock moves backwards while the booth is running.
+    // device clock moves backwards while the booth is running. Reserve before
+    // awaiting persistence so concurrent successful captures cannot share a
+    // timestamp; a failed put may leave a harmless gap.
     const createdAt = Math.max(this.now(), this.lastCreatedAt + 1);
+    this.lastCreatedAt = createdAt;
     const item: OutboxItem = {
       id: this.makeId(),
       event: this.event,
@@ -74,7 +77,6 @@ export class BoothSession {
       ...(options.rehearsalId === undefined ? {} : { rehearsalId: options.rehearsalId }),
     };
     await this.store.put(item);
-    this.lastCreatedAt = createdAt;
     const pending = await this.store.list(this.event);
     this.publish({
       status: this.state.status === "failed" ? "failed" : "idle",
@@ -111,7 +113,14 @@ export class BoothSession {
       try {
         const result = await this.upload(item);
         await this.store.remove(item.id);
-        this.onUploaded(result);
+        // Notification is outside the durable retry boundary. Storage already
+        // acknowledged and the item is gone, so a UI callback failure must not
+        // resurrect a duplicate upload.
+        try {
+          this.onUploaded(result);
+        } catch {
+          // The next state publication still reconciles the Booth UI.
+        }
         pending = await this.store.list(this.event);
         this.publish({
           status: "idle",

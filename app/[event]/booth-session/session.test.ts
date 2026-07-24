@@ -7,6 +7,58 @@ const photo = (name: string) => new Blob([name], { type: "image/jpeg" });
 const text = (blob: Blob) => blob.text();
 
 describe("BoothSession outbox", () => {
+  test("reserves strictly increasing FIFO order across concurrent durable puts", async () => {
+    let releasePuts!: () => void;
+    const putBarrier = new Promise<void>((resolve) => {
+      releasePuts = resolve;
+    });
+    let waitingPuts = 0;
+    class ConcurrentPutStore extends MemoryOutboxStore {
+      override async put(item: OutboxItem) {
+        waitingPuts++;
+        if (waitingPuts === 2) releasePuts();
+        await putBarrier;
+        await super.put(item);
+      }
+    }
+
+    const store = new ConcurrentPutStore();
+    const ids = [
+      "018f0000-0000-4000-8000-000000000002",
+      "018f0000-0000-4000-8000-000000000001",
+    ];
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => ({ url: "/photo" }),
+      () => {},
+      () => ids.shift()!,
+      () => 1753315200000
+    );
+
+    const [first, second] = await Promise.all([
+      session.enqueueCapture(async () => photo("first"), {
+        metadata: { source: "framed", frameKey: "square" },
+      }),
+      session.enqueueCapture(async () => photo("second"), {
+        metadata: { source: "camera-fallback" },
+      }),
+    ]);
+
+    expect([first.createdAt, second.createdAt]).toEqual([
+      1753315200000,
+      1753315200001,
+    ]);
+    expect(first.metadata?.capturedAt).toBe(first.createdAt);
+    expect(second.metadata?.capturedAt).toBe(second.createdAt);
+    const queued = await store.list("party");
+    expect(queued.map((item) => item.id)).toEqual([first.id, second.id]);
+    await expect(Promise.all(queued.map((item) => text(item.blob)))).resolves.toEqual([
+      "first",
+      "second",
+    ]);
+  });
+
   test("retains an older failure when a later capture is queued, then recovers in order", async () => {
     const store = new MemoryOutboxStore();
     const attempted: string[] = [];
@@ -77,6 +129,31 @@ describe("BoothSession outbox", () => {
     await session.enqueueCapture(async () => photo("one"), { metadata: { source: "camera-fallback" } });
     await Promise.all([session.process(), session.process(), session.process()]);
     expect(uploads).toBe(1);
+  });
+
+  test("does not resurrect an acknowledged item when its notification throws", async () => {
+    const store = new MemoryOutboxStore();
+    let uploads = 0;
+    const session = new BoothSession(
+      "party",
+      store,
+      async () => {
+        uploads++;
+        return { url: "/photo" };
+      },
+      () => {
+        throw new Error("thumbnail render failed");
+      }
+    );
+    await session.enqueueCapture(async () => photo("one"), {
+      metadata: { source: "camera-fallback" },
+    });
+
+    await session.process();
+    await session.retry();
+
+    expect(uploads).toBe(1);
+    expect(await store.list("party")).toEqual([]);
   });
 
   test("persists one identity and metadata before upload", async () => {
