@@ -38,6 +38,8 @@ export class BoothSession {
   private leaseHeld = false;
   private leaseExpiresAt = 0;
   private retryAt: number | null = null;
+  private manualRetryRequested = false;
+  private environmentalRetryRequested = false;
   private timer: unknown = null;
   private readonly ownerId: string;
   private readonly leaseTtlMs: number;
@@ -100,22 +102,27 @@ export class BoothSession {
   async stop() {
     this.started = false;
     this.stopRequested = true;
+    this.retryAt = null;
     this.cancelTimer();
-    const wakeWork = this.wakeWork;
     const processing = this.processing;
+    // A storage acknowledgement can outlive page teardown. Retain the lease
+    // until that drain settles so another tab cannot upload the same item.
+    if (processing && this.leaseHeld) this.scheduleWake();
+    const wakeWork = this.wakeWork;
     await Promise.allSettled([
       ...(wakeWork ? [wakeWork] : []),
       ...(processing ? [processing] : []),
     ]);
+    this.cancelTimer();
     await this.releaseLease();
   }
 
   async reconsider(_reason: "connectivity" | "foreground") {
     if (!this.started || this.stopRequested) return;
-    const pending = await this.store.list(this.event);
-    const first = pending[0];
-    if (!first || first.failureKind !== "retryable") return;
-    await this.store.put({ ...first, nextAttemptAt: this.now() });
+    // The oldest item is inspected and changed only after this session owns
+    // the Event lease; a stale pre-lease read could resurrect an acknowledged
+    // item from another tab.
+    this.environmentalRetryRequested = true;
     this.retryAt = this.now();
     this.cancelTimer();
     await this.process();
@@ -170,18 +177,7 @@ export class BoothSession {
 
   async retry() {
     if (this.stopRequested) return;
-    const pending = await this.store.list(this.event);
-    const first = pending[0];
-    if (first?.lastError || first?.failureKind) {
-      const {
-        lastError: _lastError,
-        nextAttemptAt: _nextAttemptAt,
-        failureKind: _failureKind,
-        errorClass: _errorClass,
-        ...ready
-      } = first;
-      await this.store.put(ready);
-    }
+    this.manualRetryRequested = true;
     this.retryAt = null;
     this.cancelTimer();
     await this.process();
@@ -191,7 +187,24 @@ export class BoothSession {
     if (!await this.ensureLease()) return;
     let pending = await this.store.list(this.event);
     while (pending.length > 0) {
-      const item = pending[0];
+      let item = pending[0];
+      const forceRetry =
+        this.manualRetryRequested ||
+        (this.environmentalRetryRequested && item.failureKind === "retryable");
+      this.manualRetryRequested = false;
+      this.environmentalRetryRequested = false;
+      if (forceRetry && (item.lastError || item.failureKind)) {
+        const {
+          lastError: _lastError,
+          nextAttemptAt: _nextAttemptAt,
+          failureKind: _failureKind,
+          errorClass: _errorClass,
+          ...ready
+        } = item;
+        await this.store.put(ready);
+        item = ready;
+        pending = [item, ...pending.slice(1)];
+      }
       if (item.failureKind === "retryable" && (item.nextAttemptAt ?? 0) > this.now()) {
         this.retryAt = item.nextAttemptAt ?? null;
         this.publish({
@@ -227,37 +240,24 @@ export class BoothSession {
       let result: UploadResult;
       try {
         result = await this.upload(item);
+      } catch (error) {
+        await this.recordUploadFailure(item, error, pending.length);
+        return;
+      }
+
+      try {
         await this.store.remove(item.id);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const attempt = item.attempts + 1;
-        const disposition = classifyUploadFailure(error, attempt, this.now(), this.random);
-        const failed: OutboxItem = {
-          ...item,
-          attempts: attempt,
-          lastError: message,
-          failureKind: disposition.kind === "auth-required" ? "auth" : disposition.kind,
-          errorClass: disposition.errorClass,
-          ...(disposition.kind === "retryable"
-            ? { nextAttemptAt: this.now() + disposition.delayMs }
-            : {}),
-        };
-        await this.store.put(failed);
-        this.retryAt = disposition.kind === "retryable" ? failed.nextAttemptAt ?? null : null;
+        // The Event store already acknowledged the upload. Do not classify or
+        // recreate this row if local outbox cleanup fails; a later manual retry
+        // uses the stable identity and receives the idempotent acknowledgement.
+        this.retryAt = null;
         this.publish({
           status: "failed",
           pendingCount: pending.length,
-          error: message,
+          error: error instanceof Error ? error.message : String(error),
           durable: this.store.isDurable(),
         });
-        if (disposition.kind === "auth-required") {
-          try {
-            await this.onAuthRequired();
-          } catch {
-            // Credential UI cannot affect the already-persisted queue state.
-          }
-        }
-        this.scheduleWake();
         return;
       }
 
@@ -290,14 +290,67 @@ export class BoothSession {
         durable: this.store.isDurable(),
       });
     }
+    this.manualRetryRequested = false;
+    this.environmentalRetryRequested = false;
     this.retryAt = null;
     this.scheduleWake();
   }
 
+  private async recordUploadFailure(item: OutboxItem, error: unknown, pendingCount: number) {
+    const message = error instanceof Error ? error.message : String(error);
+    const attempt = item.attempts + 1;
+    const now = this.now();
+    const disposition = classifyUploadFailure(error, attempt, now, this.random);
+    const failed: OutboxItem = {
+      ...item,
+      attempts: attempt,
+      lastError: message,
+      failureKind: disposition.kind === "auth-required" ? "auth" : disposition.kind,
+      errorClass: disposition.errorClass,
+      ...(disposition.kind === "retryable"
+        ? { nextAttemptAt: now + disposition.delayMs }
+        : {}),
+    };
+    if (!await this.store.markFailure(failed, this.ownerId, now)) {
+      this.leaseHeld = false;
+      this.leaseExpiresAt = 0;
+      if (this.started && !this.stopRequested) {
+        this.retryAt = now + this.leaseTtlMs;
+        this.scheduleWake();
+      }
+      return;
+    }
+    this.retryAt = disposition.kind === "retryable" ? failed.nextAttemptAt ?? null : null;
+    this.publish({
+      status: "failed",
+      pendingCount,
+      error: message,
+      durable: this.store.isDurable(),
+    });
+    if (disposition.kind === "auth-required") this.notifyAuthRequired();
+    this.scheduleWake();
+  }
+
+  private notifyAuthRequired() {
+    try {
+      void Promise.resolve(this.onAuthRequired()).catch(() => {
+        // Credential UI cannot affect the already-persisted queue state.
+      });
+    } catch {
+      // Synchronous credential UI failures are equally isolated from the queue.
+    }
+  }
+
   private async ensureLease() {
     if (this.leaseHeld) {
-      if (this.now() < this.leaseRenewAt()) return true;
-      if (await this.renewLease()) return true;
+      if (this.now() < this.leaseRenewAt()) {
+        this.scheduleWake();
+        return true;
+      }
+      if (await this.renewLease()) {
+        this.scheduleWake();
+        return true;
+      }
       this.leaseHeld = false;
     }
     const acquired = await this.store.acquireLease(
@@ -336,10 +389,10 @@ export class BoothSession {
   }
 
   private async releaseLease() {
+    this.cancelTimer();
     if (!this.leaseHeld) return;
     this.leaseHeld = false;
     this.leaseExpiresAt = 0;
-    if (!this.started) this.cancelTimer();
     await this.store.releaseLease(this.event, this.ownerId);
   }
 
@@ -350,9 +403,9 @@ export class BoothSession {
   }
 
   private scheduleWake() {
-    if (this.stopRequested) return;
+    const renewLease = this.leaseHeld && (!this.stopRequested || this.processing !== null);
     const targets = [
-      ...(this.leaseHeld ? [this.leaseRenewAt()] : []),
+      ...(renewLease ? [this.leaseRenewAt()] : []),
       ...(this.started && this.retryAt !== null ? [this.retryAt] : []),
     ];
     if (targets.length === 0) return;
@@ -369,11 +422,14 @@ export class BoothSession {
   }
 
   private async handleWake() {
-    if (this.stopRequested) return;
     if (this.leaseHeld && this.now() >= this.leaseRenewAt()) {
       if (!await this.renewLease()) this.leaseHeld = false;
     }
-    if (!this.started || this.stopRequested) {
+    if (this.stopRequested) {
+      if (this.leaseHeld && this.processing) this.scheduleWake();
+      return;
+    }
+    if (!this.started) {
       if (this.leaseHeld && this.processing) this.scheduleWake();
       return;
     }
