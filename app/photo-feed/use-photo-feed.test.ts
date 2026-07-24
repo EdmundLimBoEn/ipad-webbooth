@@ -177,4 +177,20 @@ describe("PhotoFeedRuntime", () => {
     expect(h.requests).toHaveLength(2);
     expect(h.requests[1]!.url).toBe("/api/photos?event=other");
   });
+
+  test("StrictMode-style suspend and restart waits for abort then requests again", async () => {
+    const h = harness();
+    const runtime = new PhotoFeedRuntime("show", PROJECTOR_FEED_PROFILE, h.providers);
+    runtime.start();
+    runtime.suspend();
+    runtime.start();
+
+    expect(h.requests).toHaveLength(1);
+    expect(h.requests[0]!.signal.aborted).toBeTrue();
+    h.requests[0]!.response.reject(new DOMException("Aborted", "AbortError"));
+    await flushPromises();
+
+    expect(h.requests).toHaveLength(2);
+    expect(h.requests[1]!.url).toBe("/api/photos?event=show");
+  });
 });

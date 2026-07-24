@@ -117,6 +117,10 @@ export class PhotoFeedRuntime {
         visible: this.providers.visibility.isVisible(),
       });
     });
+    this.dispatch({
+      type: "visibility",
+      visible: this.providers.visibility.isVisible(),
+    });
     this.dispatch({ type: "start" });
   }
 
@@ -128,9 +132,29 @@ export class PhotoFeedRuntime {
     this.dispatch({ type: "event-change", event });
   }
 
+  suspend(): void {
+    if (!this.started || this.disposed) return;
+    this.started = false;
+    this.clearTimer();
+    this.unsubscribeVisibility?.();
+    this.unsubscribeVisibility = null;
+    this.queuedRequest = null;
+    this.controller?.abort();
+
+    this.state = {
+      ...this.state,
+      request: null,
+      refreshPending: false,
+      generation: this.state.generation + 1,
+    };
+    this.currentSnapshot = { ...this.state, inserted: [] };
+    this.listeners.forEach((listener) => listener());
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.started = false;
     this.controller?.abort();
     this.controller = null;
     this.activeRequest = null;
@@ -278,7 +302,7 @@ export function usePhotoFeed(
   );
   useEffect(() => {
     runtime.start();
-    return () => runtime.dispose();
+    return () => runtime.suspend();
   }, [runtime]);
   useEffect(() => {
     runtime.setEvent(event);
