@@ -39,6 +39,8 @@ type ConfigMutationIntent = {
   config: EventExperience;
   baseRevisionId: string | null;
   boothKeyMutationFingerprint: string | null;
+  reason: "save" | "restore";
+  sourceRevisionId?: string;
 };
 type ConfigAppendInput = {
   config: EventConfig;
@@ -399,7 +401,9 @@ export class EventStore {
       input.mutationId,
       requestedExperience,
       input.baseRevisionId,
-      input.boothKeyMutationFingerprint
+      input.boothKeyMutationFingerprint,
+      input.reason,
+      input.sourceRevisionId
     );
     const existing = await this.readRevision(event, input.mutationId);
 
@@ -582,13 +586,17 @@ export class EventStore {
     mutationId: string,
     config: EventExperience,
     baseRevisionId: string | null,
-    boothKeyMutationFingerprint: string | null
+    boothKeyMutationFingerprint: string | null,
+    reason: "save" | "restore",
+    sourceRevisionId?: string
   ): Promise<void> {
     const intent: ConfigMutationIntent = {
       version: EVENT_CONFIG_VERSION,
       config,
       baseRevisionId,
       boothKeyMutationFingerprint,
+      reason,
+      ...(sourceRevisionId ? { sourceRevisionId } : {}),
     };
     const key = eventConfigMutationKey(event, mutationId);
     const created = await this.state.compareAndSwap(
@@ -612,6 +620,8 @@ export class EventStore {
       !parsed
       || parsed.baseRevisionId !== baseRevisionId
       || parsed.boothKeyMutationFingerprint !== boothKeyMutationFingerprint
+      || parsed.reason !== reason
+      || parsed.sourceRevisionId !== sourceRevisionId
       || !sameExperience(parsed.config, config)
     ) {
       throw new ConfigMutationConflictError();
@@ -755,9 +765,15 @@ function validateConfigRestoreInput(input: ConfigRestoreInput): void {
 function parseConfigMutationIntent(value: unknown): ConfigMutationIntent | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const intent = value as Record<string, unknown>;
+  const reason = intent.reason;
   if (
-    Object.keys(intent).length !== 4
-    || intent.version !== EVENT_CONFIG_VERSION
+    intent.version !== EVENT_CONFIG_VERSION
+    || (reason !== "save" && reason !== "restore")
+    || (
+      reason === "save"
+        ? Object.keys(intent).length !== 5 || "sourceRevisionId" in intent
+        : Object.keys(intent).length !== 6 || !isRevisionId(intent.sourceRevisionId)
+    )
     || (
       intent.baseRevisionId !== null
       && !isRevisionId(intent.baseRevisionId)
@@ -790,6 +806,8 @@ function parseConfigMutationIntent(value: unknown): ConfigMutationIntent | null 
     config: configExperience(parsed),
     baseRevisionId: intent.baseRevisionId as string | null,
     boothKeyMutationFingerprint: intent.boothKeyMutationFingerprint as string | null,
+    reason,
+    ...(reason === "restore" ? { sourceRevisionId: intent.sourceRevisionId as string } : {}),
   };
 }
 

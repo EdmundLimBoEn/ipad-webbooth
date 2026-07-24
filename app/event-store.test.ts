@@ -29,6 +29,26 @@ class FailNextConfigHeadCasStore extends InMemoryObjectStore {
   }
 }
 
+class FailArmedRevisionAppendStore extends InMemoryObjectStore {
+  private revisionKeyToFail: string | null = null;
+
+  failNextRevisionAppend(key: string): void {
+    this.revisionKeyToFail = key;
+  }
+
+  override async compareAndSwap(
+    key: string,
+    expectedEtag: string | null,
+    value: ArrayBuffer | ArrayBufferView | string
+  ): Promise<boolean> {
+    if (key === this.revisionKeyToFail) {
+      this.revisionKeyToFail = null;
+      throw new Error("simulated revision append failure");
+    }
+    return super.compareAndSwap(key, expectedEtag, value);
+  }
+}
+
 class GateFirstConfigHeadWriteStore extends InMemoryObjectStore {
   private gateOpen = false;
   private gated = false;
@@ -88,8 +108,27 @@ function stateWithUnfinishedMutation(mutationId: string): InMemoryObjectStore {
       config: { frames: ["one"] },
       baseRevisionId: null,
       boothKeyMutationFingerprint: null,
+      reason: "save",
     }),
   });
+}
+
+async function saveSameContentHistory(
+  store: EventStore,
+  firstMutationId: string,
+  secondMutationId: string
+) {
+  const first = await store.saveConfigRevision("launch", {
+    config: { frames: ["same"] },
+    baseRevisionId: null,
+    mutationId: firstMutationId,
+  });
+  const second = await store.saveConfigRevision("launch", {
+    config: { frames: ["same"] },
+    baseRevisionId: first.revision.id,
+    mutationId: secondMutationId,
+  });
+  return { first, second };
 }
 
 describe("ObjectStore", () => {
@@ -212,11 +251,13 @@ describe("EventStore", () => {
       config: { frames: string[] };
       baseRevisionId: string | null;
       boothKeyMutationFingerprint: null;
+      reason: "save";
     }>()).toEqual({
       version: 1,
       config: { frames: ["one"] },
       baseRevisionId: null,
       boothKeyMutationFingerprint: null,
+      reason: "save",
     });
     expect((await store.saveConfigRevision("launch", input)).idempotent).toBe(true);
     await expect(store.saveConfigRevision("launch", {
@@ -315,11 +356,13 @@ describe("EventStore", () => {
       config: { frames: string[] };
       baseRevisionId: string | null;
       boothKeyMutationFingerprint: string;
+      reason: "save";
     }>()).toEqual({
       version: 1,
       config: { frames: ["one"] },
       baseRevisionId: null,
       boothKeyMutationFingerprint: fingerprint,
+      reason: "save",
     });
     expect(await intent!.text()).not.toContain("replacement-hash");
     expect(await intent!.text()).not.toContain("boothKeyHash");
@@ -545,11 +588,13 @@ describe("EventStore", () => {
       config: { frames: string[] };
       baseRevisionId: string | null;
       boothKeyMutationFingerprint: string;
+      reason: "save";
     }>()).toEqual({
       version: 1,
       config: { frames: ["new"] },
       baseRevisionId: null,
       boothKeyMutationFingerprint: input.boothKeyMutationFingerprint,
+      reason: "save",
     });
   });
 
@@ -768,6 +813,90 @@ describe("EventStore", () => {
       reason: "restore",
       sourceRevisionId: first.revision.id,
     });
+  });
+
+  test("an unfinished restore intent rejects a different same-content source", async () => {
+    const state = new FailArmedRevisionAppendStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const { first, second } = await saveSameContentHistory(
+      store,
+      "018f0000-0000-7000-8000-00000000004a",
+      "018f0000-0000-7000-8000-00000000004b"
+    );
+    const mutationId = "018f0000-0000-7000-8000-00000000004c";
+    state.failNextRevisionAppend(eventConfigRevisionKey("launch", mutationId));
+
+    await expect(store.restoreConfigRevision("launch", {
+      revisionId: first.revision.id,
+      baseRevisionId: second.revision.id,
+      mutationId,
+    })).rejects.toThrow("simulated revision append failure");
+    await expect(store.restoreConfigRevision("launch", {
+      revisionId: second.revision.id,
+      baseRevisionId: second.revision.id,
+      mutationId,
+    })).rejects.toBeInstanceOf(ConfigMutationConflictError);
+    expect(state.has(eventConfigRevisionKey("launch", mutationId))).toBe(false);
+  });
+
+  test("an unfinished restore mutation cannot be reused as an equivalent save", async () => {
+    const state = new FailArmedRevisionAppendStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const { first, second } = await saveSameContentHistory(
+      store,
+      "018f0000-0000-7000-8000-00000000004d",
+      "018f0000-0000-7000-8000-00000000004e"
+    );
+    const mutationId = "018f0000-0000-7000-8000-00000000004f";
+    state.failNextRevisionAppend(eventConfigRevisionKey("launch", mutationId));
+
+    await expect(store.restoreConfigRevision("launch", {
+      revisionId: first.revision.id,
+      baseRevisionId: second.revision.id,
+      mutationId,
+    })).rejects.toThrow("simulated revision append failure");
+    await expect(store.saveConfigRevision("launch", {
+      config: { frames: ["same"] },
+      baseRevisionId: second.revision.id,
+      mutationId,
+    })).rejects.toBeInstanceOf(ConfigMutationConflictError);
+    expect(state.has(eventConfigRevisionKey("launch", mutationId))).toBe(false);
+  });
+
+  test("an identical unfinished restore intent recovers idempotently", async () => {
+    const state = new FailArmedRevisionAppendStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const { first, second } = await saveSameContentHistory(
+      store,
+      "018f0000-0000-7000-8000-000000000050",
+      "018f0000-0000-7000-8000-000000000051"
+    );
+    const input = {
+      revisionId: first.revision.id,
+      baseRevisionId: second.revision.id,
+      mutationId: "018f0000-0000-7000-8000-000000000052",
+    };
+    state.failNextRevisionAppend(eventConfigRevisionKey("launch", input.mutationId));
+
+    await expect(store.restoreConfigRevision("launch", input)).rejects.toThrow("simulated revision append failure");
+    expect(await (await state.get(eventConfigMutationKey("launch", input.mutationId)))?.json<{
+      version: number;
+      config: { frames: string[] };
+      baseRevisionId: string;
+      boothKeyMutationFingerprint: null;
+      reason: "restore";
+      sourceRevisionId: string;
+    }>()).toEqual({
+      version: 1,
+      config: { frames: ["same"] },
+      baseRevisionId: second.revision.id,
+      boothKeyMutationFingerprint: null,
+      reason: "restore",
+      sourceRevisionId: first.revision.id,
+    });
+
+    expect((await store.restoreConfigRevision("launch", input)).idempotent).toBe(false);
+    expect((await store.restoreConfigRevision("launch", input)).idempotent).toBe(true);
   });
 
   test("an identical retry finishes a restore after the revision append succeeds", async () => {
