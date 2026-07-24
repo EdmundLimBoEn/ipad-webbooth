@@ -1,0 +1,101 @@
+.gallery {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: max(24px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
+  color: #fff;
+  background: radial-gradient(circle at top, #3b1730, #090509 58%);
+}
+
+.card {
+  display: grid;
+  width: min(100%, 680px);
+  gap: 18px;
+  text-align: center;
+}
+
+.card h1 {
+  font-size: clamp(28px, 7vw, 52px);
+  line-height: 1;
+}
+
+.photo {
+  width: 100%;
+  max-height: 70dvh;
+  object-fit: contain;
+  border-radius: 16px;
+  background: #1b1119;
+  box-shadow: 0 18px 52px rgba(0, 0, 0, .38);
+  animation: appear 220ms ease-out;
+}
+
+.actions {
+  display: flex;
+  justify-content: center;
+}
+
+.status {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  padding: 24px;
+  border: 1px solid rgba(255, 255, 255, .28);
+  border-radius: 16px;
+  background: rgba(16, 7, 14, .78);
+}
+
+.status p,
+.error {
+  max-width: 36rem;
+  font-size: 18px;
+  line-height: 1.45;
+}
+
+.error {
+  color: #ffc5df;
+}
+
+.primaryAction,
+.secondaryAction {
+  min-height: 44px;
+  padding: 11px 20px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  font: inherit;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.primaryAction {
+  color: #1a0712;
+  background: #ff75b5;
+}
+
+.secondaryAction {
+  color: #fff;
+  border-color: currentColor;
+  background: transparent;
+}
+
+.primaryAction:focus-visible,
+.secondaryAction:focus-visible,
+.status:focus-visible,
+.error:focus-visible {
+  outline: 3px solid #fff;
+  outline-offset: 4px;
+}
+
+@keyframes appear {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (forced-colors: active) {
+  .gallery { background: Canvas; color: CanvasText; }
+  .status, .photo { border: 1px solid CanvasText; }
+  .primaryAction, .secondaryAction { color: ButtonText; background: ButtonFace; border-color: ButtonText; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .photo { animation: none; }
+}

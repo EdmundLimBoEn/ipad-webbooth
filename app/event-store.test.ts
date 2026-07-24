@@ -107,6 +107,19 @@ class MissingDuplicatePhotoMetadataStore extends InMemoryObjectStore {
   }
 }
 
+class ExactPhotoReadStore extends InMemoryObjectStore {
+  readonly reads: string[] = [];
+
+  override async get(key: string): Promise<StoredObjectBody | null> {
+    this.reads.push(key);
+    return super.get(key);
+  }
+
+  resetReads(): void {
+    this.reads.length = 0;
+  }
+}
+
 class InstrumentedStateStore extends InMemoryObjectStore {
   reads = 0;
 
@@ -1796,6 +1809,37 @@ describe("EventStore", () => {
     expect(await store.deletePhoto("launch", "launch/0000000001000-a.jpg")).toBe(true);
     expect(photos.has("launch/0000000001000-a.jpg")).toBe(false);
     expect(photos.has("other/0000000001000-b.jpg")).toBe(true);
+  });
+
+  test("gets only an exact public image owned by the canonical Event", async () => {
+    const uploaded = new Date("2026-07-24T12:00:00.000Z");
+    const key = "launch/0000000001000-photo.jpg";
+    const photos = new ExactPhotoReadStore();
+    photos.set(key, "photo", uploaded);
+    photos.set("other/0000000001000-photo.jpg", "other", uploaded);
+    const store = new EventStore(photos, new InMemoryObjectStore(), "https://photos.example");
+
+    await expect(store.getPublicPhoto("launch", key)).resolves.toEqual({
+      key,
+      url: "https://photos.example/launch/0000000001000-photo.jpg",
+      uploadedAt: uploaded.toISOString(),
+    });
+    expect(photos.reads).toEqual([key]);
+
+    photos.resetReads();
+    await expect(store.getPublicPhoto("Launch", key)).rejects.toBeInstanceOf(InvalidEventSlugError);
+    for (const malformed of [
+      "launch/",
+      "0000000001000-photo.jpg",
+      "launch/../other/0000000001000-photo.jpg",
+      "other/0000000001000-photo.jpg",
+    ]) {
+      await expect(store.getPublicPhoto("launch", malformed)).rejects.toBeInstanceOf(TypeError);
+    }
+    expect(photos.reads).toEqual([]);
+
+    await expect(store.getPublicPhoto("launch", "launch/0000000001000-missing.jpg")).resolves.toBeNull();
+    expect(photos.reads).toEqual(["launch/0000000001000-missing.jpg"]);
   });
 
   test("writes an exact private heartbeat with a server-controlled timestamp", async () => {

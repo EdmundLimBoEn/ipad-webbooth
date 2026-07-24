@@ -277,6 +277,7 @@ function isPhotoKey(event: string, key: string): boolean {
 }
 
 export type Photo = { key: string; url: string; uploadedAt: Date };
+export type PublicPhoto = { key: string; url: string; uploadedAt: string };
 export type PhotoFeed = { photos: Photo[]; cursor: string | null; unchanged: boolean; truncated: boolean };
 export type PutPhotoOptions = { upload?: StableUpload };
 export type PutPhotoResult = {
@@ -1217,6 +1218,20 @@ export class EventStore {
 
   getPhoto(key: string): Promise<StoredObjectBody | null> {
     return this.photos.get(key);
+  }
+
+  async getPublicPhoto(event: string, completeKey: string): Promise<PublicPhoto | null> {
+    const canonical = canonicalEvent(event);
+    if (!isPhotoKey(canonical, completeKey)) {
+      throw new TypeError("public photo key must be an exact Event-owned image key");
+    }
+    const object = await this.photos.get(completeKey);
+    if (!object || object.key !== completeKey) return null;
+    return {
+      key: completeKey,
+      url: this.publicUrl(completeKey),
+      uploadedAt: object.uploaded.toISOString(),
+    };
   }
 
   async deletePhoto(event: string, key: string): Promise<boolean> {
