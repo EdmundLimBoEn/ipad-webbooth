@@ -1,12 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import { BoothUnlock } from "./booth-unlock";
+import {
+  BoothUnlock,
+  createUnlockFormState,
+  unlockFormReducer,
+} from "./booth-unlock";
+import type { BoothAccessFeedback } from "./booth-session/lifecycle";
 
 const secret = "never-render-this-booth-key";
 
 function render(
   state: "locked" | "checking" | "recovery-only" | "unavailable",
-  pendingCount = 0
+  pendingCount = 0,
+  feedback?: BoothAccessFeedback
 ) {
   return renderToStaticMarkup(
     <BoothUnlock
@@ -14,6 +20,7 @@ function render(
       state={state}
       pendingCount={pendingCount}
       durable
+      feedback={feedback}
       onUnlock={(key) => {
         if (key === secret) throw new Error("not called during static render");
       }}
@@ -65,35 +72,48 @@ describe("Booth unlock", () => {
     expect(html).toContain("Check the Event setup, then try again.");
     expect(html).toContain(">Try again</button>");
   });
-});
 
-describe("Booth startup integration", () => {
-  test("recovers the Outbox before credential access and uses authenticated preflight", async () => {
-    const source = await Bun.file(`${import.meta.dir}/page.tsx`).text();
-    const recoverAt = source.indexOf("await session.recover()");
-    const credentialAt = source.indexOf("const stored = loadBoothCredential(");
+  test("announces rejected credentials with fixed non-secret copy", () => {
+    const html = render("locked", 2, "rejected-key");
 
-    expect(recoverAt).toBeGreaterThan(-1);
-    expect(credentialAt).toBeGreaterThan(recoverAt);
-    expect(source).toContain("/api/booth/preflight?event=");
-    expect(source).toContain('"x-booth-key": key');
-    expect(source).not.toContain("window.prompt");
-    expect(source).not.toContain("/api/config?event=");
+    expect(html).toContain('role="alert"');
+    expect(html).toContain("Booth Key rejected. Enter the current key and try again.");
+    expect(html).not.toContain(secret);
   });
 
-  test("gates retry and camera start on successful preflight and relocks on 401", async () => {
-    const source = await Bun.file(`${import.meta.dir}/page.tsx`).text();
-    const successfulPreflight = source.indexOf("if (response.ok)");
-    const readyBranch = source.slice(successfulPreflight, source.indexOf("} catch", successfulPreflight));
+  test.each([
+    ["checking", "Checking Booth access online."],
+    ["network", "Could not reach Booth service. Pending photos are still safe."],
+    ["unavailable", "This Event is not ready for Booth capture."],
+  ] satisfies Array<[BoothAccessFeedback, string]>)(
+    "announces %s feedback in the live region",
+    (feedback, message) => {
+      expect(render(
+        feedback === "network" ? "recovery-only" : feedback === "unavailable" ? "unavailable" : "checking",
+        0,
+        feedback
+      )).toContain(message);
+    }
+  );
 
-    expect(successfulPreflight).toBeGreaterThan(-1);
-    expect(readyBranch).toContain("session.start()");
-    expect(readyBranch).toContain("startCamera()");
-    expect(source).toContain(
-      "clearBoothCredential(event, window.sessionStorage, window.localStorage)"
-    );
-    expect(source).toContain('accessState !== "ready"');
-    expect(source).toContain("request !== cameraRequestRef.current");
+  test("changing Event identity clears typed key and remember state", () => {
+    let form = createUnlockFormState("first");
+    form = unlockFormReducer(form, { type: "key-changed", key: secret });
+    form = unlockFormReducer(form, { type: "remember-changed", remember: true });
+    form = unlockFormReducer(form, { type: "event-changed", event: "second" });
+
+    expect(form).toEqual({ event: "second", key: "", remember: false });
+  });
+});
+
+describe("Booth page safety wiring", () => {
+  test("uses authenticated preflight without prompt or public config startup", async () => {
+    const source = await Bun.file(`${import.meta.dir}/page.tsx`).text();
+
+    expect(source).toContain("/api/booth/preflight?event=");
+    expect(source).not.toContain("window.prompt");
+    expect(source).not.toContain("/api/config?event=");
+    expect(source).toContain("key={event}");
   });
 });
 

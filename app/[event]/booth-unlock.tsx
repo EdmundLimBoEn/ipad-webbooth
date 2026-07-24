@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useReducer, type FormEvent } from "react";
 import type { BoothAccessState } from "./booth-session/access";
+import type { BoothAccessFeedback } from "./booth-session/lifecycle";
 import styles from "./booth.module.css";
 
 type UnlockState = Extract<
@@ -12,12 +13,43 @@ type UnlockState = Extract<
 export type BoothUnlockProps = {
   event: string;
   state: UnlockState;
+  feedback?: BoothAccessFeedback;
   pendingCount: number;
   durable: boolean;
   outboxRecovered?: boolean;
   onUnlock: (key: string, remember: boolean) => void;
   onRetry: () => void;
 };
+
+export type UnlockFormState = {
+  event: string;
+  key: string;
+  remember: boolean;
+};
+
+export type UnlockFormEvent =
+  | { type: "event-changed"; event: string }
+  | { type: "key-changed"; key: string }
+  | { type: "remember-changed"; remember: boolean }
+  | { type: "submitted" };
+
+export function createUnlockFormState(event: string): UnlockFormState {
+  return { event, key: "", remember: false };
+}
+
+export function unlockFormReducer(
+  state: UnlockFormState,
+  event: UnlockFormEvent
+): UnlockFormState {
+  if (event.type === "event-changed") {
+    return event.event === state.event ? state : createUnlockFormState(event.event);
+  }
+  if (event.type === "key-changed") return { ...state, key: event.key };
+  if (event.type === "remember-changed") {
+    return { ...state, remember: event.remember };
+  }
+  return { ...state, key: "" };
+}
 
 function pendingLabel(pendingCount: number) {
   if (pendingCount === 0) return "No photos waiting";
@@ -27,22 +59,48 @@ function pendingLabel(pendingCount: number) {
 export function BoothUnlock({
   event,
   state,
+  feedback = state === "checking"
+    ? "checking"
+    : state === "recovery-only"
+      ? "network"
+      : state === "unavailable"
+        ? "unavailable"
+        : "locked",
   pendingCount,
   durable,
   outboxRecovered = true,
   onUnlock,
   onRetry,
 }: BoothUnlockProps) {
-  const [key, setKey] = useState("");
-  const [remember, setRemember] = useState(false);
+  const [form, dispatch] = useReducer(
+    unlockFormReducer,
+    event,
+    createUnlockFormState
+  );
   const checking = state === "checking" || !outboxRecovered;
+
+  useEffect(() => {
+    dispatch({ type: "event-changed", event });
+  }, [event]);
 
   const submit = (submitEvent: FormEvent<HTMLFormElement>) => {
     submitEvent.preventDefault();
-    const submittedKey = key;
-    setKey("");
-    if (submittedKey) onUnlock(submittedKey, remember);
+    const submittedKey = form.key;
+    dispatch({ type: "submitted" });
+    if (submittedKey) onUnlock(submittedKey, form.remember);
   };
+
+  const accessMessage = feedback === "rejected-key"
+    ? "Booth Key rejected. Enter the current key and try again."
+    : feedback === "checking"
+      ? "Checking Booth access online."
+      : feedback === "network"
+        ? "Could not reach Booth service. Pending photos are still safe."
+        : feedback === "unavailable"
+          ? "This Event is not ready for Booth capture."
+          : feedback === "recovering"
+            ? "Recovering photos saved on this iPad."
+            : "Booth is locked.";
 
   const title = !outboxRecovered
     ? "Recovering saved photos"
@@ -96,8 +154,13 @@ export function BoothUnlock({
           </div>
         </div>
 
-        <div className={styles.unlockStatus} role="status" aria-live="polite">
+        <div
+          className={styles.unlockStatus}
+          role={feedback === "rejected-key" ? "alert" : "status"}
+          aria-live={feedback === "rejected-key" ? "assertive" : "polite"}
+        >
           <strong>{pendingLabel(pendingCount)}</strong>
+          <span>{accessMessage}</span>
           <span>
             {durable
               ? "Saved photos stay on this iPad until upload succeeds."
@@ -115,19 +178,26 @@ export function BoothUnlock({
               autoComplete="current-password"
               required
               disabled={checking}
-              value={key}
-              onChange={(inputEvent) => setKey(inputEvent.target.value)}
+              value={form.key}
+              onChange={(inputEvent) =>
+                dispatch({ type: "key-changed", key: inputEvent.target.value })
+              }
             />
             <label className={styles.remember}>
               <input
                 type="checkbox"
-                checked={remember}
+                checked={form.remember}
                 disabled={checking}
-                onChange={(inputEvent) => setRemember(inputEvent.target.checked)}
+                onChange={(inputEvent) =>
+                  dispatch({
+                    type: "remember-changed",
+                    remember: inputEvent.target.checked,
+                  })
+                }
               />
               <span>Remember on this iPad</span>
             </label>
-            <button type="submit" disabled={checking || key.length === 0}>
+            <button type="submit" disabled={checking || form.key.length === 0}>
               Unlock Booth
             </button>
           </form>

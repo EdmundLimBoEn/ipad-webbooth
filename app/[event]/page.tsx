@@ -1,25 +1,39 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import styles from "./booth.module.css";
 import { TEMPLATES, availableTemplates, composite } from "../templates";
 import { createOutboxStore, type OutboxItem } from "./booth-session/outbox";
-import { BoothSession, runCaptureSequence, type UploadState } from "./booth-session/session";
+import {
+  BoothSession,
+  runCaptureSequence,
+  type UploadResult,
+  type UploadState,
+} from "./booth-session/session";
 import { outboxUploadHeaders } from "./booth-session/upload";
 import { HttpUploadError, type UploadErrorClass } from "./booth-session/retry-policy";
-import {
-  transitionBoothAccess,
-  type BoothAccessState,
-} from "./booth-session/access";
+import type { BoothAccessState } from "./booth-session/access";
 import {
   clearBoothCredential,
   loadBoothCredential,
   saveBoothCredential,
 } from "./booth-session/credential";
+import {
+  BoothLifecycleCoordinator,
+  type BoothAccessFeedback,
+  type BoothPreflightResult,
+} from "./booth-session/lifecycle";
 import { BoothUnlock } from "./booth-unlock";
 
 type Status = "starting" | "picking" | "ready" | "denied" | "running";
+
+const INITIAL_UPLOAD_STATE: UploadState = {
+  status: "idle",
+  pendingCount: 0,
+  error: null,
+  durable: true,
+};
 
 function uploadErrorClass(status: number): UploadErrorClass {
   if (status === 401) return "auth";
@@ -29,18 +43,41 @@ function uploadErrorClass(status: number): UploadErrorClass {
   return "unknown";
 }
 
+async function requestBoothPreflight(
+  event: string,
+  key: string,
+  signal: AbortSignal
+): Promise<BoothPreflightResult> {
+  const response = await fetch(
+    `/api/booth/preflight?event=${encodeURIComponent(event)}`,
+    {
+      method: "POST",
+      headers: { "x-booth-key": key },
+      signal,
+    }
+  );
+  if (response.status === 401) return { kind: "unauthorized" };
+  if (response.status === 409 || response.status === 503) {
+    return { kind: "unavailable" };
+  }
+  if (!response.ok) return { kind: "recovery-only" };
+  const payload = await response.json() as { experience?: { frames?: unknown } };
+  return { kind: "ready", frames: payload.experience?.frames };
+}
+
 export default function Booth() {
   const { event } = useParams<{ event: string }>();
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<BoothSession | null>(null);
   const captureRef = useRef<AbortController | null>(null);
-  const preflightRef = useRef<AbortController | null>(null);
   const cameraRequestRef = useRef(0);
   const unmountedRef = useRef(false);
   const keyRef = useRef("");
   const [status, setStatus] = useState<Status>("starting");
   const [accessState, setAccessState] = useState<BoothAccessState>("locked");
+  const [accessFeedback, setAccessFeedback] =
+    useState<BoothAccessFeedback>("recovering");
   const [outboxRecovered, setOutboxRecovered] = useState(false);
   const [mode, setMode] = useState<keyof typeof TEMPLATES | null>(null);
   const [count, setCount] = useState(0);
@@ -48,12 +85,8 @@ export default function Booth() {
   const [flash, setFlash] = useState(false);
   const [lastUrl, setLastUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [uploadState, setUploadState] = useState<UploadState>({
-    status: "idle",
-    pendingCount: 0,
-    error: null,
-    durable: true,
-  });
+  const [uploadState, setUploadState] =
+    useState<UploadState>(INITIAL_UPLOAD_STATE);
   // Frames remain unavailable until authenticated preflight returns the safe
   // Event experience. `null` is never shown while the Booth is locked.
   const [enabled, setEnabled] = useState<string[] | null>(null);
@@ -92,17 +125,75 @@ export default function Booth() {
     }
   }, []);
 
+  const stopCamera = useCallback(() => {
+    cameraRequestRef.current++;
+    captureRef.current?.abort();
+    captureRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+  }, []);
+
+  const lifecycle = useMemo(
+    () => new BoothLifecycleCoordinator<UploadResult>({
+      preflight: requestBoothPreflight,
+      loadCredential: (nextEvent) =>
+        loadBoothCredential(
+          nextEvent,
+          window.sessionStorage,
+          window.localStorage
+        ),
+      clearCredential: (nextEvent) =>
+        clearBoothCredential(
+          nextEvent,
+          window.sessionStorage,
+          window.localStorage
+        ),
+      onReset: () => {
+        setStatus("starting");
+        setMode(null);
+        setLastUrl(null);
+        setError(null);
+        setCount(0);
+        setShot(0);
+        setFlash(false);
+        setEnabled(null);
+        setOutboxRecovered(false);
+        setUploadState(INITIAL_UPLOAD_STATE);
+      },
+      onOutboxRecovered: () => setOutboxRecovered(true),
+      onAccess: (state, feedback) => {
+        if (state === "locked" && feedback === "rejected-key") {
+          setStatus("starting");
+          setMode(null);
+          setError(null);
+          setCount(0);
+          setShot(0);
+          setFlash(false);
+        }
+        setAccessState(state);
+        setAccessFeedback(feedback);
+      },
+      onFrames: setEnabled,
+      onCredential: (key) => {
+        keyRef.current = key;
+      },
+      onCameraStart: () => {
+        void startCamera();
+      },
+      onCameraStop: stopCamera,
+      onUploaded: ({ url }) => setLastUrl(url),
+    }),
+    [startCamera, stopCamera]
+  );
+
   useEffect(() => {
     unmountedRef.current = false;
     return () => {
       unmountedRef.current = true;
-      cameraRequestRef.current++;
-      preflightRef.current?.abort();
-      captureRef.current?.abort();
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
+      stopCamera();
     };
-  }, []);
+  }, [stopCamera]);
 
   // grab the current video frame, mirrored to match the preview, at full res
   const grabFrame = useCallback((): HTMLCanvasElement => {
@@ -140,152 +231,41 @@ export default function Booth() {
     [event]
   );
 
-  const relockAfterUnauthorized = useCallback(() => {
-    clearBoothCredential(event, window.sessionStorage, window.localStorage);
-    keyRef.current = "";
-    preflightRef.current?.abort();
-    cameraRequestRef.current++;
-    captureRef.current?.abort();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    setEnabled(null);
-    setMode(null);
-    setStatus("starting");
-    setAccessState((current) =>
-      transitionBoothAccess(current, { type: "unauthorized" })
-    );
-    void sessionRef.current?.stop();
-  }, [event]);
-
-  const attemptPreflight = useCallback(async (key: string) => {
-    const session = sessionRef.current;
-    if (!session || !key) return;
-
-    preflightRef.current?.abort();
-    const controller = new AbortController();
-    preflightRef.current = controller;
-    setAccessState((current) =>
-      current === "locked"
-        ? transitionBoothAccess(current, { type: "check" })
-        : transitionBoothAccess(current, { type: "retry" })
-    );
-
-    try {
-      const response = await fetch(
-        `/api/booth/preflight?event=${encodeURIComponent(event)}`,
-        {
-          method: "POST",
-          headers: { "x-booth-key": key },
-          signal: controller.signal,
-        }
-      );
-      if (controller.signal.aborted) return;
-
-      if (response.status === 401) {
-        relockAfterUnauthorized();
-        return;
-      }
-      if (response.status === 409 || response.status === 503) {
-        const unavailableStatus = response.status === 409 ? 409 : 503;
-        setAccessState((current) =>
-          transitionBoothAccess(current, {
-            type: "preflight-unavailable",
-            status: unavailableStatus,
-          })
-        );
-        return;
-      }
-      if (response.ok) {
-        const payload = await response.json() as {
-          experience?: { frames?: unknown };
-        };
-        if (
-          !Array.isArray(payload.experience?.frames) ||
-          payload.experience.frames.some((frame) => typeof frame !== "string")
-        ) {
-          setAccessState((current) =>
-            transitionBoothAccess(current, { type: "preflight-network-failed" })
-          );
-          return;
-        }
-        setEnabled([...payload.experience.frames] as string[]);
-        setAccessState((current) =>
-          transitionBoothAccess(current, { type: "preflight-ready" })
-        );
-        void session.start();
-        void startCamera();
-        return;
-      }
-
-      setAccessState((current) =>
-        transitionBoothAccess(current, { type: "preflight-network-failed" })
-      );
-    } catch {
-      if (controller.signal.aborted) return;
-      setAccessState((current) =>
-        transitionBoothAccess(current, { type: "preflight-network-failed" })
-      );
-    }
-  }, [event, relockAfterUnauthorized, startCamera]);
-
   useEffect(() => {
-    let active = true;
-    setAccessState("locked");
-    setOutboxRecovered(false);
-    setEnabled(null);
-    keyRef.current = "";
     let session!: BoothSession;
     session = new BoothSession(
       event,
       createOutboxStore(),
       uploadOne,
-      ({ url }) => setLastUrl(url),
+      (result) => lifecycle.acceptUploaded(session, result),
       undefined,
       undefined,
       {
-        onAuthRequired: () => {
-          if (sessionRef.current === session) relockAfterUnauthorized();
-        },
+        onAuthRequired: () => lifecycle.authRequired(session),
       }
     );
     sessionRef.current = session;
-    const unsubscribe = session.subscribe(setUploadState);
+    const entering = lifecycle.beginEvent(event, session);
+    const unsubscribe = session.subscribe((next) => {
+      if (lifecycle.isActive(session)) setUploadState(next);
+    });
     const reconsiderConnectivity = () => void session.reconsider("connectivity");
     const reconsiderForeground = () => {
       if (document.visibilityState === "visible") void session.reconsider("foreground");
     };
     window.addEventListener("online", reconsiderConnectivity);
     document.addEventListener("visibilitychange", reconsiderForeground);
-    void (async () => {
-      await session.recover();
-      if (!active) return;
-      setOutboxRecovered(true);
-      const stored = loadBoothCredential(
-        event,
-        window.sessionStorage,
-        window.localStorage
-      );
-      if (!stored) return;
-      keyRef.current = stored.key;
-      await attemptPreflight(stored.key);
-    })();
+    void entering;
     return () => {
-      active = false;
-      cameraRequestRef.current++;
-      preflightRef.current?.abort();
-      captureRef.current?.abort();
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
       unsubscribe();
       window.removeEventListener("online", reconsiderConnectivity);
       document.removeEventListener("visibilitychange", reconsiderForeground);
       if (sessionRef.current === session) sessionRef.current = null;
-      void session.stop();
+      void lifecycle.leaveEvent(session);
     };
-  }, [attemptPreflight, event, relockAfterUnauthorized, uploadOne]);
+  }, [event, lifecycle, uploadOne]);
 
   const unlock = useCallback((key: string, remember: boolean) => {
-    keyRef.current = key;
     saveBoothCredential(
       event,
       key,
@@ -293,16 +273,12 @@ export default function Booth() {
       window.sessionStorage,
       window.localStorage
     );
-    void attemptPreflight(key);
-  }, [attemptPreflight, event]);
+    void lifecycle.unlock(key);
+  }, [event, lifecycle]);
 
   const retryPreflight = useCallback(() => {
-    if (!keyRef.current) {
-      relockAfterUnauthorized();
-      return;
-    }
-    void attemptPreflight(keyRef.current);
-  }, [attemptPreflight, relockAfterUnauthorized]);
+    void lifecycle.retryPreflight();
+  }, [lifecycle]);
 
   const retryUpload = useCallback(() => {
     if (accessState !== "ready" || !uploadState.pendingCount) return;
@@ -316,8 +292,8 @@ export default function Booth() {
     setStatus("running");
     const controller = new AbortController();
     captureRef.current = controller;
+    const session = sessionRef.current;
     try {
-      const session = sessionRef.current;
       if (!session) throw new Error("Photo queue is still starting — please try again");
       await session.enqueueCapture(
         async (signal) => {
@@ -342,6 +318,7 @@ export default function Booth() {
           },
         }
       );
+      if (controller.signal.aborted || !lifecycle.isActive(session)) return;
       // Durable handoff is complete. Return to the picker before uploading so
       // the next guest is never trapped on the previous guest's frame.
       setError(null);
@@ -349,6 +326,7 @@ export default function Booth() {
       setStatus("picking");
       void session.process();
     } catch (e) {
+      if (controller.signal.aborted || !session || !lifecycle.isActive(session)) return;
       // composite (frame art fetch, toBlob) failed — surface it and recover
       // instead of leaving the booth stuck in "running" until a reload
       setError(e instanceof Error ? e.message : String(e));
@@ -360,7 +338,7 @@ export default function Booth() {
     } finally {
       if (captureRef.current === controller) captureRef.current = null;
     }
-  }, [accessState, status, mode, grabFrame]);
+  }, [accessState, status, mode, grabFrame, lifecycle]);
 
   // fallback: native file input (camera) when getUserMedia is blocked.
   // Re-encode to a real JPEG first — iPhones hand back HEIC, and the stored
@@ -375,8 +353,10 @@ export default function Booth() {
       const file = e.target.files?.[0];
       e.target.value = "";
       if (!file) return;
+      const controller = new AbortController();
+      captureRef.current = controller;
+      const session = sessionRef.current;
       try {
-        const session = sessionRef.current;
         if (!session) throw new Error("Photo queue is still starting — please try again");
         await session.enqueueCapture(async () => {
           let blob: Blob = file;
@@ -394,17 +374,22 @@ export default function Booth() {
           }
           return blob;
         }, {
+          signal: controller.signal,
           metadata: {
             source: "camera-fallback",
           },
         });
+        if (controller.signal.aborted || !lifecycle.isActive(session)) return;
         setError(null);
         void session.process();
       } catch (uploadError) {
+        if (controller.signal.aborted || !session || !lifecycle.isActive(session)) return;
         setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
+      } finally {
+        if (captureRef.current === controller) captureRef.current = null;
       }
     },
-    [accessState]
+    [accessState, lifecycle]
   );
 
   const pick = (m: keyof typeof TEMPLATES) => {
@@ -529,8 +514,10 @@ export default function Booth() {
       )}
       {accessState !== "ready" && accessState !== "exited" && (
         <BoothUnlock
+          key={event}
           event={event}
           state={accessState}
+          feedback={accessFeedback}
           pendingCount={uploadState.pendingCount}
           durable={uploadState.durable}
           outboxRecovered={outboxRecovered}
