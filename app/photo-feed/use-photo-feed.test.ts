@@ -12,6 +12,13 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+async function flushPromises() {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 function harness() {
   const requests: Array<{
     url: string;
@@ -70,8 +77,7 @@ describe("PhotoFeedRuntime", () => {
       cursor: "opaque",
       ignored: true,
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushPromises();
 
     expect(runtime.snapshot().photos).toHaveLength(1);
     expect(runtime.snapshot().inserted.map((photo) => photo.key)).toEqual(["events/show/a.jpg"]);
@@ -83,8 +89,7 @@ describe("PhotoFeedRuntime", () => {
     const runtime = new PhotoFeedRuntime("show", PROJECTOR_FEED_PROFILE, h.providers);
     runtime.start();
     h.requests[0]!.response.resolve({ photos: [{ key: 1 }], cursor: "bad" });
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushPromises();
 
     expect(runtime.snapshot()).toMatchObject({ photos: [], status: "error" });
     expect(h.timers.size).toBe(1);
@@ -99,8 +104,7 @@ describe("PhotoFeedRuntime", () => {
     expect(h.requests).toHaveLength(1);
     expect(h.requests[0]!.signal.aborted).toBeTrue();
     h.requests[0]!.response.reject(new DOMException("Aborted", "AbortError"));
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushPromises();
     expect(h.requests).toHaveLength(2);
   });
 
@@ -113,8 +117,7 @@ describe("PhotoFeedRuntime", () => {
       photos: [{ key: "events/show/stale.jpg", url: "/stale", uploadedAt: "2026-07-24T00:00:00Z" }],
       cursor: "stale",
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushPromises();
 
     expect(runtime.snapshot().photos).toEqual([]);
     expect(h.requests).toHaveLength(2);
@@ -125,8 +128,7 @@ describe("PhotoFeedRuntime", () => {
     const runtime = new PhotoFeedRuntime("show", PROJECTOR_FEED_PROFILE, h.providers);
     runtime.start();
     h.requests[0]!.response.resolve({ photos: [], cursor: null });
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushPromises();
     expect(h.timers.size).toBe(1);
 
     h.setVisible(false);
@@ -145,5 +147,19 @@ describe("PhotoFeedRuntime", () => {
 
     runtime.dispose();
     expect(h.requests.at(-1)!.signal.aborted).toBeTrue();
+  });
+
+  test("event change queues the new Event until the aborted request settles", async () => {
+    const h = harness();
+    const runtime = new PhotoFeedRuntime("show", PROJECTOR_FEED_PROFILE, h.providers);
+    runtime.start();
+    runtime.setEvent("other");
+
+    expect(h.requests).toHaveLength(1);
+    h.requests[0]!.response.resolve({ photos: [], cursor: null });
+    await flushPromises();
+
+    expect(h.requests).toHaveLength(2);
+    expect(h.requests[1]!.url).toBe("/api/photos?event=other");
   });
 });

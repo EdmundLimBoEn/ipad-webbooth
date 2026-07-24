@@ -83,6 +83,8 @@ export class PhotoFeedRuntime {
   private currentSnapshot: PhotoFeedSnapshot;
   private readonly listeners = new Set<() => void>();
   private controller: AbortController | null = null;
+  private activeRequest: Extract<PhotoFeedEffect, { type: "request" }> | null = null;
+  private queuedRequest: Extract<PhotoFeedEffect, { type: "request" }> | null = null;
   private timer: unknown = null;
   private unsubscribeVisibility: (() => void) | null = null;
   private started = false;
@@ -129,6 +131,8 @@ export class PhotoFeedRuntime {
     this.disposed = true;
     this.controller?.abort();
     this.controller = null;
+    this.activeRequest = null;
+    this.queuedRequest = null;
     this.clearTimer();
     this.unsubscribeVisibility?.();
     this.unsubscribeVisibility = null;
@@ -158,9 +162,19 @@ export class PhotoFeedRuntime {
   private execute(effect: PhotoFeedEffect): void {
     if (this.disposed) return;
     switch (effect.type) {
-      case "abort":
-        this.controller?.abort();
+      case "abort": {
+        if (this.queuedRequest?.requestId === effect.requestId) {
+          const queued = this.queuedRequest;
+          this.queuedRequest = null;
+          this.dispatch({
+            type: "request-aborted",
+            requestId: queued.requestId,
+            generation: queued.generation,
+          });
+        }
+        if (this.activeRequest?.requestId === effect.requestId) this.controller?.abort();
         return;
+      }
       case "cancel-schedule":
         this.clearTimer();
         return;
@@ -181,8 +195,13 @@ export class PhotoFeedRuntime {
     effect: Extract<PhotoFeedEffect, { type: "request" }>,
   ): void {
     this.clearTimer();
+    if (this.activeRequest) {
+      this.queuedRequest = effect;
+      return;
+    }
     const controller = new AbortController();
     this.controller = controller;
+    this.activeRequest = effect;
     const search = new URLSearchParams({ event: this.state.event });
     if (effect.after !== null) search.set("after", effect.after);
     void this.providers
@@ -226,7 +245,12 @@ export class PhotoFeedRuntime {
         });
       })
       .finally(() => {
-        if (this.controller === controller) this.controller = null;
+        if (this.controller !== controller) return;
+        this.controller = null;
+        this.activeRequest = null;
+        const queued = this.queuedRequest;
+        this.queuedRequest = null;
+        if (queued) this.request(queued);
       });
   }
 
