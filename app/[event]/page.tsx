@@ -18,6 +18,7 @@ import {
   BoothHeartbeatReporter,
   BoothStatePoller,
   createBoothOperationalSessionState,
+  stopBoothOperationalClients,
   type BoothOperationalClientState,
 } from "./booth-session/operational-client";
 import {
@@ -420,6 +421,7 @@ export default function Booth() {
       window.removeEventListener("offline", reconsiderConnectivity);
       document.removeEventListener("visibilitychange", reconsiderForeground);
       if (sessionRef.current === session) sessionRef.current = null;
+      stopBoothOperationalClients(poller, reporter);
       if (statePollerRef.current === poller) statePollerRef.current = null;
       if (heartbeatReporterRef.current === reporter) heartbeatReporterRef.current = null;
       void lifecycle.leaveEvent(session);

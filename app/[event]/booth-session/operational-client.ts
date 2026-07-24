@@ -270,6 +270,14 @@ export class BoothHeartbeatReporter {
   }
 }
 
+export function stopBoothOperationalClients(
+  poller: BoothStatePoller,
+  reporter: BoothHeartbeatReporter
+): void {
+  poller.stop();
+  reporter.stop();
+}
+
 // Enumerating these fields prevents browser details, arbitrary exception
 // messages, and credentials from entering the private heartbeat payload.
 function copySnapshot(snapshot: BoothHeartbeatInput): BoothHeartbeatInput {

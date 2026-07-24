@@ -4,6 +4,7 @@ import {
   BoothHeartbeatReporter,
   BoothStatePoller,
   createBoothOperationalSessionState,
+  stopBoothOperationalClients,
   type FetchLike,
 } from "./operational-client";
 
@@ -424,5 +425,81 @@ describe("Booth operational Event reset", () => {
       cameraErrorClass: null,
     });
     expect(eventB).not.toEqual(eventA);
+  });
+
+  test("navigation stops captured Event A controllers before callbacks can update Event B", async () => {
+    const oldPoll = deferred<Response>();
+    const oldHeartbeat = deferred<Response>();
+    const oldPollTimers = new Timers();
+    const oldHeartbeatTimers = new Timers();
+    let oldPollSignal: AbortSignal | undefined;
+    let oldHeartbeatSignal: AbortSignal | undefined;
+    let visibleEvent = "event-a";
+    const stateUpdates: Array<{ event: string; paused: boolean; connected: boolean }> = [];
+    const relocks: string[] = [];
+    const onState = (state: { paused: boolean; connected: boolean }) => {
+      stateUpdates.push({ event: visibleEvent, ...state });
+    };
+    const onAuthRequired = () => {
+      relocks.push(visibleEvent);
+    };
+    const oldPoller = new BoothStatePoller({
+      event: "event-a",
+      fetch: (_input, init) => {
+        oldPollSignal = init?.signal ?? undefined;
+        return oldPoll.promise;
+      },
+      onState,
+      setTimer: oldPollTimers.set,
+      clearTimer: oldPollTimers.clear,
+    });
+    const oldReporter = new BoothHeartbeatReporter({
+      event: "event-a",
+      boothKey: () => "event-a-key",
+      fetch: (_input, init) => {
+        oldHeartbeatSignal = init?.signal ?? undefined;
+        return oldHeartbeat.promise;
+      },
+      onAuthRequired,
+      setTimer: oldHeartbeatTimers.set,
+      clearTimer: oldHeartbeatTimers.clear,
+    });
+    oldReporter.update(heartbeat());
+    oldPoller.start();
+    oldReporter.start();
+
+    stopBoothOperationalClients(oldPoller, oldReporter);
+
+    visibleEvent = "event-b";
+    const eventBPoller = new BoothStatePoller({
+      event: "event-b",
+      fetch: async () => response(operationalState(false)),
+      onState,
+    });
+    const eventBReporter = new BoothHeartbeatReporter({
+      event: "event-b",
+      boothKey: () => "event-b-key",
+      fetch: async () => response({ ok: true }),
+      onAuthRequired,
+    });
+    eventBReporter.update(heartbeat({ sessionStartedAt: 200 }));
+    eventBPoller.start();
+    eventBReporter.start();
+    await settle();
+
+    oldPoll.resolve(response(operationalState(true)));
+    oldHeartbeat.resolve(response({ error: "unauthorized" }, 401));
+    await settle();
+    eventBPoller.stop();
+    eventBReporter.stop();
+
+    expect(stateUpdates).toEqual([
+      { event: "event-b", paused: false, connected: true },
+    ]);
+    expect(relocks).toEqual([]);
+    expect(oldPollSignal?.aborted).toBe(true);
+    expect(oldHeartbeatSignal?.aborted).toBe(true);
+    expect(oldPollTimers.pending).toHaveLength(0);
+    expect(oldHeartbeatTimers.pending).toHaveLength(0);
   });
 });
