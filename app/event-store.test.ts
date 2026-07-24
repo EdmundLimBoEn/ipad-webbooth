@@ -1,11 +1,42 @@
 import { describe, expect, test } from "bun:test";
 import {
   canonicalEvent,
+  ConfigConflictError,
+  ConfigMutationConflictError,
   EventStore,
   InMemoryObjectStore,
   eventConfigKey,
+  eventConfigRevisionKey,
   legacyEventConfigKey,
 } from "./event-store";
+
+class FailNextConfigHeadCasStore extends InMemoryObjectStore {
+  private failNextConfigHeadCas = true;
+
+  override async compareAndSwap(
+    key: string,
+    expectedEtag: string | null,
+    value: ArrayBuffer | ArrayBufferView | string
+  ): Promise<boolean> {
+    if (this.failNextConfigHeadCas && key === eventConfigKey("launch")) {
+      this.failNextConfigHeadCas = false;
+      return false;
+    }
+    return super.compareAndSwap(key, expectedEtag, value);
+  }
+}
+
+describe("ObjectStore", () => {
+  test("compareAndSwap rejects a stale etag", async () => {
+    const state = new InMemoryObjectStore();
+    expect(await state.compareAndSwap("head", null, "one")).toBe(true);
+    const first = await state.get("head");
+    expect(await state.compareAndSwap("head", "stale", "two")).toBe(false);
+    expect(await state.compareAndSwap("head", first!.etag, "two")).toBe(true);
+    expect(await first!.text()).toBe("one");
+    expect(await (await state.get("head"))!.text()).toBe("two");
+  });
+});
 
 describe("canonical event identity", () => {
   test("accepts canonical slugs and keeps the default event", () => {
@@ -57,6 +88,183 @@ describe("EventStore", () => {
       version: 2,
       frames: ["future"],
     });
+  });
+
+  test("first revision save appends baseline and preserves booth key", async () => {
+    const state = new InMemoryObjectStore({
+      [eventConfigKey("launch")]: JSON.stringify({ version: 1, frames: ["old"], boothKeyHash: "hash" }),
+    });
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example", () => new Date("2026-07-24T00:00:00Z"));
+    const result = await store.saveConfigRevision("launch", {
+      config: { frames: ["new"] },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-7000-8000-000000000002",
+    });
+    expect(result.config.boothKeyHash).toBe("hash");
+    expect(result.revision.parentRevisionId).not.toBeNull();
+    expect(result.idempotent).toBe(false);
+    expect((await store.readConfig("launch"))?.currentRevisionId).toBe(result.revision.id);
+    const baseline = await state.get(eventConfigRevisionKey("launch", result.revision.parentRevisionId!));
+    expect(await baseline?.json()).toMatchObject({
+      reason: "baseline",
+      config: { frames: ["old"] },
+    });
+    expect(await baseline!.text()).not.toContain("boothKeyHash");
+  });
+
+  test("stale save conflicts and an identical mutation retry is idempotent", async () => {
+    const store = new EventStore(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
+    const input = {
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-7000-8000-000000000003",
+    };
+    expect((await store.saveConfigRevision("launch", input)).idempotent).toBe(false);
+    expect((await store.saveConfigRevision("launch", input)).idempotent).toBe(true);
+    await expect(store.saveConfigRevision("launch", {
+      ...input,
+      mutationId: "018f0000-0000-7000-8000-000000000004",
+    })).rejects.toBeInstanceOf(ConfigConflictError);
+  });
+
+  test("only one concurrent save advances the head", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const results = await Promise.allSettled([
+      store.saveConfigRevision("launch", {
+        config: { frames: ["one"] },
+        baseRevisionId: null,
+        mutationId: "018f0000-0000-7000-8000-000000000005",
+      }),
+      store.saveConfigRevision("launch", {
+        config: { frames: ["two"] },
+        baseRevisionId: null,
+        mutationId: "018f0000-0000-7000-8000-000000000006",
+      }),
+    ]);
+
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({ reason: expect.any(ConfigConflictError) });
+    const winner = fulfilled[0];
+    if (!winner || winner.status !== "fulfilled") throw new Error("expected a winning save");
+    expect((await store.readConfig("launch"))?.currentRevisionId).toBe(winner.value.revision.id);
+  });
+
+  test("an orphaned concurrent revision stays outside the later head chain", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const mutationIds = [
+      "018f0000-0000-7000-8000-000000000007",
+      "018f0000-0000-7000-8000-000000000008",
+    ] as const;
+    const results = await Promise.allSettled(mutationIds.map((mutationId, index) =>
+      store.saveConfigRevision("launch", {
+        config: { frames: [`concurrent-${index}`] },
+        baseRevisionId: null,
+        mutationId,
+      })
+    ));
+    const winner = results.find((result) => result.status === "fulfilled");
+    expect(winner?.status).toBe("fulfilled");
+    if (!winner || winner.status !== "fulfilled") throw new Error("expected a winning save");
+    const orphanId = mutationIds.find((id) => id !== winner.value.revision.id)!;
+    expect(state.has(eventConfigRevisionKey("launch", orphanId))).toBe(true);
+
+    const later = await store.saveConfigRevision("launch", {
+      config: { frames: ["later"] },
+      baseRevisionId: winner.value.revision.id,
+      mutationId: "018f0000-0000-7000-8000-000000000009",
+    });
+    expect(later.revision.parentRevisionId).toBe(winner.value.revision.id);
+    expect(later.revision.parentRevisionId).not.toBe(orphanId);
+  });
+
+  test("reusing a mutation ID with different config conflicts", async () => {
+    const store = new EventStore(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
+    const mutationId = "018f0000-0000-7000-8000-00000000000a";
+    await store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      mutationId,
+    });
+    await expect(store.saveConfigRevision("launch", {
+      config: { frames: ["two"] },
+      baseRevisionId: null,
+      mutationId,
+    })).rejects.toBeInstanceOf(ConfigMutationConflictError);
+  });
+
+  test("reusing a mutation ID with a different base revision conflicts", async () => {
+    const store = new EventStore(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
+    const first = await store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-7000-8000-00000000000b",
+    });
+    const mutationId = "018f0000-0000-7000-8000-00000000000c";
+    await store.saveConfigRevision("launch", {
+      config: { frames: ["two"] },
+      baseRevisionId: first.revision.id,
+      mutationId,
+    });
+
+    await expect(store.saveConfigRevision("launch", {
+      config: { frames: ["two"] },
+      baseRevisionId: null,
+      mutationId,
+    })).rejects.toBeInstanceOf(ConfigMutationConflictError);
+  });
+
+  test("a mutation key containing a revision with another ID conflicts", async () => {
+    const state = new InMemoryObjectStore();
+    const mutationId = "018f0000-0000-7000-8000-00000000000e";
+    state.set(eventConfigRevisionKey("launch", mutationId), JSON.stringify({
+      version: 1,
+      id: "018f0000-0000-7000-8000-00000000000f",
+      createdAt: "2026-07-24T00:00:00Z",
+      parentRevisionId: null,
+      reason: "save",
+      config: { frames: ["one"] },
+    }));
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+
+    await expect(store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      mutationId,
+    })).rejects.toBeInstanceOf(ConfigMutationConflictError);
+  });
+
+  test("an identical retry finishes a legacy save after the revision append succeeds", async () => {
+    const state = new FailNextConfigHeadCasStore({
+      [eventConfigKey("launch")]: JSON.stringify({
+        version: 1,
+        frames: ["old"],
+        boothKeyHash: "hash",
+      }),
+    });
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const input = {
+      config: { frames: ["new"] },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-7000-8000-00000000000d",
+    };
+
+    await expect(store.saveConfigRevision("launch", input)).rejects.toBeInstanceOf(ConfigConflictError);
+    expect(state.has(eventConfigRevisionKey("launch", input.mutationId))).toBe(true);
+    expect((await store.readConfig("launch"))?.currentRevisionId).toBeUndefined();
+
+    const recovered = await store.saveConfigRevision("launch", input);
+    expect(recovered.idempotent).toBe(true);
+    expect(recovered.config).toMatchObject({
+      frames: ["new"],
+      boothKeyHash: "hash",
+      currentRevisionId: input.mutationId,
+    });
+    expect(recovered.revision.parentRevisionId).not.toBeNull();
   });
 
   test("returns an initial snapshot and efficient start-after delta", async () => {

@@ -4,18 +4,21 @@ import type {
   R2Objects,
   R2PutOptions,
 } from "@cloudflare/workers-types";
+import {
+  EVENT_CONFIG_VERSION,
+  parseConfigRevision,
+  parseEventConfig,
+  type ConfigRevision,
+  type EventConfig,
+  type EventExperience,
+} from "./event-config";
 export { canonicalEvent, InvalidEventSlugError, slugifyEvent } from "./event-identity";
-
-export const EVENT_CONFIG_VERSION = 1 as const;
+export { EVENT_CONFIG_VERSION };
+export type { EventConfig } from "./event-config";
 export const HEALTH_CANARY_KEY = "_health/canary";
 const HEALTH_STATE_KEY = "health/statuspage.json";
 const LEGACY_HEALTH_STATE_KEY = "_health/state.json";
 const PAGE_SIZE = 1000;
-
-export type EventConfig = {
-  frames?: string[];
-  boothKeyHash?: string;
-};
 
 type StoredEventConfig = EventConfig & { version: typeof EVENT_CONFIG_VERSION };
 
@@ -23,6 +26,7 @@ export type StoredObject = {
   key: string;
   size: number;
   uploaded: Date;
+  etag: string;
 };
 
 export interface StoredObjectBody extends StoredObject {
@@ -49,6 +53,12 @@ export interface ObjectStore {
   put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: R2PutOptions): Promise<void>;
   delete(key: string): Promise<void>;
   list(options?: ListOptions): Promise<ListResult>;
+  compareAndSwap(
+    key: string,
+    expectedEtag: string | null,
+    value: ArrayBuffer | ArrayBufferView | string,
+    options?: R2PutOptions
+  ): Promise<boolean>;
 }
 
 /** Production adapter. Keeping R2 behind this seam makes key and paging rules testable. */
@@ -63,6 +73,21 @@ export class R2ObjectStore implements ObjectStore {
     await this.bucket.put(key, value, options);
   }
 
+  async compareAndSwap(
+    key: string,
+    expectedEtag: string | null,
+    value: ArrayBuffer | ArrayBufferView | string,
+    options?: R2PutOptions
+  ): Promise<boolean> {
+    const result = await this.bucket.put(key, value, {
+      ...options,
+      onlyIf: expectedEtag === null
+        ? { etagDoesNotMatch: "*" }
+        : { etagMatches: expectedEtag },
+    });
+    return result !== null;
+  }
+
   delete(key: string): Promise<void> {
     return this.bucket.delete(key);
   }
@@ -73,7 +98,7 @@ export class R2ObjectStore implements ObjectStore {
   }
 }
 
-type MemoryEntry = { bytes: Uint8Array; uploaded: Date };
+type MemoryEntry = { bytes: Uint8Array; uploaded: Date; etag: string };
 
 /** Deterministic, committed fake used by unit/contract tests and local tooling. */
 export class InMemoryObjectStore implements ObjectStore {
@@ -87,7 +112,7 @@ export class InMemoryObjectStore implements ObjectStore {
 
   set(key: string, value: string | Uint8Array, uploaded = new Date()): void {
     const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value.slice();
-    this.entries.set(key, { bytes, uploaded });
+    this.entries.set(key, { bytes, uploaded, etag: crypto.randomUUID() });
   }
 
   has(key: string): boolean {
@@ -102,6 +127,7 @@ export class InMemoryObjectStore implements ObjectStore {
       key,
       size: bytes.byteLength,
       uploaded: entry.uploaded,
+      etag: entry.etag,
       async arrayBuffer() {
         return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
       },
@@ -115,11 +141,26 @@ export class InMemoryObjectStore implements ObjectStore {
   }
 
   async put(_key: string, value: ArrayBuffer | ArrayBufferView | string): Promise<void> {
-    let bytes: Uint8Array;
-    if (typeof value === "string") bytes = new TextEncoder().encode(value);
-    else if (ArrayBuffer.isView(value)) bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
-    else bytes = new Uint8Array(value.slice(0));
-    this.entries.set(_key, { bytes, uploaded: new Date() });
+    this.entries.set(_key, {
+      bytes: memoryBytes(value),
+      uploaded: new Date(),
+      etag: crypto.randomUUID(),
+    });
+  }
+
+  async compareAndSwap(
+    key: string,
+    expectedEtag: string | null,
+    value: ArrayBuffer | ArrayBufferView | string
+  ): Promise<boolean> {
+    const current = this.entries.get(key);
+    if (expectedEtag === null ? current !== undefined : current?.etag !== expectedEtag) return false;
+    this.entries.set(key, {
+      bytes: memoryBytes(value),
+      uploaded: new Date(),
+      etag: crypto.randomUUID(),
+    });
+    return true;
   }
 
   async delete(key: string): Promise<void> {
@@ -136,7 +177,7 @@ export class InMemoryObjectStore implements ObjectStore {
     const selected = keys.slice(offset, offset + limit);
     const objects = selected.map((key) => {
       const entry = this.entries.get(key)!;
-      return { key, size: entry.bytes.byteLength, uploaded: entry.uploaded };
+      return { key, size: entry.bytes.byteLength, uploaded: entry.uploaded, etag: entry.etag };
     });
     const next = offset + selected.length;
     return { objects, truncated: next < keys.length, cursor: next < keys.length ? String(next) : undefined };
@@ -144,20 +185,12 @@ export class InMemoryObjectStore implements ObjectStore {
 }
 
 export const eventConfigKey = (event: string) => `events/${event}/config.json`;
+export const eventConfigRevisionPrefix = (event: string) =>
+  `events/${event}/config-revisions/`;
+export const eventConfigRevisionKey = (event: string, id: string) =>
+  `${eventConfigRevisionPrefix(event)}${id}.json`;
 export const legacyEventConfigKey = (event: string) => `_config/${event}.json`;
 export const eventPhotoPrefix = (event: string) => `${event}/`;
-
-function parseConfig(value: unknown): EventConfig | null {
-  if (!value || typeof value !== "object") return null;
-  const config = value as Record<string, unknown>;
-  if (config.version !== undefined && config.version !== EVENT_CONFIG_VERSION) return null;
-  if (config.frames !== undefined && (!Array.isArray(config.frames) || !config.frames.every((f) => typeof f === "string"))) return null;
-  if (config.boothKeyHash !== undefined && typeof config.boothKeyHash !== "string") return null;
-  return {
-    ...(config.frames !== undefined ? { frames: config.frames as string[] } : {}),
-    ...(typeof config.boothKeyHash === "string" ? { boothKeyHash: config.boothKeyHash } : {}),
-  };
-}
 
 function photoTimestamp(key: string): number {
   const filename = key.slice(key.lastIndexOf("/") + 1);
@@ -170,6 +203,23 @@ function isPhotoKey(event: string, key: string): boolean {
 
 export type Photo = { key: string; url: string; uploadedAt: Date };
 export type PhotoFeed = { photos: Photo[]; cursor: string | null; unchanged: boolean; truncated: boolean };
+export type ConfigMutationResult = {
+  config: EventConfig;
+  revision: ConfigRevision;
+  idempotent: boolean;
+};
+
+export class ConfigConflictError extends Error {
+  constructor(readonly expectedRevisionId: string | null, readonly currentRevisionId: string | null) {
+    super("event configuration changed");
+  }
+}
+
+export class ConfigMutationConflictError extends Error {
+  constructor() {
+    super("mutation ID was already used for different configuration");
+  }
+}
 
 export class InvalidStoredEventConfigError extends Error {
   constructor(readonly event: string) {
@@ -183,7 +233,8 @@ export class EventStore {
   constructor(
     readonly photos: ObjectStore,
     readonly state: ObjectStore,
-    readonly publicBase: string
+    readonly publicBase: string,
+    private readonly now: () => Date = () => new Date()
   ) {}
 
   static fromEnv(env: Pick<CloudflareEnv, "PHOTOS" | "STATE" | "R2_PUBLIC_BASE">): EventStore {
@@ -205,7 +256,7 @@ export class EventStore {
         } catch {
           throw new InvalidStoredEventConfigError(event);
         }
-        const parsed = parseConfig(current);
+        const parsed = parseEventConfig(current);
         if (!parsed) throw new InvalidStoredEventConfigError(event);
         return parsed;
       }
@@ -215,7 +266,7 @@ export class EventStore {
     }
 
     // Compatibility migration: old configs remain readable after STATE is introduced.
-    const legacy = parseConfig(await this.readJson(this.photos, legacyEventConfigKey(event)));
+    const legacy = parseEventConfig(await this.readJson(this.photos, legacyEventConfigKey(event)));
     if (!legacy) return null;
     try {
       await this.writeConfig(event, legacy);
@@ -231,6 +282,84 @@ export class EventStore {
     await this.state.put(eventConfigKey(event), JSON.stringify(stored), {
       httpMetadata: { contentType: "application/json", cacheControl: "no-store" },
     });
+  }
+
+  async saveConfigRevision(
+    event: string,
+    input: {
+      config: EventConfig;
+      baseRevisionId: string | null;
+      mutationId: string;
+    }
+  ): Promise<ConfigMutationResult> {
+    const requested = parseEventConfig({
+      version: EVENT_CONFIG_VERSION,
+      ...input.config,
+      currentRevisionId: undefined,
+    });
+    if (!requested) throw new TypeError("invalid event configuration");
+    const requestedExperience = configExperience(requested);
+    const head = await this.readConfigHead(event);
+    const existing = await this.readRevision(event, input.mutationId);
+
+    if (existing) {
+      await this.assertMatchingMutation(event, existing, requestedExperience, input.baseRevisionId, input.mutationId);
+      return this.finishExistingMutation(event, input, requested, head, existing);
+    }
+
+    const currentRevisionId = head.config?.currentRevisionId ?? null;
+    if (input.baseRevisionId !== currentRevisionId) {
+      throw new ConfigConflictError(input.baseRevisionId, currentRevisionId);
+    }
+
+    let parentRevisionId = currentRevisionId;
+    if (head.config && !head.config.currentRevisionId) {
+      const baseline: ConfigRevision = {
+        version: EVENT_CONFIG_VERSION,
+        id: crypto.randomUUID(),
+        createdAt: this.now().toISOString(),
+        parentRevisionId: null,
+        reason: "baseline",
+        config: configExperience(head.config),
+      };
+      const appended = await this.state.compareAndSwap(
+        eventConfigRevisionKey(event, baseline.id),
+        null,
+        JSON.stringify(baseline),
+        jsonWriteOptions()
+      );
+      if (!appended) throw new ConfigMutationConflictError();
+      parentRevisionId = baseline.id;
+    }
+
+    const revision: ConfigRevision = {
+      version: EVENT_CONFIG_VERSION,
+      id: input.mutationId,
+      createdAt: this.now().toISOString(),
+      parentRevisionId,
+      reason: "save",
+      config: requestedExperience,
+    };
+    const appended = await this.state.compareAndSwap(
+      eventConfigRevisionKey(event, revision.id),
+      null,
+      JSON.stringify(revision),
+      jsonWriteOptions()
+    );
+    if (!appended) {
+      const racedRevision = await this.readRevision(event, input.mutationId);
+      if (!racedRevision) throw new ConfigMutationConflictError();
+      await this.assertMatchingMutation(
+        event,
+        racedRevision,
+        requestedExperience,
+        input.baseRevisionId,
+        input.mutationId
+      );
+      return this.finishExistingMutation(event, input, requested, head, racedRevision);
+    }
+
+    return this.advanceConfigHead(event, input.baseRevisionId, requested, head, revision, false);
   }
 
   photoKey(event: string, now = Date.now(), suffix = randomSuffix()): string {
@@ -315,6 +444,145 @@ export class EventStore {
       return null;
     }
   }
+
+  private async readConfigHead(event: string): Promise<{ config: EventConfig | null; etag: string | null }> {
+    const object = await this.state.get(eventConfigKey(event));
+    if (object) {
+      let value: unknown;
+      try {
+        value = await object.json<unknown>();
+      } catch {
+        throw new InvalidStoredEventConfigError(event);
+      }
+      const config = parseEventConfig(value);
+      if (!config) throw new InvalidStoredEventConfigError(event);
+      return { config, etag: object.etag };
+    }
+    const legacy = parseEventConfig(await this.readJson(this.photos, legacyEventConfigKey(event)));
+    return { config: legacy, etag: null };
+  }
+
+  private async readRevision(event: string, id: string): Promise<ConfigRevision | null> {
+    const object = await this.state.get(eventConfigRevisionKey(event, id));
+    if (!object) return null;
+    try {
+      return parseConfigRevision(await object.json<unknown>());
+    } catch {
+      return null;
+    }
+  }
+
+  private async assertMatchingMutation(
+    event: string,
+    revision: ConfigRevision,
+    requested: EventExperience,
+    baseRevisionId: string | null,
+    mutationId: string
+  ): Promise<void> {
+    if (
+      revision.id !== mutationId
+      || revision.reason !== "save"
+      || revision.sourceRevisionId !== undefined
+      || revision.sourcePresetId !== undefined
+      || !sameExperience(revision.config, requested)
+    ) {
+      throw new ConfigMutationConflictError();
+    }
+    if (revision.parentRevisionId === baseRevisionId) return;
+    if (baseRevisionId !== null || revision.parentRevisionId === null) {
+      throw new ConfigMutationConflictError();
+    }
+
+    // A first save over an unrevisioned config receives an internal baseline
+    // parent even though the caller's base remains null.
+    const parent = await this.readRevision(event, revision.parentRevisionId);
+    if (parent?.reason !== "baseline") throw new ConfigMutationConflictError();
+  }
+
+  private async finishExistingMutation(
+    event: string,
+    input: { config: EventConfig; baseRevisionId: string | null; mutationId: string },
+    requested: EventConfig,
+    head: { config: EventConfig | null; etag: string | null },
+    revision: ConfigRevision
+  ): Promise<ConfigMutationResult> {
+    if (head.config?.currentRevisionId === revision.id) {
+      return { config: head.config, revision, idempotent: true };
+    }
+
+    const currentRevisionId = head.config?.currentRevisionId ?? null;
+    let canAdvance = currentRevisionId === revision.parentRevisionId
+      && input.baseRevisionId === currentRevisionId;
+    if (
+      !canAdvance
+      && input.baseRevisionId === null
+      && currentRevisionId === null
+      && revision.parentRevisionId
+    ) {
+      const baseline = await this.readRevision(event, revision.parentRevisionId);
+      canAdvance = baseline?.reason === "baseline"
+        && sameExperience(baseline.config, configExperience(head.config ?? { frames: [] }));
+    }
+    if (!canAdvance) {
+      throw new ConfigConflictError(input.baseRevisionId, currentRevisionId);
+    }
+
+    return this.advanceConfigHead(event, input.baseRevisionId, requested, head, revision, true);
+  }
+
+  private async advanceConfigHead(
+    event: string,
+    baseRevisionId: string | null,
+    requested: EventConfig,
+    head: { config: EventConfig | null; etag: string | null },
+    revision: ConfigRevision,
+    idempotent: boolean
+  ): Promise<ConfigMutationResult> {
+    const config = mergedRevisionHead(requested, head.config, revision.id);
+    const advanced = await this.state.compareAndSwap(
+      eventConfigKey(event),
+      head.etag,
+      JSON.stringify({ version: EVENT_CONFIG_VERSION, ...config }),
+      jsonWriteOptions()
+    );
+    if (advanced) return { config, revision, idempotent };
+    const current = await this.readConfigHead(event);
+    if (current.config?.currentRevisionId === revision.id) {
+      return { config: current.config, revision, idempotent: true };
+    }
+    throw new ConfigConflictError(baseRevisionId, current.config?.currentRevisionId ?? null);
+  }
+}
+
+function memoryBytes(value: ArrayBuffer | ArrayBufferView | string): Uint8Array {
+  if (typeof value === "string") return new TextEncoder().encode(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+  return new Uint8Array(value.slice(0));
+}
+
+function configExperience(config: EventConfig): EventExperience {
+  const { boothKeyHash: _boothKeyHash, currentRevisionId: _currentRevisionId, ...experience } = config;
+  return experience;
+}
+
+function sameExperience(left: EventExperience, right: EventExperience): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function mergedRevisionHead(requested: EventConfig, current: EventConfig | null, revisionId: string): EventConfig {
+  const config: EventConfig = {
+    ...configExperience(requested),
+    currentRevisionId: revisionId,
+  };
+  const boothKeyHash = requested.boothKeyHash ?? current?.boothKeyHash;
+  if (boothKeyHash !== undefined) config.boothKeyHash = boothKeyHash;
+  return config;
+}
+
+function jsonWriteOptions(): R2PutOptions {
+  return {
+    httpMetadata: { contentType: "application/json", cacheControl: "no-store" },
+  };
 }
 
 function randomSuffix(): string {
