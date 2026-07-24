@@ -6,6 +6,8 @@ import {
   type BoothCredentialHolder,
   type BoothPreflightResult,
 } from "./lifecycle";
+import { MemoryOutboxStore } from "./outbox";
+import { BoothSession } from "./session";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -19,12 +21,14 @@ class FakeSession implements BoothLifecycleSession {
   readonly actions: string[] = [];
   recoverWork: Promise<void> = Promise.resolve();
   stopWork: Promise<void> = Promise.resolve();
+  recoverResult = { authBlockedItemId: null as string | null };
   onResumeAuth: (itemId: string) => void = () => {};
 
   async recover() {
     this.actions.push("recover");
     await this.recoverWork;
     this.actions.push("recovered");
+    return this.recoverResult;
   }
 
   start() {
@@ -96,6 +100,16 @@ function harness(options: {
 function credential(): BoothCredentialHolder {
   return { key: "" };
 }
+
+function activeCandidate(
+  coordinator: BoothLifecycleCoordinator<{ url: string }>
+) {
+  return (coordinator as unknown as {
+    active: { key: string } | null;
+  }).active;
+}
+
+const photo = (name: string) => new Blob([name], { type: "image/jpeg" });
 
 describe("Booth lifecycle coordination", () => {
   test("completes Outbox recovery before reading a stored credential or preflighting", async () => {
@@ -284,6 +298,109 @@ describe("Booth lifecycle coordination", () => {
       "resume-auth:first-auth",
       "resume-auth:second-auth",
     ]);
+  });
+
+  test("fresh-page recovery resumes a persisted auth oldest item and drains FIFO", async () => {
+    const store = new MemoryOutboxStore();
+    await store.put({
+      id: "persisted-auth",
+      event: "launch",
+      blob: photo("auth"),
+      createdAt: 1,
+      attempts: 1,
+      lastError: "expired key",
+      failureKind: "auth",
+      errorClass: "auth",
+    });
+    await store.put({
+      id: "ready-next",
+      event: "launch",
+      blob: photo("next"),
+      createdAt: 2,
+      attempts: 0,
+    });
+    const uploads: string[] = [];
+    const session = new BoothSession("launch", store, async (item) => {
+      uploads.push(item.id);
+      return { url: `/${item.id}` };
+    });
+    const h = harness({ stored: { launch: "restored-key" } });
+
+    await h.coordinator.beginEvent("launch", session, credential());
+
+    expect(uploads).toEqual(["persisted-auth", "ready-next"]);
+    expect(await store.list("launch")).toEqual([]);
+    await session.stop();
+  });
+
+  test("fresh-page recovery leaves a persisted permanent oldest item paused", async () => {
+    const store = new MemoryOutboxStore();
+    await store.put({
+      id: "persisted-permanent",
+      event: "launch",
+      blob: photo("permanent"),
+      createdAt: 1,
+      attempts: 1,
+      lastError: "invalid photo",
+      failureKind: "permanent",
+      errorClass: "payload",
+    });
+    await store.put({
+      id: "ready-next",
+      event: "launch",
+      blob: photo("next"),
+      createdAt: 2,
+      attempts: 0,
+    });
+    const uploads: string[] = [];
+    const session = new BoothSession("launch", store, async (item) => {
+      uploads.push(item.id);
+      return { url: `/${item.id}` };
+    });
+    const h = harness({ stored: { launch: "restored-key" } });
+
+    await h.coordinator.beginEvent("launch", session, credential());
+    await session.process();
+
+    expect(uploads).toEqual([]);
+    expect(await store.list("launch")).toMatchObject([
+      { id: "persisted-permanent", failureKind: "permanent" },
+      { id: "ready-next" },
+    ]);
+    await session.stop();
+  });
+
+  test("zeros the previous candidate key immediately when replacing an Event", async () => {
+    const nextRecovery = deferred<void>();
+    const first = new FakeSession();
+    const second = new FakeSession();
+    second.recoverWork = nextRecovery.promise;
+    const h = harness({ stored: { first: "first-key" } });
+    await h.coordinator.beginEvent("first", first, credential());
+    const previous = activeCandidate(h.coordinator);
+    expect(previous?.key).toBe("first-key");
+
+    const switching = h.coordinator.beginEvent("second", second, credential());
+
+    expect(previous?.key).toBe("");
+    nextRecovery.resolve();
+    await switching;
+  });
+
+  test("zeros the active candidate key immediately when leaving an Event", async () => {
+    const stopping = deferred<void>();
+    const session = new FakeSession();
+    session.stopWork = stopping.promise;
+    const h = harness({ stored: { launch: "stored-key" } });
+    await h.coordinator.beginEvent("launch", session, credential());
+    const leavingActive = activeCandidate(h.coordinator);
+    expect(leavingActive?.key).toBe("stored-key");
+
+    const leaving = h.coordinator.leaveEvent(session);
+
+    expect(leavingActive?.key).toBe("");
+    stopping.resolve();
+    await leaving;
   });
 });
 

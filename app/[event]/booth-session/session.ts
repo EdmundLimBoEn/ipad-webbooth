@@ -93,6 +93,10 @@ export class BoothSession {
       error: pending.find((item) => item.lastError)?.lastError ?? null,
       durable: this.store.isDurable(),
     });
+    return {
+      authBlockedItemId:
+        pending[0]?.failureKind === "auth" ? pending[0].id : null,
+    };
   }
 
   start() {

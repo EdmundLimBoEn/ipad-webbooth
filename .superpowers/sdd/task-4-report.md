@@ -292,3 +292,65 @@ dynamic `/[event]` route.
   resuming.
 - Memory-only outbox copy says photos are waiting in the open page and that
   reload recovery is unavailable; it never describes those photos as safe.
+
+## Final review follow-up — reload auth recovery
+
+### RED
+
+Added Session recovery-contract tests, real fresh-page coordinator/Session
+tests, and synchronous candidate-key zeroing tests before implementation:
+
+```bash
+/Users/limboenedmund/.bun/bin/bun test \
+  'app/[event]/booth-session/session.test.ts' \
+  'app/[event]/booth-session/lifecycle.test.ts' \
+  'app/[event]/booth-unlock.test.tsx'
+```
+
+Observed: exit `1`, `65 pass`, `5 fail`, `209` expectations. The expected
+failures showed that `recover()` returned no auth identity, a fresh coordinator
+did not resume the persisted auth row, and candidate keys survived replacement
+and leave until after the security boundary.
+
+### GREEN
+
+The same focused suite after the minimal recovery contract and zeroing changes:
+
+```bash
+/Users/limboenedmund/.bun/bin/bun test \
+  'app/[event]/booth-session/session.test.ts' \
+  'app/[event]/booth-session/lifecycle.test.ts' \
+  'app/[event]/booth-unlock.test.tsx'
+```
+
+Observed: exit `0`, `70 pass`, `0 fail`, `212` expectations.
+
+Both TypeScript checks:
+
+```bash
+/Users/limboenedmund/.bun/bin/bun run typecheck && \
+  /Users/limboenedmund/.bun/bin/bun run typecheck:tests
+```
+
+Observed: exit `0`; both checks passed.
+
+Full test suite:
+
+```bash
+/Users/limboenedmund/.bun/bin/bun test
+```
+
+Observed: exit `0`, `319 pass`, `0 fail`, `1021` expectations across `26`
+test files.
+
+### Final review fixes
+
+- `BoothSession.recover()` reports the exact oldest persisted auth-failed item
+  ID without changing or removing any outbox row.
+- Fresh coordinator recovery retains that ID through credential preflight and
+  invokes the existing lease-gated `resumeAuth(id)` path only after successful
+  authentication. The auth row and following rows drain in FIFO order.
+- A recovered permanent oldest row exposes no auth-resume identity and remains
+  paused.
+- Event replacement and leave synchronously blank both the upload credential
+  holder and the coordinator's candidate key before any deferred stop work.

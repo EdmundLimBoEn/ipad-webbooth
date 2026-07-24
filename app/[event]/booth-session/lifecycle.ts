@@ -16,8 +16,12 @@ export type BoothPreflightResult =
   | { kind: "unavailable" }
   | { kind: "recovery-only" };
 
+export type BoothSessionRecovery = {
+  authBlockedItemId: string | null;
+};
+
 export interface BoothLifecycleSession {
-  recover(): Promise<void>;
+  recover(): Promise<BoothSessionRecovery>;
   start(): Promise<void> | void;
   resumeAuth(itemId: string): Promise<void>;
   stop(): Promise<void>;
@@ -82,6 +86,7 @@ export class BoothLifecycleCoordinator<Result> {
     const previous = this.active;
     this.preflightController?.abort();
     if (previous) {
+      previous.key = "";
       previous.credential.key = "";
       void this.ensureStopped(previous);
     }
@@ -101,8 +106,9 @@ export class BoothLifecycleCoordinator<Result> {
     this.deps.onFrames(null);
     this.deps.onAccess("locked", "recovering");
 
+    let recovery: BoothSessionRecovery;
     try {
-      await session.recover();
+      recovery = await session.recover();
     } catch {
       if (!this.isCurrent(active)) return;
       this.deps.onOutboxRecovered();
@@ -110,6 +116,7 @@ export class BoothLifecycleCoordinator<Result> {
       return;
     }
     if (!this.isCurrent(active)) return;
+    active.authBlockedItemId = recovery.authBlockedItemId;
 
     this.deps.onOutboxRecovered();
     this.deps.onAccess("locked", "locked");
@@ -124,6 +131,7 @@ export class BoothLifecycleCoordinator<Result> {
     if (!active || active.session !== session) return;
     this.active = null;
     this.preflightController?.abort();
+    active.key = "";
     active.credential.key = "";
     this.deps.onCameraStop();
     await this.ensureStopped(active);

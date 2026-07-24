@@ -593,6 +593,65 @@ describe("BoothSession outbox", () => {
     }
   });
 
+  test("recover exposes the exact oldest persisted auth item without changing the row", async () => {
+    const store = new MemoryOutboxStore();
+    await store.put({
+      id: "persisted-auth",
+      event: "party",
+      blob: photo("auth"),
+      createdAt: 1,
+      attempts: 3,
+      lastError: "expired key",
+      failureKind: "auth",
+      errorClass: "auth",
+    });
+    await store.put({
+      id: "ready-next",
+      event: "party",
+      blob: photo("next"),
+      createdAt: 2,
+      attempts: 0,
+    });
+    const before = await store.list("party");
+    const session = new BoothSession("party", store, async () => ({ url: "/unused" }));
+
+    const recovery = await session.recover();
+
+    expect(recovery).toEqual({ authBlockedItemId: "persisted-auth" });
+    expect(await store.list("party")).toEqual(before);
+  });
+
+  test("recover does not expose a later auth row when the persisted oldest is permanent", async () => {
+    const store = new MemoryOutboxStore();
+    await store.put({
+      id: "permanent-oldest",
+      event: "party",
+      blob: photo("permanent"),
+      createdAt: 1,
+      attempts: 1,
+      lastError: "invalid photo",
+      failureKind: "permanent",
+      errorClass: "payload",
+    });
+    await store.put({
+      id: "auth-next",
+      event: "party",
+      blob: photo("auth"),
+      createdAt: 2,
+      attempts: 1,
+      lastError: "expired key",
+      failureKind: "auth",
+      errorClass: "auth",
+    });
+    const before = await store.list("party");
+    const session = new BoothSession("party", store, async () => ({ url: "/unused" }));
+
+    const recovery = await session.recover();
+
+    expect(recovery).toEqual({ authBlockedItemId: null });
+    expect(await store.list("party")).toEqual(before);
+  });
+
   test("persists auth failure before notifying the credential owner", async () => {
     const store = new MemoryOutboxStore();
     let persistedBeforeCallback = false;
