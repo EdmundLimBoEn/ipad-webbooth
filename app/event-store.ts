@@ -29,11 +29,24 @@ type ConfigSaveInput = {
   mutationId: string;
   boothKeyMutationFingerprint?: string;
 };
+export type ConfigRestoreInput = {
+  revisionId: string;
+  baseRevisionId: string | null;
+  mutationId: string;
+};
 type ConfigMutationIntent = {
   version: typeof EVENT_CONFIG_VERSION;
   config: EventExperience;
   baseRevisionId: string | null;
   boothKeyMutationFingerprint: string | null;
+};
+type ConfigAppendInput = {
+  config: EventConfig;
+  baseRevisionId: string | null;
+  mutationId: string;
+  boothKeyMutationFingerprint: string | null;
+  reason: "save" | "restore";
+  sourceRevisionId?: string;
 };
 
 export type StoredObject = {
@@ -224,6 +237,11 @@ export type ConfigMutationResult = {
   revision: ConfigRevision;
   idempotent: boolean;
 };
+export type ConfigHistory = {
+  config: EventConfig | null;
+  currentRevisionId: string | null;
+  revisions: ConfigRevision[];
+};
 
 export class ConfigConflictError extends Error {
   constructor(readonly expectedRevisionId: string | null, readonly currentRevisionId: string | null) {
@@ -234,6 +252,18 @@ export class ConfigConflictError extends Error {
 export class ConfigMutationConflictError extends Error {
   constructor() {
     super("mutation ID was already used for different configuration");
+  }
+}
+
+export class ConfigRevisionNotFoundError extends Error {
+  constructor(readonly event: string, readonly revisionId: string) {
+    super(`config revision ${revisionId} is not reachable for ${event}`);
+  }
+}
+
+export class InvalidStoredConfigRevisionError extends Error {
+  constructor(readonly event: string, readonly revisionId: string) {
+    super(`stored config revision ${revisionId} for ${event} is corrupt or uses an unsupported version`);
   }
 }
 
@@ -310,20 +340,72 @@ export class EventStore {
       currentRevisionId: undefined,
     });
     if (!requested) throw new TypeError("invalid event configuration");
-    const requestedExperience = configExperience(requested);
+    return this.appendConfigRevision(event, {
+      config: requested,
+      baseRevisionId: input.baseRevisionId,
+      mutationId: input.mutationId,
+      boothKeyMutationFingerprint,
+      reason: "save",
+    });
+  }
+
+  async readConfigHistory(event: string): Promise<ConfigHistory> {
+    const config = await this.readConfig(event);
+    const currentRevisionId = config?.currentRevisionId ?? null;
+    const revisions: ConfigRevision[] = [];
+    const visited = new Set<string>();
+    let revisionId = currentRevisionId;
+
+    while (revisionId !== null) {
+      if (visited.has(revisionId)) {
+        throw new InvalidStoredConfigRevisionError(event, revisionId);
+      }
+      visited.add(revisionId);
+      const revision = await this.readReachableRevision(event, revisionId);
+      revisions.push(revision);
+      revisionId = revision.parentRevisionId;
+    }
+
+    return { config, currentRevisionId, revisions };
+  }
+
+  async restoreConfigRevision(
+    event: string,
+    input: ConfigRestoreInput
+  ): Promise<ConfigMutationResult> {
+    validateConfigRestoreInput(input);
+    const history = await this.readConfigHistory(event);
+    const source = history.revisions.find((revision) => revision.id === input.revisionId);
+    if (!source) throw new ConfigRevisionNotFoundError(event, input.revisionId);
+
+    return this.appendConfigRevision(event, {
+      config: source.config,
+      baseRevisionId: input.baseRevisionId,
+      mutationId: input.mutationId,
+      boothKeyMutationFingerprint: null,
+      reason: "restore",
+      sourceRevisionId: source.id,
+    });
+  }
+
+  private async appendConfigRevision(
+    event: string,
+    input: ConfigAppendInput
+  ): Promise<ConfigMutationResult> {
+    const requestedExperience = configExperience(input.config);
     const head = await this.readConfigHead(event);
     await this.ensureConfigMutationIntent(
       event,
       input.mutationId,
       requestedExperience,
       input.baseRevisionId,
-      boothKeyMutationFingerprint
+      input.boothKeyMutationFingerprint
     );
     const existing = await this.readRevision(event, input.mutationId);
 
     if (existing) {
-      await this.assertMatchingMutation(event, existing, requestedExperience, input.baseRevisionId, input.mutationId);
-      return this.finishExistingMutation(event, input, requested, head, existing);
+      await this.assertMatchingMutation(event, existing, requestedExperience, input);
+      return this.finishExistingMutation(event, input, input.config, head, existing);
     }
 
     const currentRevisionId = head.config?.currentRevisionId ?? null;
@@ -356,7 +438,8 @@ export class EventStore {
       id: input.mutationId,
       createdAt: this.now().toISOString(),
       parentRevisionId,
-      reason: "save",
+      reason: input.reason,
+      ...(input.sourceRevisionId ? { sourceRevisionId: input.sourceRevisionId } : {}),
       config: requestedExperience,
     };
     const appended = await this.state.compareAndSwap(
@@ -372,13 +455,12 @@ export class EventStore {
         event,
         racedRevision,
         requestedExperience,
-        input.baseRevisionId,
-        input.mutationId
+        input
       );
-      return this.finishExistingMutation(event, input, requested, head, racedRevision);
+      return this.finishExistingMutation(event, input, input.config, head, racedRevision);
     }
 
-    return this.advanceConfigHead(event, input.baseRevisionId, requested, head, revision, false);
+    return this.advanceConfigHead(event, input.baseRevisionId, input.config, head, revision, false);
   }
 
   photoKey(event: string, now = Date.now(), suffix = randomSuffix()): string {
@@ -546,24 +628,39 @@ export class EventStore {
     }
   }
 
+  private async readReachableRevision(event: string, id: string): Promise<ConfigRevision> {
+    const object = await this.state.get(eventConfigRevisionKey(event, id));
+    if (!object) throw new InvalidStoredConfigRevisionError(event, id);
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredConfigRevisionError(event, id);
+    }
+    const revision = parseConfigRevision(value);
+    if (!revision || revision.id !== id) {
+      throw new InvalidStoredConfigRevisionError(event, id);
+    }
+    return revision;
+  }
+
   private async assertMatchingMutation(
     event: string,
     revision: ConfigRevision,
     requested: EventExperience,
-    baseRevisionId: string | null,
-    mutationId: string
+    input: ConfigAppendInput
   ): Promise<void> {
     if (
-      revision.id !== mutationId
-      || revision.reason !== "save"
-      || revision.sourceRevisionId !== undefined
+      revision.id !== input.mutationId
+      || revision.reason !== input.reason
+      || revision.sourceRevisionId !== input.sourceRevisionId
       || revision.sourcePresetId !== undefined
       || !sameExperience(revision.config, requested)
     ) {
       throw new ConfigMutationConflictError();
     }
-    if (revision.parentRevisionId === baseRevisionId) return;
-    if (baseRevisionId !== null || revision.parentRevisionId === null) {
+    if (revision.parentRevisionId === input.baseRevisionId) return;
+    if (input.baseRevisionId !== null || revision.parentRevisionId === null) {
       throw new ConfigMutationConflictError();
     }
 
@@ -575,7 +672,7 @@ export class EventStore {
 
   private async finishExistingMutation(
     event: string,
-    input: ConfigSaveInput,
+    input: Pick<ConfigAppendInput, "baseRevisionId">,
     requested: EventConfig,
     head: { config: EventConfig | null; etag: string | null },
     revision: ConfigRevision
@@ -645,6 +742,14 @@ function validateConfigMutationInput(input: ConfigSaveInput): string | null {
     throw new TypeError("boothKeyMutationFingerprint must be 64 lowercase hexadecimal characters");
   }
   return input.boothKeyMutationFingerprint ?? null;
+}
+
+function validateConfigRestoreInput(input: ConfigRestoreInput): void {
+  if (!isRevisionId(input.revisionId)) throw new TypeError("revisionId must be a revision ID");
+  if (!isRevisionId(input.mutationId)) throw new TypeError("mutationId must be a revision ID");
+  if (input.baseRevisionId !== null && !isRevisionId(input.baseRevisionId)) {
+    throw new TypeError("baseRevisionId must be a revision ID or null");
+  }
 }
 
 function parseConfigMutationIntent(value: unknown): ConfigMutationIntent | null {

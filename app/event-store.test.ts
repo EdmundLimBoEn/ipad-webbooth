@@ -3,8 +3,10 @@ import {
   canonicalEvent,
   ConfigConflictError,
   ConfigMutationConflictError,
+  ConfigRevisionNotFoundError,
   EventStore,
   InMemoryObjectStore,
+  InvalidStoredConfigRevisionError,
   eventConfigKey,
   eventConfigMutationKey,
   eventConfigRevisionKey,
@@ -549,6 +551,334 @@ describe("EventStore", () => {
       baseRevisionId: null,
       boothKeyMutationFingerprint: input.boothKeyMutationFingerprint,
     });
+  });
+
+  test("history follows only the reachable head chain and restore appends", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const first = await store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-7000-8000-000000000010",
+    });
+    const second = await store.saveConfigRevision("launch", {
+      config: { frames: ["two"] },
+      baseRevisionId: first.revision.id,
+      mutationId: "018f0000-0000-7000-8000-000000000011",
+    });
+    state.set(eventConfigRevisionKey("launch", "018f0000-0000-7000-8000-000000000099"), JSON.stringify({
+      version: 1,
+      id: "018f0000-0000-7000-8000-000000000099",
+      createdAt: "2026-07-24T00:00:00Z",
+      parentRevisionId: null,
+      reason: "save",
+      config: { frames: ["orphan"] },
+    }));
+
+    expect((await store.readConfigHistory("launch")).revisions.map((revision) => revision.id)).toEqual([
+      second.revision.id,
+      first.revision.id,
+    ]);
+    const restored = await store.restoreConfigRevision("launch", {
+      revisionId: first.revision.id,
+      baseRevisionId: second.revision.id,
+      mutationId: "018f0000-0000-7000-8000-000000000012",
+    });
+    expect(restored.config.frames).toEqual(["one"]);
+    expect(restored.revision).toMatchObject({
+      reason: "restore",
+      sourceRevisionId: first.revision.id,
+      parentRevisionId: second.revision.id,
+    });
+    expect((await store.readConfigHistory("launch")).revisions.map((revision) => revision.id)).toEqual([
+      restored.revision.id,
+      second.revision.id,
+      first.revision.id,
+    ]);
+  });
+
+  test("restore rejects missing and unreachable source revisions", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const current = await store.saveConfigRevision("launch", {
+      config: { frames: ["current"] },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-7000-8000-000000000030",
+    });
+    const orphanId = "018f0000-0000-7000-8000-000000000031";
+    state.set(eventConfigRevisionKey("launch", orphanId), JSON.stringify({
+      version: 1,
+      id: orphanId,
+      createdAt: "2026-07-24T00:00:00Z",
+      parentRevisionId: null,
+      reason: "save",
+      config: { frames: ["orphan"] },
+    }));
+    const attempts = [
+      {
+        revisionId: "018f0000-0000-7000-8000-000000000098",
+        mutationId: "018f0000-0000-7000-8000-000000000032",
+      },
+      {
+        revisionId: orphanId,
+        mutationId: "018f0000-0000-7000-8000-000000000046",
+      },
+    ];
+
+    for (const attempt of attempts) {
+      await expect(store.restoreConfigRevision("launch", {
+        ...attempt,
+        baseRevisionId: current.revision.id,
+      })).rejects.toBeInstanceOf(ConfigRevisionNotFoundError);
+      expect(state.has(eventConfigMutationKey("launch", attempt.mutationId))).toBe(false);
+      expect(state.has(eventConfigRevisionKey("launch", attempt.mutationId))).toBe(false);
+    }
+  });
+
+  test("history rejects corrupt and unsupported reachable revisions", async () => {
+    const corruptId = "018f0000-0000-7000-8000-000000000033";
+    const futureId = "018f0000-0000-7000-8000-000000000034";
+    const invalidValues = [
+      [corruptId, "{not-json"],
+      [futureId, JSON.stringify({
+        version: 2,
+        id: futureId,
+        createdAt: "2026-07-24T00:00:00Z",
+        parentRevisionId: null,
+        reason: "save",
+        config: { frames: ["future"] },
+      })],
+    ] as const;
+
+    for (const [revisionId, value] of invalidValues) {
+      const state = new InMemoryObjectStore({
+        [eventConfigKey("launch")]: JSON.stringify({
+          version: 1,
+          frames: ["current"],
+          currentRevisionId: revisionId,
+        }),
+        [eventConfigRevisionKey("launch", revisionId)]: value,
+      });
+      const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+      await expect(store.readConfigHistory("launch")).rejects.toBeInstanceOf(InvalidStoredConfigRevisionError);
+    }
+  });
+
+  test("history rejects a missing reachable parent", async () => {
+    const headId = "018f0000-0000-7000-8000-000000000035";
+    const missingParentId = "018f0000-0000-7000-8000-000000000036";
+    const state = new InMemoryObjectStore({
+      [eventConfigKey("launch")]: JSON.stringify({
+        version: 1,
+        frames: ["head"],
+        currentRevisionId: headId,
+      }),
+      [eventConfigRevisionKey("launch", headId)]: JSON.stringify({
+        version: 1,
+        id: headId,
+        createdAt: "2026-07-24T00:00:00Z",
+        parentRevisionId: missingParentId,
+        reason: "save",
+        config: { frames: ["head"] },
+      }),
+    });
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+
+    await expect(store.readConfigHistory("launch")).rejects.toBeInstanceOf(InvalidStoredConfigRevisionError);
+  });
+
+  test("history rejects a cycle in the reachable chain", async () => {
+    const firstId = "018f0000-0000-7000-8000-000000000037";
+    const secondId = "018f0000-0000-7000-8000-000000000038";
+    const state = new InMemoryObjectStore({
+      [eventConfigKey("launch")]: JSON.stringify({
+        version: 1,
+        frames: ["first"],
+        currentRevisionId: firstId,
+      }),
+      [eventConfigRevisionKey("launch", firstId)]: JSON.stringify({
+        version: 1,
+        id: firstId,
+        createdAt: "2026-07-24T00:00:00Z",
+        parentRevisionId: secondId,
+        reason: "save",
+        config: { frames: ["first"] },
+      }),
+      [eventConfigRevisionKey("launch", secondId)]: JSON.stringify({
+        version: 1,
+        id: secondId,
+        createdAt: "2026-07-23T00:00:00Z",
+        parentRevisionId: firstId,
+        reason: "save",
+        config: { frames: ["second"] },
+      }),
+    });
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+
+    await expect(store.readConfigHistory("launch")).rejects.toBeInstanceOf(InvalidStoredConfigRevisionError);
+  });
+
+  test("stale restore conflicts without appending a revision", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const first = await store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-7000-8000-000000000039",
+    });
+    const second = await store.saveConfigRevision("launch", {
+      config: { frames: ["two"] },
+      baseRevisionId: first.revision.id,
+      mutationId: "018f0000-0000-7000-8000-00000000003a",
+    });
+    const mutationId = "018f0000-0000-7000-8000-00000000003b";
+
+    await expect(store.restoreConfigRevision("launch", {
+      revisionId: first.revision.id,
+      baseRevisionId: first.revision.id,
+      mutationId,
+    })).rejects.toBeInstanceOf(ConfigConflictError);
+    expect((await store.readConfig("launch"))?.currentRevisionId).toBe(second.revision.id);
+    expect(state.has(eventConfigRevisionKey("launch", mutationId))).toBe(false);
+  });
+
+  test("an identical restore retry is idempotent", async () => {
+    const store = new EventStore(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
+    const first = await store.saveConfigRevision("launch", {
+      config: { frames: ["one"] },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-7000-8000-00000000003c",
+    });
+    const second = await store.saveConfigRevision("launch", {
+      config: { frames: ["two"] },
+      baseRevisionId: first.revision.id,
+      mutationId: "018f0000-0000-7000-8000-00000000003d",
+    });
+    const input = {
+      revisionId: first.revision.id,
+      baseRevisionId: second.revision.id,
+      mutationId: "018f0000-0000-7000-8000-00000000003e",
+    };
+
+    expect((await store.restoreConfigRevision("launch", input)).idempotent).toBe(false);
+    const retried = await store.restoreConfigRevision("launch", input);
+    expect(retried.idempotent).toBe(true);
+    expect(retried.revision).toMatchObject({
+      id: input.mutationId,
+      reason: "restore",
+      sourceRevisionId: first.revision.id,
+    });
+  });
+
+  test("an identical retry finishes a restore after the revision append succeeds", async () => {
+    const firstId = "018f0000-0000-7000-8000-000000000047";
+    const secondId = "018f0000-0000-7000-8000-000000000048";
+    const state = new FailNextConfigHeadCasStore({
+      [eventConfigKey("launch")]: JSON.stringify({
+        version: 1,
+        frames: ["two"],
+        boothKeyHash: "current-hash",
+        currentRevisionId: secondId,
+      }),
+      [eventConfigRevisionKey("launch", firstId)]: JSON.stringify({
+        version: 1,
+        id: firstId,
+        createdAt: "2026-07-23T00:00:00Z",
+        parentRevisionId: null,
+        reason: "save",
+        config: { frames: ["one"] },
+      }),
+      [eventConfigRevisionKey("launch", secondId)]: JSON.stringify({
+        version: 1,
+        id: secondId,
+        createdAt: "2026-07-24T00:00:00Z",
+        parentRevisionId: firstId,
+        reason: "save",
+        config: { frames: ["two"] },
+      }),
+    });
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const input = {
+      revisionId: firstId,
+      baseRevisionId: secondId,
+      mutationId: "018f0000-0000-7000-8000-000000000049",
+    };
+
+    await expect(store.restoreConfigRevision("launch", input)).rejects.toBeInstanceOf(ConfigConflictError);
+    expect(state.has(eventConfigRevisionKey("launch", input.mutationId))).toBe(true);
+    expect((await store.readConfigHistory("launch")).revisions.map((revision) => revision.id)).toEqual([
+      secondId,
+      firstId,
+    ]);
+
+    const recovered = await store.restoreConfigRevision("launch", input);
+    expect(recovered).toMatchObject({
+      config: {
+        frames: ["one"],
+        boothKeyHash: "current-hash",
+        currentRevisionId: input.mutationId,
+      },
+      revision: {
+        id: input.mutationId,
+        parentRevisionId: secondId,
+        reason: "restore",
+        sourceRevisionId: firstId,
+      },
+      idempotent: true,
+    });
+  });
+
+  test("restore preserves the current Booth Key without writing it to immutable records", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const first = await store.saveConfigRevision("launch", {
+      config: { frames: ["one"], boothKeyHash: "old-hash" },
+      baseRevisionId: null,
+      mutationId: "018f0000-0000-7000-8000-00000000003f",
+      boothKeyMutationFingerprint: "d".repeat(64),
+    });
+    const second = await store.saveConfigRevision("launch", {
+      config: { frames: ["two"], boothKeyHash: "current-hash" },
+      baseRevisionId: first.revision.id,
+      mutationId: "018f0000-0000-7000-8000-000000000040",
+      boothKeyMutationFingerprint: "e".repeat(64),
+    });
+
+    const restored = await store.restoreConfigRevision("launch", {
+      revisionId: first.revision.id,
+      baseRevisionId: second.revision.id,
+      mutationId: "018f0000-0000-7000-8000-000000000041",
+    });
+    expect(restored.config.boothKeyHash).toBe("current-hash");
+    expect(await (await state.get(eventConfigRevisionKey("launch", restored.revision.id)))?.text()).not.toContain("current-hash");
+    expect(await (await state.get(eventConfigMutationKey("launch", restored.revision.id)))?.text()).not.toContain("current-hash");
+  });
+
+  test("invalid restore revision IDs write nothing", async () => {
+    const invalidInputs = [
+      {
+        revisionId: "not-a-revision-id",
+        baseRevisionId: null,
+        mutationId: "018f0000-0000-7000-8000-000000000042",
+      },
+      {
+        revisionId: "018f0000-0000-7000-8000-000000000043",
+        baseRevisionId: "not-a-revision-id",
+        mutationId: "018f0000-0000-7000-8000-000000000044",
+      },
+      {
+        revisionId: "018f0000-0000-7000-8000-000000000045",
+        baseRevisionId: null,
+        mutationId: "not-a-revision-id",
+      },
+    ];
+
+    for (const input of invalidInputs) {
+      const state = new InMemoryObjectStore();
+      const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+      await expect(store.restoreConfigRevision("launch", input)).rejects.toBeInstanceOf(TypeError);
+      expect((await state.list()).objects).toHaveLength(0);
+    }
   });
 
   test("returns an initial snapshot and efficient start-after delta", async () => {
