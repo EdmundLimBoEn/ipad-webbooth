@@ -3,6 +3,7 @@ import { NextRequest } from "next/server";
 import {
   EventStore,
   InMemoryObjectStore,
+  legacyEventConfigKey,
   type ObjectStore,
   type StoredObjectBody,
   type StoredObject,
@@ -145,6 +146,28 @@ describe("upload route", () => {
     expect((await state.list()).objects).toHaveLength(0);
   });
 
+  test("invalid stable identity cannot trigger lazy legacy-config migration", async () => {
+    const boothKey = "event-key-123";
+    const boothKeyHash = await hashBoothKey(boothKey);
+    const { photos, state, deps } = memoryDeps();
+    photos.set(
+      legacyEventConfigKey("launch"),
+      JSON.stringify({ frames: ["square"], boothKeyHash })
+    );
+
+    const response = await handleUpload(request("launch", {
+      headers: { "x-booth-key": boothKey, "x-capture-id": CAPTURE_ID },
+    }), deps);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "incomplete_capture_identity" });
+    expect((await state.list()).objects).toHaveLength(0);
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(0);
+    expect((await photos.list()).objects.map((object) => object.key)).toEqual([
+      legacyEventConfigKey("launch"),
+    ]);
+  });
+
   test("rejects canonical aliases and unauthorized uploads without writes", async () => {
     const alias = memoryDeps();
     const aliasResponse = await handleUpload(request("Launch", { headers: stableHeaders() }), alias.deps);
@@ -196,7 +219,10 @@ describe("upload route", () => {
 
     expect(first.status).toBe(503);
     expect(first.headers.get("Retry-After")).toBe("1");
-    expect(await first.json()).toEqual({ error: "photo index unavailable" });
+    expect(await first.json()).toEqual({
+      error: "photo index unavailable",
+      retryable: true,
+    });
     expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(1);
 
     state.allowWrites();

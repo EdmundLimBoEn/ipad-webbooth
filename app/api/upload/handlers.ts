@@ -39,17 +39,8 @@ export async function handleUpload(req: NextRequest, deps: UploadHandlerDeps): P
   if (event instanceof NextResponse) return event;
 
   const provided = req.headers.get("x-booth-key") ?? "";
-  // The overwhelmingly common Admin-Key path requires no config read (and
-  // therefore cannot trigger a compatibility migration before body/header
-  // validation). Only an otherwise unauthorized request looks up an Event's
-  // private Booth Key hash.
   let auth = await boothOrAdminOk(provided, deps.adminKey);
-  if (auth === "unauthorized") {
-    const config = await deps.store.readConfig(event);
-    auth = await boothOrAdminOk(provided, deps.adminKey, config?.boothKeyHash);
-  }
   if (auth === "disabled") return jsonError("upload disabled: no key configured", 503);
-  if (auth !== "ok") return jsonError("unauthorized", 401);
 
   // Early reject via declared size before buffering the whole body.
   if (declaredSizeTooLarge(req)) return jsonError("too large", 413);
@@ -63,6 +54,15 @@ export async function handleUpload(req: NextRequest, deps: UploadHandlerDeps): P
     if (error instanceof InvalidUploadHeadersError) return jsonError(error.code, 400);
     throw error;
   }
+
+  // Resolve the private Event-scoped Booth Key only after strict upload-header
+  // validation. readConfig() may lazily migrate a legacy public config, so
+  // calling it earlier would let an invalid request write to STATE.
+  if (auth === "unauthorized") {
+    const config = await deps.store.readConfig(event);
+    auth = await boothOrAdminOk(provided, deps.adminKey, config?.boothKeyHash);
+  }
+  if (auth !== "ok") return jsonError("unauthorized", 401);
 
   const body = await req.arrayBuffer();
   if (body.byteLength === 0) return jsonError("empty body", 400);
@@ -79,7 +79,10 @@ export async function handleUpload(req: NextRequest, deps: UploadHandlerDeps): P
   } catch (error) {
     if (error instanceof PhotoIndexWriteError) {
       // An acknowledged stable client can safely retry this exact identity.
-      return jsonError("photo index unavailable", 503, { "Retry-After": "1" });
+      return NextResponse.json(
+        { error: "photo index unavailable", retryable: true },
+        { status: 503, headers: { "Retry-After": "1" } }
+      );
     }
     throw error;
   }
