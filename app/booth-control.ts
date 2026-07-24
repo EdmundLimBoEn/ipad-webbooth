@@ -19,6 +19,21 @@ const ERROR_CLASSES = [
   "server",
   "unknown",
 ] as const;
+const HEARTBEAT_INPUT_KEYS = [
+  "version",
+  "deviceId",
+  "sessionStartedAt",
+  "pendingCount",
+  "durableStorage",
+  "online",
+  "installed",
+  "camera",
+  "upload",
+  "lastSuccessfulUploadAt",
+  "errorClass",
+  "buildId",
+] as const;
+const HEARTBEAT_RECORD_KEYS = [...HEARTBEAT_INPUT_KEYS, "lastSeenAt"] as const;
 
 export type BoothCameraState = typeof CAMERA_STATES[number];
 export type BoothUploadState = typeof UPLOAD_STATES[number];
@@ -52,40 +67,13 @@ export type BoothOperationalState = {
 export type BoothOperationalStateInput = Pick<BoothOperationalState, "paused" | "messages">;
 
 export function parseBoothHeartbeat(value: unknown): BoothHeartbeatInput | null {
-  const record = parseRecord(value, [
-    "version",
-    "deviceId",
-    "sessionStartedAt",
-    "pendingCount",
-    "durableStorage",
-    "online",
-    "installed",
-    "camera",
-    "upload",
-    "lastSuccessfulUploadAt",
-    "errorClass",
-    "buildId",
-  ]);
+  const record = parseRecord(value, HEARTBEAT_INPUT_KEYS);
   if (!record) return null;
   return parseHeartbeatFields(record);
 }
 
 export function parseBoothHeartbeatRecord(value: unknown): BoothHeartbeatRecord | null {
-  const record = parseRecord(value, [
-    "version",
-    "deviceId",
-    "sessionStartedAt",
-    "pendingCount",
-    "durableStorage",
-    "online",
-    "installed",
-    "camera",
-    "upload",
-    "lastSuccessfulUploadAt",
-    "errorClass",
-    "buildId",
-    "lastSeenAt",
-  ]);
+  const record = parseRecord(value, HEARTBEAT_RECORD_KEYS);
   if (!record || !isIsoTimestamp(record.lastSeenAt)) return null;
   const heartbeat = parseHeartbeatFields(record);
   return heartbeat ? { ...heartbeat, lastSeenAt: record.lastSeenAt } : null;
@@ -164,7 +152,9 @@ function parseMessages(value: unknown): Record<string, string> | null | undefine
     entries.length > 20
     || entries.some(([locale, message]) => !TOKEN.test(locale) || typeof message !== "string" || message.length > 280)
   ) return null;
-  return Object.fromEntries(entries as [string, string][]);
+  const messages = Object.create(null) as Record<string, string>;
+  for (const [locale, message] of entries) messages[locale] = message as string;
+  return messages;
 }
 
 function parseRecord(value: unknown, allowedKeys: readonly string[]): Record<string, unknown> | null {

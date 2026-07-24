@@ -63,4 +63,32 @@ describe("Booth control schemas", () => {
     })).toBeNull();
     expect(parseBoothOperationalState({ ...state, unknown: "credential=x" })).toBeNull();
   });
+
+  test("returns locale messages with own-property lookup semantics", () => {
+    const parsed = parseBoothOperationalState({
+      version: 1,
+      paused: true,
+      messages: {
+        en: "Paused",
+        constructor: "Constructor locale",
+        prototype: "Prototype locale",
+        toString: "String locale",
+      },
+      updatedAt: "2026-07-24T00:00:00.000Z",
+    });
+
+    expect(Object.getPrototypeOf(parsed!.messages!)).toBeNull();
+    expect(Object.hasOwn(parsed!.messages!, "en")).toBe(true);
+    expect(Object.hasOwn(parsed!.messages!, "constructor")).toBe(true);
+    expect(Object.hasOwn(parsed!.messages!, "prototype")).toBe(true);
+    expect(Object.hasOwn(parsed!.messages!, "toString")).toBe(true);
+
+    const onlyEnglish = parseBoothOperationalState({
+      version: 1,
+      paused: true,
+      messages: { en: "Paused" },
+      updatedAt: "2026-07-24T00:00:00.000Z",
+    });
+    expect(onlyEnglish!.messages!["toString"]).toBeUndefined();
+  });
 });

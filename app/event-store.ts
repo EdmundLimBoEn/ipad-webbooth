@@ -25,8 +25,9 @@ import {
   type BoothOperationalState,
   type BoothOperationalStateInput,
 } from "./booth-control";
+import { canonicalEvent, InvalidEventSlugError, slugifyEvent } from "./event-identity";
 import type { StableCaptureIdentity, StableUpload } from "./upload-contract";
-export { canonicalEvent, InvalidEventSlugError, slugifyEvent } from "./event-identity";
+export { canonicalEvent, InvalidEventSlugError, slugifyEvent };
 export { EVENT_CONFIG_VERSION };
 export type { EventConfig } from "./event-config";
 export const HEALTH_CANARY_KEY = "_health/canary";
@@ -606,10 +607,11 @@ export class EventStore {
   }
 
   async writeBoothHeartbeat(event: string, input: BoothHeartbeatInput): Promise<BoothHeartbeatRecord> {
+    const canonical = canonicalEvent(event);
     const heartbeat = parseBoothHeartbeat(input);
     if (!heartbeat) throw new TypeError("invalid booth heartbeat");
     const record: BoothHeartbeatRecord = { ...heartbeat, lastSeenAt: this.now().toISOString() };
-    await this.state.put(boothHeartbeatKey(event, record.deviceId), JSON.stringify(record), jsonWriteOptions());
+    await this.state.put(boothHeartbeatKey(canonical, record.deviceId), JSON.stringify(record), jsonWriteOptions());
     return record;
   }
 
@@ -617,22 +619,23 @@ export class EventStore {
     event: string,
     options: BoothHeartbeatListOptions = {}
   ): Promise<BoothHeartbeatPage> {
+    const canonical = canonicalEvent(event);
     const limit = options.limit ?? 50;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw new TypeError("booth heartbeat limit must be an integer from 1 to 100");
     }
     const cursor = options.cursor ?? undefined;
-    if (cursor !== undefined && (typeof cursor !== "string" || cursor.length === 0 || cursor.length > 2048)) {
+    if (cursor !== undefined && (typeof cursor !== "string" || cursor.trim().length === 0)) {
       throw new TypeError("booth heartbeat cursor is invalid");
     }
     const page = await this.state.list({
-      prefix: boothHeartbeatPrefix(event),
+      prefix: boothHeartbeatPrefix(canonical),
       ...(cursor !== undefined ? { cursor } : {}),
       limit,
     });
     const now = this.now().getTime();
     const booths = await Promise.all(page.objects.map(async (object): Promise<AdminBoothRecord> => {
-      const record = await this.readBoothHeartbeat(event, object.key);
+      const record = await this.readBoothHeartbeat(canonical, object.key);
       return {
         ...record,
         stale: now - Date.parse(record.lastSeenAt) >= BOOTH_STALE_AFTER_MS,
@@ -642,7 +645,8 @@ export class EventStore {
   }
 
   async readBoothOperationalState(event: string): Promise<BoothOperationalState> {
-    const object = await this.state.get(boothOperationalStateKey(event));
+    const canonical = canonicalEvent(event);
+    const object = await this.state.get(boothOperationalStateKey(canonical));
     if (!object) {
       return { version: 1, paused: false, updatedAt: this.now().toISOString() };
     }
@@ -650,10 +654,10 @@ export class EventStore {
     try {
       value = await object.json<unknown>();
     } catch {
-      throw new InvalidStoredBoothOperationalStateError(event);
+      throw new InvalidStoredBoothOperationalStateError(canonical);
     }
     const state = parseBoothOperationalState(value);
-    if (!state) throw new InvalidStoredBoothOperationalStateError(event);
+    if (!state) throw new InvalidStoredBoothOperationalStateError(canonical);
     return state;
   }
 
@@ -661,6 +665,7 @@ export class EventStore {
     event: string,
     input: BoothOperationalStateInput
   ): Promise<BoothOperationalState> {
+    const canonical = canonicalEvent(event);
     const operational = parseBoothOperationalStateInput(input);
     if (!operational) throw new TypeError("invalid booth operational state");
     const state: BoothOperationalState = {
@@ -668,7 +673,7 @@ export class EventStore {
       ...operational,
       updatedAt: this.now().toISOString(),
     };
-    await this.state.put(boothOperationalStateKey(event), JSON.stringify(state), jsonWriteOptions());
+    await this.state.put(boothOperationalStateKey(canonical), JSON.stringify(state), jsonWriteOptions());
     return state;
   }
 

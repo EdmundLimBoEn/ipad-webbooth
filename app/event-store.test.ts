@@ -6,6 +6,7 @@ import {
   ConfigRevisionNotFoundError,
   EventStore,
   InMemoryObjectStore,
+  InvalidEventSlugError,
   InvalidPhotoCursorError,
   InvalidStoredConfigRevisionError,
   eventConfigKey,
@@ -96,6 +97,55 @@ class InstrumentedStateStore extends InMemoryObjectStore {
 
   resetReads(): void {
     this.reads = 0;
+  }
+}
+
+class BoothStateAccessStore extends InMemoryObjectStore {
+  readonly reads: string[] = [];
+  readonly writes: string[] = [];
+  readonly lists: ListOptions[] = [];
+
+  override async get(key: string): Promise<StoredObjectBody | null> {
+    this.reads.push(key);
+    return super.get(key);
+  }
+
+  override async put(
+    key: string,
+    value: ArrayBuffer | ArrayBufferView | string
+  ): Promise<void> {
+    this.writes.push(key);
+    return super.put(key, value);
+  }
+
+  override async list(options: ListOptions = {}): Promise<ListResult> {
+    this.lists.push({ ...options });
+    return super.list(options);
+  }
+}
+
+class LongBoothCursorStore extends InMemoryObjectStore {
+  readonly opaqueCursor = `r2:${"x".repeat(3_000)}`;
+
+  constructor(
+    private readonly boothPrefix: string,
+    private readonly firstKey: string
+  ) {
+    super();
+  }
+
+  override async list(options: ListOptions = {}): Promise<ListResult> {
+    if (options.prefix !== this.boothPrefix) return super.list(options);
+    if (options.cursor === undefined) {
+      const page = await super.list({ ...options, limit: 1 });
+      return { objects: page.objects, truncated: true, cursor: this.opaqueCursor };
+    }
+    if (options.cursor !== this.opaqueCursor) throw new Error("opaque cursor changed");
+    return super.list({
+      prefix: options.prefix,
+      startAfter: this.firstKey,
+      limit: options.limit,
+    });
   }
 }
 
@@ -1781,6 +1831,26 @@ describe("EventStore", () => {
     expect((await photos.list()).objects).toHaveLength(0);
   });
 
+  test("passes a long opaque storage cursor through unchanged", async () => {
+    const firstDevice = "018f0000-0000-4000-8000-000000000001";
+    const secondDevice = "018f0000-0000-4000-8000-000000000002";
+    const prefix = "events/launch/booths/";
+    const state = new LongBoothCursorStore(prefix, boothHeartbeatKey("launch", firstDevice));
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    await store.writeBoothHeartbeat("launch", boothHeartbeat(firstDevice));
+    await store.writeBoothHeartbeat("launch", boothHeartbeat(secondDevice));
+
+    const firstPage = await store.listBoothHeartbeats("launch", { limit: 1 });
+    expect(firstPage.cursor).toBe(state.opaqueCursor);
+    expect(firstPage.cursor!.length).toBeGreaterThan(2_048);
+
+    const secondPage = await store.listBoothHeartbeats("launch", {
+      limit: 1,
+      cursor: firstPage.cursor,
+    });
+    expect(secondPage.booths.map((record) => record.deviceId)).toEqual([secondDevice]);
+  });
+
   test("isolates heartbeats by Event and fails closed on malformed or future private records", async () => {
     const deviceId = "018f0000-0000-4000-8000-000000000001";
     const photos = new InMemoryObjectStore();
@@ -1835,5 +1905,60 @@ describe("EventStore", () => {
 
     state.set(boothOperationalStateKey("other"), JSON.stringify({ version: 2, paused: false, updatedAt: now.toISOString() }));
     await expect(store.readBoothOperationalState("other")).rejects.toThrow("booth operational state");
+  });
+
+  test("rejects non-canonical Events before any Booth STATE access", async () => {
+    const input = boothHeartbeat("018f0000-0000-4000-8000-000000000001");
+
+    for (const event of ["Launch 2026", "launch--2026", "launch/nested"]) {
+      const state = new BoothStateAccessStore();
+      const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+      const results = await Promise.allSettled([
+        store.writeBoothHeartbeat(event, input),
+        store.listBoothHeartbeats(event, {}),
+        store.readBoothOperationalState(event),
+        store.writeBoothOperationalState(event, { paused: true }),
+      ]);
+
+      expect(results.map((result) => result.status)).toEqual([
+        "rejected",
+        "rejected",
+        "rejected",
+        "rejected",
+      ]);
+      for (const result of results) {
+        if (result.status === "rejected") {
+          expect(result.reason).toBeInstanceOf(InvalidEventSlugError);
+        }
+      }
+      expect(state.reads).toEqual([]);
+      expect(state.writes).toEqual([]);
+      expect(state.lists).toEqual([]);
+    }
+  });
+
+  test("round-trips sensitive locale names with own-property semantics", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const messages = {
+      constructor: "Constructor locale",
+      prototype: "Prototype locale",
+      toString: "String locale",
+    };
+
+    const written = await store.writeBoothOperationalState("launch", { paused: true, messages });
+    expect(Object.getPrototypeOf(written.messages!)).toBeNull();
+    expect(Object.keys(written.messages!)).toEqual(Object.keys(messages));
+    const stored = await (await state.get(boothOperationalStateKey("launch")))!.json<{
+      messages: Record<string, string>;
+    }>();
+    expect(stored.messages).toEqual(messages);
+
+    const roundTripped = await store.readBoothOperationalState("launch");
+    expect(Object.getPrototypeOf(roundTripped.messages!)).toBeNull();
+    for (const key of Object.keys(messages)) {
+      expect(Object.hasOwn(roundTripped.messages!, key)).toBe(true);
+      expect(roundTripped.messages![key]).toBe(messages[key as keyof typeof messages]);
+    }
   });
 });
