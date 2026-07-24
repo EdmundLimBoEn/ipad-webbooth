@@ -13,6 +13,7 @@ import {
   type EventConfig,
   type EventExperience,
 } from "./event-config";
+import type { StableCaptureIdentity, StableUpload } from "./upload-contract";
 export { canonicalEvent, InvalidEventSlugError, slugifyEvent } from "./event-identity";
 export { EVENT_CONFIG_VERSION };
 export type { EventConfig } from "./event-config";
@@ -222,6 +223,12 @@ export const eventConfigMutationKey = (event: string, mutationId: string) =>
   `events/${event}/config-mutations/${mutationId}.json`;
 export const legacyEventConfigKey = (event: string) => `_config/${event}.json`;
 export const eventPhotoPrefix = (event: string) => `${event}/`;
+export const stablePhotoKey = (event: string, id: StableCaptureIdentity) =>
+  `${event}/${String(id.capturedAt).padStart(13, "0")}-${id.captureId}.jpg`;
+export const photoReceiptKey = (event: string, key: string) =>
+  `events/${event}/photo-metadata/${key.slice(eventPhotoPrefix(event).length)}.json`;
+export const photoIndexKey = (event: string, key: string, sortTime: number) =>
+  `events/${event}/photo-index/v1/${String(9_999_999_999_999 - sortTime).padStart(13, "0")}-${base64url(key)}.json`;
 
 function photoTimestamp(key: string): number {
   const filename = key.slice(key.lastIndexOf("/") + 1);
@@ -234,6 +241,14 @@ function isPhotoKey(event: string, key: string): boolean {
 
 export type Photo = { key: string; url: string; uploadedAt: Date };
 export type PhotoFeed = { photos: Photo[]; cursor: string | null; unchanged: boolean; truncated: boolean };
+export type PutPhotoOptions = { upload?: StableUpload };
+export type PutPhotoResult = {
+  key: string;
+  url: string;
+  duplicate: boolean;
+  receiptStored: boolean;
+  indexStored: boolean;
+};
 export type ConfigMutationResult = {
   config: EventConfig;
   revision: ConfigRevision;
@@ -272,6 +287,16 @@ export class InvalidStoredConfigRevisionError extends Error {
 export class InvalidStoredEventConfigError extends Error {
   constructor(readonly event: string) {
     super(`stored config for ${event} is corrupt or uses an unsupported version`);
+  }
+}
+
+export class PhotoIndexWriteError extends Error {
+  constructor(
+    readonly photo: Pick<PutPhotoResult, "key" | "url" | "duplicate">,
+    options: { cause: unknown }
+  ) {
+    super("photo index write failed", options);
+    this.name = "PhotoIndexWriteError";
   }
 }
 
@@ -471,10 +496,41 @@ export class EventStore {
     return `${event}/${String(now).padStart(13, "0")}-${suffix}.jpg`;
   }
 
-  async putPhoto(event: string, body: ArrayBuffer): Promise<{ key: string; url: string }> {
-    const key = this.photoKey(event);
-    await this.photos.put(key, body, { httpMetadata: { contentType: "image/jpeg" } });
-    return { key, url: this.publicUrl(key) };
+  async putPhoto(event: string, body: ArrayBuffer, options: PutPhotoOptions = {}): Promise<PutPhotoResult> {
+    // Capture server time once: the immutable records for this attempt then
+    // agree even when a retry completes a previously interrupted upload.
+    const uploadedAt = this.now();
+    const upload = options.upload;
+    const key = upload ? stablePhotoKey(event, upload) : this.photoKey(event, uploadedAt.getTime());
+    const url = this.publicUrl(key);
+    let duplicate = false;
+
+    if (upload) {
+      const created = await this.photos.compareAndSwap(key, null, body, jpegWriteOptions());
+      duplicate = !created;
+    } else {
+      // Legacy clients cannot retry the same public key. Keep their original
+      // acknowledgment behavior even when private derived writes are down.
+      await this.photos.put(key, body, jpegWriteOptions());
+    }
+
+    const photo = { key, url, duplicate };
+    const metadata = photoPrivateMetadata(key, uploadedAt, upload);
+    const indexKey = photoIndexKey(event, key, metadata.capturedAt);
+
+    if (upload) {
+      try {
+        await this.state.compareAndSwap(indexKey, null, JSON.stringify(metadata), jsonWriteOptions());
+      } catch (cause) {
+        throw new PhotoIndexWriteError(photo, { cause });
+      }
+      const receiptStored = await this.tryWritePhotoReceipt(event, key, metadata);
+      return { ...photo, indexStored: true, receiptStored };
+    }
+
+    const indexStored = await this.tryWritePhotoIndex(indexKey, metadata);
+    const receiptStored = await this.tryWritePhotoReceipt(event, key, metadata);
+    return { ...photo, indexStored, receiptStored };
   }
 
   async listPhotos(event: string, after: string | null = null): Promise<PhotoFeed> {
@@ -538,6 +594,29 @@ export class EventStore {
     return this.state.put(HEALTH_STATE_KEY, JSON.stringify(value), {
       httpMetadata: { contentType: "application/json", cacheControl: "no-store" },
     });
+  }
+
+  private async tryWritePhotoIndex(key: string, metadata: PrivatePhotoMetadata): Promise<boolean> {
+    try {
+      await this.state.compareAndSwap(key, null, JSON.stringify(metadata), jsonWriteOptions());
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async tryWritePhotoReceipt(event: string, photoKey: string, metadata: PrivatePhotoMetadata): Promise<boolean> {
+    try {
+      await this.state.compareAndSwap(
+        photoReceiptKey(event, photoKey),
+        null,
+        JSON.stringify(metadata),
+        jsonWriteOptions()
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async readJson(store: ObjectStore, key: string): Promise<unknown | null> {
@@ -840,6 +919,39 @@ function jsonWriteOptions(): R2PutOptions {
   return {
     httpMetadata: { contentType: "application/json", cacheControl: "no-store" },
   };
+}
+
+function jpegWriteOptions(): R2PutOptions {
+  return { httpMetadata: { contentType: "image/jpeg" } };
+}
+
+type PrivatePhotoMetadata = {
+  version: 1;
+  key: string;
+  uploadedAt: string;
+  capturedAt: number;
+  source?: StableUpload["source"];
+  frameKey?: string;
+  configRevisionId?: string;
+};
+
+function photoPrivateMetadata(key: string, uploadedAt: Date, upload?: StableUpload): PrivatePhotoMetadata {
+  return {
+    version: 1,
+    key,
+    uploadedAt: uploadedAt.toISOString(),
+    capturedAt: upload?.capturedAt ?? uploadedAt.getTime(),
+    ...(upload?.source ? { source: upload.source } : {}),
+    ...(upload?.frameKey ? { frameKey: upload.frameKey } : {}),
+    ...(upload?.configRevisionId ? { configRevisionId: upload.configRevisionId } : {}),
+  };
+}
+
+function base64url(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
 function randomSuffix(): string {

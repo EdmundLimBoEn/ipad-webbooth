@@ -11,7 +11,33 @@ import {
   eventConfigMutationKey,
   eventConfigRevisionKey,
   legacyEventConfigKey,
+  PhotoIndexWriteError,
+  photoIndexKey,
+  photoReceiptKey,
 } from "./event-store";
+
+class FailPrivatePhotoWriteStore extends InMemoryObjectStore {
+  private writesFail = true;
+
+  constructor(private readonly failingPrefix: string) {
+    super();
+  }
+
+  allowWrites(): void {
+    this.writesFail = false;
+  }
+
+  override async compareAndSwap(
+    key: string,
+    expectedEtag: string | null,
+    value: ArrayBuffer | ArrayBufferView | string
+  ): Promise<boolean> {
+    if (this.writesFail && key.startsWith(this.failingPrefix)) {
+      throw new Error(`simulated private write failure for ${key}`);
+    }
+    return super.compareAndSwap(key, expectedEtag, value);
+  }
+}
 
 class FailNextConfigHeadCasStore extends InMemoryObjectStore {
   private failNextConfigHeadCas = true;
@@ -1007,6 +1033,125 @@ describe("EventStore", () => {
       const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
       await expect(store.restoreConfigRevision("launch", input)).rejects.toBeInstanceOf(TypeError);
       expect((await state.list()).objects).toHaveLength(0);
+    }
+  });
+
+  test("stable ingest creates one immutable photo across retries", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(photos, state, "https://photos.example", () => new Date("2026-07-24T00:00:00Z"));
+    const upload = {
+      captureId: "018f0000-0000-4000-8000-000000000001",
+      capturedAt: 1753315200000,
+      source: "framed" as const,
+      frameKey: "square",
+    };
+
+    const first = await store.putPhoto("launch", new TextEncoder().encode("first").buffer, { upload });
+    const retry = await store.putPhoto("launch", new TextEncoder().encode("replacement").buffer, { upload });
+
+    expect(first).toMatchObject({
+      key: "launch/1753315200000-018f0000-0000-4000-8000-000000000001.jpg",
+      duplicate: false,
+      indexStored: true,
+      receiptStored: true,
+    });
+    expect(retry).toMatchObject({ key: first.key, url: first.url, duplicate: true, indexStored: true, receiptStored: true });
+    expect(await (await photos.get(first.key))!.text()).toBe("first");
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(1);
+    expect(state.has(photoIndexKey("launch", first.key, upload.capturedAt))).toBe(true);
+    expect(state.has(photoReceiptKey("launch", first.key))).toBe(true);
+  });
+
+  test("concurrent stable attempts produce one public image", async () => {
+    const photos = new InMemoryObjectStore();
+    const store = new EventStore(photos, new InMemoryObjectStore(), "https://photos.example");
+    const upload = {
+      captureId: "018f0000-0000-4000-8000-000000000002",
+      capturedAt: 1753315200001,
+    };
+
+    const results = await Promise.all([
+      store.putPhoto("launch", new Uint8Array([1]).buffer, { upload }),
+      store.putPhoto("launch", new Uint8Array([2]).buffer, { upload }),
+    ]);
+
+    expect(results.filter((result) => result.duplicate)).toHaveLength(1);
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(1);
+  });
+
+  test("a stable retry repairs a missing index without another public photo", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new FailPrivatePhotoWriteStore("events/launch/photo-index/");
+    const store = new EventStore(photos, state, "https://photos.example");
+    const upload = { captureId: "018f0000-0000-4000-8000-000000000003", capturedAt: 1753315200002 };
+
+    const first = store.putPhoto("launch", new Uint8Array([1]).buffer, { upload });
+    await expect(first).rejects.toBeInstanceOf(PhotoIndexWriteError);
+    const key = "launch/1753315200002-018f0000-0000-4000-8000-000000000003.jpg";
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(1);
+    expect(state.has(photoIndexKey("launch", key, upload.capturedAt))).toBe(false);
+
+    state.allowWrites();
+    await expect(store.putPhoto("launch", new Uint8Array([2]).buffer, { upload })).resolves.toMatchObject({
+      key,
+      duplicate: true,
+      indexStored: true,
+    });
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(1);
+  });
+
+  test("receipt failure is observable but does not reject an acknowledged stable photo", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new FailPrivatePhotoWriteStore("events/launch/photo-metadata/");
+    const store = new EventStore(photos, state, "https://photos.example");
+    const upload = { captureId: "018f0000-0000-4000-8000-000000000004", capturedAt: 1753315200003 };
+
+    await expect(store.putPhoto("launch", new Uint8Array([1]).buffer, { upload })).resolves.toMatchObject({
+      duplicate: false,
+      indexStored: true,
+      receiptStored: false,
+    });
+  });
+
+  test("legacy uploads keep random keys and acknowledge private derived-write failures", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new FailPrivatePhotoWriteStore("events/launch/photo-");
+    const store = new EventStore(photos, state, "https://photos.example", () => new Date("2026-07-24T00:00:00Z"));
+
+    const first = await store.putPhoto("launch", new Uint8Array([1]).buffer);
+    const retry = await store.putPhoto("launch", new Uint8Array([2]).buffer);
+
+    expect(first).toMatchObject({ duplicate: false, indexStored: false, receiptStored: false });
+    expect(retry).toMatchObject({ duplicate: false, indexStored: false, receiptStored: false });
+    expect(first.key).not.toBe(retry.key);
+    expect((await photos.list({ prefix: "launch/" })).objects).toHaveLength(2);
+  });
+
+  test("stable identities are event-isolated and private records contain no credentials", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(photos, state, "https://photos.example", () => new Date("2026-07-24T00:00:00Z"));
+    const upload = {
+      captureId: "018f0000-0000-4000-8000-000000000005",
+      capturedAt: 1753315200004,
+      source: "camera-fallback" as const,
+      frameKey: "square",
+      configRevisionId: "018f0000-0000-7000-8000-000000000006",
+    };
+
+    const launch = await store.putPhoto("launch", new Uint8Array([1]).buffer, { upload });
+    const other = await store.putPhoto("other", new Uint8Array([2]).buffer, { upload });
+    expect(launch.key).not.toBe(other.key);
+    expect((await photos.list()).objects).toHaveLength(2);
+
+    const index = await (await state.get(photoIndexKey("launch", launch.key, upload.capturedAt)))!.json<Record<string, unknown>>();
+    const receipt = await (await state.get(photoReceiptKey("launch", launch.key)))!.json<Record<string, unknown>>();
+    for (const record of [index, receipt]) {
+      expect(record).not.toHaveProperty("boothKeyHash");
+      expect(record).not.toHaveProperty("boothKey");
+      expect(record).not.toHaveProperty("credential");
+      expect(JSON.stringify(record)).not.toContain("hash");
     }
   });
 
