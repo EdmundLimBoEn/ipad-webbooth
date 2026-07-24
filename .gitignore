@@ -11,4 +11,5 @@ next-env.d.ts
 .wrangler/
 scripts/.migrated.json
 .claude/
+.worktrees/
 EDMUNDS-STUFF.md
