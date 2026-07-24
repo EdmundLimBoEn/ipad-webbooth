@@ -80,6 +80,7 @@ describe("private moderation photo records", () => {
       { ...valid, version: 2 },
       { ...valid, key: "other/1753315200000-a.jpg" },
       { ...valid, uploadedAt: "not-an-instant" },
+      { ...valid, uploadedAt: "2025-02-30T00:00:00.000Z" },
       { ...valid, capturedAt: 1.5 },
       { ...valid, frameKey: 42 },
       { ...valid, configRevisionId: 42 },

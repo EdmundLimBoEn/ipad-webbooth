@@ -135,8 +135,9 @@ function isEventPhotoKey(event: string, key: string): boolean {
 }
 
 function isStoredInstant(value: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)
-    && !Number.isNaN(Date.parse(value));
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  const parsed = Date.parse(value);
+  return !Number.isNaN(parsed) && new Date(parsed).toISOString() === value;
 }
 
 function isNullableTimestamp(value: unknown): value is number | null {
