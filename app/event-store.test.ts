@@ -107,6 +107,29 @@ class CrashBeforeCompleteMarkerStore extends InMemoryObjectStore {
   }
 }
 
+class RecordingDeleteStore extends InMemoryObjectStore {
+  readonly gets: string[] = [];
+  readonly deletes: string[] = [];
+  readonly lists: ListOptions[] = [];
+  readonly failDeletes = new Set<string>();
+
+  override async get(key: string): Promise<StoredObjectBody | null> {
+    this.gets.push(key);
+    return super.get(key);
+  }
+
+  override async delete(key: string): Promise<void> {
+    this.deletes.push(key);
+    if (this.failDeletes.has(key)) throw new Error(`simulated delete failure for ${key}`);
+    return super.delete(key);
+  }
+
+  override async list(options: ListOptions = {}): Promise<ListResult> {
+    this.lists.push({ ...options });
+    return super.list(options);
+  }
+}
+
 class GuardedPhotoListStore extends InMemoryObjectStore {
   rejectPhotoLists = false;
 
@@ -1860,9 +1883,12 @@ describe("EventStore", () => {
       "launch/notes.txt": "keep",
     });
     const store = new EventStore(photos, new InMemoryObjectStore(), "https://photos.example");
-    expect(await store.deletePhoto("launch", "other/0000000001000-b.jpg")).toBe(false);
-    expect(await store.deletePhoto("launch", "launch/notes.txt")).toBe(false);
-    expect(await store.deletePhoto("launch", "launch/0000000001000-a.jpg")).toBe(true);
+    expect(await store.deletePhoto("launch", "other/0000000001000-b.jpg")).toEqual({ deleted: false });
+    expect(await store.deletePhoto("launch", "launch/notes.txt")).toEqual({ deleted: false });
+    expect(await store.deletePhoto("launch", "launch/0000000001000-a.jpg")).toEqual({
+      deleted: true,
+      cleanup: { index: "missing", receipt: "missing" },
+    });
     expect(photos.has("launch/0000000001000-a.jpg")).toBe(false);
     expect(photos.has("other/0000000001000-b.jpg")).toBe(true);
   });
@@ -1896,6 +1922,89 @@ describe("EventStore", () => {
 
     await expect(store.getPublicPhoto("launch", "launch/0000000001000-missing.jpg")).resolves.toBeNull();
     expect(photos.reads).toEqual(["launch/0000000001000-missing.jpg"]);
+  });
+
+  test("deletes public bytes first then only the exact receipt-derived private records", async () => {
+    const photoKey = "launch/1753315200000-a.jpg";
+    const adjacentKey = "launch/1753315200001-b.jpg";
+    const photos = new RecordingDeleteStore({
+      [photoKey]: "a",
+      [adjacentKey]: "b",
+      "other/1753315200000-a.jpg": "other",
+    });
+    const state = new RecordingDeleteStore();
+    const receiptKey = photoReceiptKey("launch", photoKey);
+    const indexKey = photoIndexKey("launch", photoKey, 1_753_315_199_999);
+    const adjacentReceipt = photoReceiptKey("launch", adjacentKey);
+    const adjacentIndex = photoIndexKey("launch", adjacentKey, 1_753_315_200_001);
+    state.set(receiptKey, JSON.stringify({
+      version: 1,
+      key: photoKey,
+      uploadedAt: "2025-07-24T00:00:00.000Z",
+      capturedAt: 1_753_315_199_999,
+    }));
+    state.set(indexKey, "index");
+    state.set(adjacentReceipt, "adjacent receipt");
+    state.set(adjacentIndex, "adjacent index");
+
+    const result = await new EventStore(photos, state, "https://photos.example")
+      .deletePhoto("launch", photoKey);
+
+    expect(result).toEqual({
+      deleted: true,
+      cleanup: { index: "deleted", receipt: "deleted" },
+    });
+    expect(photos.deletes).toEqual([photoKey]);
+    expect(state.deletes).toEqual([indexKey, receiptKey]);
+    expect(state.lists).toEqual([]);
+    expect(photos.has(adjacentKey)).toBe(true);
+    expect(photos.has("other/1753315200000-a.jpg")).toBe(true);
+    expect(state.has(adjacentReceipt)).toBe(true);
+    expect(state.has(adjacentIndex)).toBe(true);
+  });
+
+  test("uses exact safe fallback time and reports independent cleanup failures after deletion", async () => {
+    const key = "launch/1753315200000-a.jpg";
+    const photos = new RecordingDeleteStore();
+    photos.set(key, "a", new Date("2025-07-25T00:00:00.000Z"));
+    const state = new RecordingDeleteStore({
+      [photoReceiptKey("launch", key)]: "corrupt",
+      [photoIndexKey("launch", key, 1_753_315_200_000)]: "index",
+    });
+    const receiptKey = photoReceiptKey("launch", key);
+    const indexKey = photoIndexKey("launch", key, 1_753_315_200_000);
+    state.failDeletes.add(indexKey);
+    state.failDeletes.add(receiptKey);
+
+    const result = await new EventStore(photos, state, "https://photos.example")
+      .deletePhoto("launch", key);
+
+    expect(result).toEqual({
+      deleted: true,
+      cleanup: { index: "failed", receipt: "failed" },
+    });
+    expect(photos.has(key)).toBe(false);
+    expect(state.deletes).toEqual([indexKey, receiptKey]);
+  });
+
+  test("does no private cleanup when public deletion fails", async () => {
+    const key = "launch/1753315200000-a.jpg";
+    const photos = new RecordingDeleteStore({ [key]: "a" });
+    photos.failDeletes.add(key);
+    const state = new RecordingDeleteStore({
+      [photoReceiptKey("launch", key)]: JSON.stringify({
+        version: 1,
+        key,
+        uploadedAt: "2025-07-24T00:00:00.000Z",
+        capturedAt: 1_753_315_200_000,
+      }),
+      [photoIndexKey("launch", key, 1_753_315_200_000)]: "index",
+    });
+
+    await expect(new EventStore(photos, state, "https://photos.example")
+      .deletePhoto("launch", key)).rejects.toThrow("delete failure");
+    expect(state.deletes).toEqual([]);
+    expect(state.has(photoReceiptKey("launch", key))).toBe(true);
   });
 
   test("pages the private inverse-time index newest-first across bounded storage pages", async () => {

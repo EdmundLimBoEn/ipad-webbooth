@@ -1,10 +1,37 @@
 import { describe, expect, test } from "bun:test";
 import { NextRequest } from "next/server";
-import { EventStore, InMemoryObjectStore } from "@/app/event-store";
-import { getPhotos } from "./handlers";
+import {
+  EventStore,
+  InMemoryObjectStore,
+  photoIndexKey,
+  photoReceiptKey,
+  type DeletePhotoResult,
+} from "@/app/event-store";
+import { deletePhoto, getPhotos } from "./handlers";
 
 function request(query = "event=launch") {
   return new NextRequest(`https://app.test/api/photos?${query}`);
+}
+
+class DeleteHandlerStore extends EventStore {
+  calls: Array<{ event: string; key: string }> = [];
+  result: DeletePhotoResult = { deleted: false };
+
+  constructor() {
+    super(new InMemoryObjectStore(), new InMemoryObjectStore(), "https://photos.example");
+  }
+
+  override async deletePhoto(event: string, key: string): Promise<DeletePhotoResult> {
+    this.calls.push({ event, key });
+    return this.result;
+  }
+}
+
+function deleteRequest(query: string, key = "admin") {
+  return new NextRequest(`https://app.test/api/photos?${query}`, {
+    method: "DELETE",
+    headers: { "x-booth-key": key },
+  });
 }
 
 describe("photos handler", () => {
@@ -87,5 +114,76 @@ describe("photos handler", () => {
     expect(response.status).toBe(200);
     expect(body.photos).toEqual([]);
     expect(body.cursor).toStartWith("pf1.");
+  });
+
+  test("DELETE fails closed before validation or store access", async () => {
+    for (const [adminKey, status] of [[undefined, 503], ["different", 401]] as const) {
+      const store = new DeleteHandlerStore();
+      const response = await deletePhoto(
+        deleteRequest("event=Launch&key=fragment.jpg"),
+        { store, adminKey }
+      );
+      expect(response.status).toBe(status);
+      expect(store.calls).toEqual([]);
+    }
+  });
+
+  test("DELETE rejects aliases, missing keys, duplicates, and unknown query fields", async () => {
+    for (const query of [
+      "event=Launch&key=launch%2F1753315200000-a.jpg",
+      "event=launch",
+      "event=launch&key=a&key=b",
+      "event=launch&key=a&prefix=true",
+    ]) {
+      const store = new DeleteHandlerStore();
+      const response = await deletePhoto(deleteRequest(query), { store, adminKey: "admin" });
+      expect(response.status).toBe(400);
+      expect(store.calls).toEqual([]);
+    }
+  });
+
+  test("DELETE preserves 404 and reports only additive cleanupPending", async () => {
+    const store = new DeleteHandlerStore();
+    const missing = await deletePhoto(
+      deleteRequest("event=launch&key=launch%2F1753315200000-a.jpg"),
+      { store, adminKey: "admin" }
+    );
+    expect(missing.status).toBe(404);
+
+    store.result = {
+      deleted: true,
+      cleanup: { index: "failed", receipt: "deleted" },
+    };
+    const response = await deletePhoto(
+      deleteRequest("event=launch&key=launch%2F1753315200000-a.jpg"),
+      { store, adminKey: "admin" }
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({
+      deleted: true,
+      key: "launch/1753315200000-a.jpg",
+      cleanupPending: true,
+    });
+  });
+
+  test("DELETE exact cleanup success never exposes private derived key names", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(photos, state, "https://photos.example");
+    const uploaded = await store.putPhoto("launch", new Uint8Array([1]).buffer, {
+      upload: { captureId: "018f0000-0000-4000-8000-000000000204", capturedAt: 1753315200000 },
+    });
+    expect(state.has(photoReceiptKey("launch", uploaded.key))).toBe(true);
+    expect(state.has(photoIndexKey("launch", uploaded.key, 1753315200000))).toBe(true);
+
+    const response = await deletePhoto(
+      deleteRequest(`event=launch&key=${encodeURIComponent(uploaded.key)}`),
+      { store, adminKey: "admin" }
+    );
+    const body = await response.json() as Record<string, unknown>;
+    expect(body).toEqual({ deleted: true, key: uploaded.key, cleanupPending: false });
+    expect(JSON.stringify(body)).not.toContain("photo-index");
+    expect(JSON.stringify(body)).not.toContain("photo-metadata");
   });
 });

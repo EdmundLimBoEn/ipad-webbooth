@@ -297,6 +297,15 @@ export type PutPhotoResult = {
   receiptStored: boolean;
   indexStored: boolean;
 };
+export type DeletePhotoResult =
+  | { deleted: false }
+  | {
+      deleted: true;
+      cleanup: {
+        index: "deleted" | "missing" | "failed";
+        receipt: "deleted" | "missing" | "failed";
+      };
+    };
 export type ConfigMutationResult = {
   config: EventConfig;
   revision: ConfigRevision;
@@ -1510,12 +1519,43 @@ export class EventStore {
     };
   }
 
-  async deletePhoto(event: string, key: string): Promise<boolean> {
-    if (!isPhotoKey(event, key)) return false;
+  async deletePhoto(event: string, key: string): Promise<DeletePhotoResult> {
+    const canonical = canonicalEvent(event);
+    if (!isPhotoKey(canonical, key)) return { deleted: false };
     const existing = await this.photos.get(key);
-    if (!existing) return false;
+    if (!existing) return { deleted: false };
+    const receiptKey = photoReceiptKey(canonical, key);
+    const receipt = await this.state.get(receiptKey);
+    let sortTime = capturedAtFromLegacyPhotoKey(canonical, key) ?? existing.uploaded.getTime();
+    if (receipt) {
+      try {
+        sortTime = parsePhotoReceipt(await receipt.json<unknown>(), key).capturedAt;
+      } catch {
+        // A corrupt derived record cannot block exact public deletion. Its one
+        // exact receipt is still cleaned below using the safe public fallback.
+      }
+    }
     await this.photos.delete(key);
-    return true;
+    const index = await this.deleteDerivedRecord(
+      photoIndexKey(canonical, key, sortTime)
+    );
+    const receiptCleanup = await this.deleteDerivedRecord(receiptKey);
+    return {
+      deleted: true,
+      cleanup: { index, receipt: receiptCleanup },
+    };
+  }
+
+  private async deleteDerivedRecord(
+    key: string
+  ): Promise<"deleted" | "missing" | "failed"> {
+    try {
+      if (!await this.state.get(key)) return "missing";
+      await this.state.delete(key);
+      return "deleted";
+    } catch {
+      return "failed";
+    }
   }
 
   async readHealthState<T>(): Promise<T | null> {
