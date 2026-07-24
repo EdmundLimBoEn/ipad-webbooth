@@ -60,4 +60,11 @@ describe("guest message catalogs", () => {
     expect(localeDirection("en")).toBe("ltr");
     expect(localeDirection("zh-SG")).toBe("ltr");
   });
+
+  test("ships localized moderation copy with placeholder parity", () => {
+    expect(message("en", "moderationLoaded", { count: 12 })).toBe("12 photos loaded");
+    expect(message("zh-SG", "moderationLoaded", { count: 12 })).toContain("12");
+    expect(message("ar", "moderationOpenPhoto", { filename: "photo.jpg" }))
+      .toContain("photo.jpg");
+  });
 });

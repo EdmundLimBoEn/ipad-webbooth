@@ -6,6 +6,7 @@ import {
   resolveDeviceLocale,
   resolveEnabledLocales,
   saveDeviceLocale,
+  formatLocalizedDateTime,
 } from "./locale";
 
 describe("guest locale resolution", () => {
@@ -146,5 +147,12 @@ describe("guest locale resolution", () => {
     expect(root).toEqual({ lang: "zh-SG", dir: "ltr" });
     expect(lease.restore()).toBe(true);
     expect(root).toEqual({ lang: "fr", dir: "ltr" });
+  });
+
+  test("formats operator timestamps with the selected locale and English fallback", () => {
+    const timestamp = "2026-07-24T00:00:00.000Z";
+    expect(formatLocalizedDateTime(timestamp, "zh-SG", "UTC")).toContain("2026");
+    expect(formatLocalizedDateTime(timestamp, "legacy", "UTC"))
+      .toBe(formatLocalizedDateTime(timestamp, "en", "UTC"));
   });
 });

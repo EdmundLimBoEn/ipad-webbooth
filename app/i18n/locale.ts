@@ -86,6 +86,28 @@ export function applyDocumentLocale(
   documentElement.dir = localeDirection(locale);
 }
 
+export function formatLocalizedDateTime(
+  value: string | number,
+  locale: string,
+  timeZone?: string
+): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const supportedLocale = isSupportedLocale(locale) ? locale : "en";
+  try {
+    return new Intl.DateTimeFormat(supportedLocale, {
+      dateStyle: "medium",
+      timeStyle: "short",
+      ...(timeZone ? { timeZone } : {}),
+    }).format(date);
+  } catch {
+    return new Intl.DateTimeFormat("en", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(date);
+  }
+}
+
 type DocumentLocaleRoot = Pick<HTMLElement, "lang" | "dir">;
 
 export class DocumentLocaleLease {

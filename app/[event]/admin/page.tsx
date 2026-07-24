@@ -5,7 +5,13 @@ import { useParams } from "next/navigation";
 import QRCode from "qrcode";
 import { TEMPLATES } from "../../templates";
 import type { ConfigRevision, PublicEventConfig } from "../../event-config";
-import type { SupportedLocale } from "../../i18n/catalog";
+import { message, type SupportedLocale } from "../../i18n/catalog";
+import {
+  deviceLocaleStorageKey,
+  DocumentLocaleLease,
+  resolveDeviceLocale,
+} from "../../i18n/locale";
+import type { ModerationPhoto } from "../../moderation";
 import type { AdminBoothRecord, BoothOperationalState } from "../../booth-control";
 import {
   BoothKeyControls,
@@ -23,6 +29,19 @@ import {
 import { BoothOperationsPanel } from "./booth-operations-panel";
 import { ConfigHistoryPanel } from "./config-history-panel";
 import { ExportPanel } from "./export-panel";
+import { ModerationDialog } from "./moderation-dialog";
+import {
+  ModerationPanel,
+  type ModerationRebuildState,
+} from "./moderation-panel";
+import {
+  mergeModerationPage,
+  moderationFilterInstant,
+  ModerationPageCoordinator,
+  parseModerationPageResponse,
+  removeModeratedPhoto,
+  type ModerationFilters,
+} from "./moderation-state";
 import {
   buildConfigSaveBody,
   clearRestoreRequestAfterReconciliation,
@@ -36,7 +55,6 @@ import {
 } from "./config-mutation";
 import styles from "./admin.module.css";
 
-type Photo = { key: string; url: string; uploadedAt: string };
 type AuthState = "missing" | "ready" | "invalid";
 type Probe = { status: "up" | "degraded" | "down"; detail: string };
 type Health = { upload: Probe; live: Probe };
@@ -49,6 +67,7 @@ export default function Admin() {
   const [frames, setFrames] = useState<Set<string>>(new Set());
   const [locales, setLocales] = useState<Set<SupportedLocale>>(new Set(["en"]));
   const [defaultLocale, setDefaultLocale] = useState<SupportedLocale>("en");
+  const [uiLocale, setUiLocale] = useState<SupportedLocale>("en");
   const [timeZone, setTimeZone] = useState<string | undefined>();
   const [reviewEnabled, setReviewEnabled] = useState(true);
   const [autoAcceptSeconds, setAutoAcceptSeconds] = useState(5);
@@ -62,12 +81,23 @@ export default function Admin() {
   const [hasBoothKey, setHasBoothKey] = useState(false);
   const [boothKey, setBoothKey] = useState("");
   const [boothKeySaved, setBoothKeySaved] = useState(false);
-  const [photos, setPhotos] = useState<Photo[]>([]);
+  const [photos, setPhotos] = useState<ModerationPhoto[]>([]);
   const [photosLoaded, setPhotosLoaded] = useState(false);
   const [photosError, setPhotosError] = useState("");
+  const [photosLoading, setPhotosLoading] = useState(false);
+  const [photosLoadingMore, setPhotosLoadingMore] = useState(false);
+  const [photoCursor, setPhotoCursor] = useState<string | null>(null);
+  const [draftFilters, setDraftFilters] = useState<ModerationFilters>({ from: "", to: "" });
+  const [appliedFilters, setAppliedFilters] = useState<ModerationFilters>({ from: "", to: "" });
+  const [moderationNotice, setModerationNotice] = useState("");
+  const [moderationRebuild, setModerationRebuild] = useState<ModerationRebuildState | null>(null);
+  const [rebuildingModeration, setRebuildingModeration] = useState(false);
+  const [selectedPhoto, setSelectedPhoto] = useState<ModerationPhoto | null>(null);
+  const [dialogTrigger, setDialogTrigger] = useState<HTMLElement | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [cleanupPending, setCleanupPending] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [deleting, setDeleting] = useState("");
-  const [confirmDelete, setConfirmDelete] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [origin, setOrigin] = useState("");
@@ -84,7 +114,10 @@ export default function Admin() {
   const [boothMutationBusy, setBoothMutationBusy] = useState(false);
   const [boothStatusError, setBoothStatusError] = useState(false);
   const [boothMessageDraft, setBoothMessageDraft] = useState("");
-  const photoCursor = useRef<string | null>(null);
+  const moderationCoordinator = useRef(new ModerationPageCoordinator());
+  const moderationHeading = useRef<HTMLHeadingElement>(null);
+  const moderationPhotoRefs = useRef(new Map<string, HTMLButtonElement>());
+  const documentLocale = useRef<DocumentLocaleLease | null>(null);
   const boothCoordinator = useRef(new BoothOperationsCoordinator());
   const boothMessageEditing = useRef(false);
   const configMutationBusy = useRef(false);
@@ -124,12 +157,21 @@ export default function Admin() {
 
   useEffect(() => {
     setOrigin(window.location.origin);
+    documentLocale.current = new DocumentLocaleLease(document.documentElement);
     const stored = sessionStorage.getItem("adminKey") || "";
     if (stored) {
       setAdminKey(stored);
       setAuth("ready");
     }
+    return () => {
+      documentLocale.current?.restore();
+      documentLocale.current = null;
+    };
   }, []);
+
+  useEffect(() => {
+    documentLocale.current?.apply(event, uiLocale);
+  }, [event, uiLocale]);
 
   useEffect(() => {
     if (!origin) return;
@@ -159,6 +201,13 @@ export default function Admin() {
       setFrames(new Set(rebased.frames));
       setLocales(new Set(rebased.locales));
       setDefaultLocale(rebased.defaultLocale);
+      setUiLocale(resolveDeviceLocale({
+        event,
+        configured: rebased.locales,
+        defaultLocale: rebased.defaultLocale,
+        storedLocale: localStorage.getItem(deviceLocaleStorageKey(event)),
+        navigatorLanguages: navigator.languages,
+      }));
       setTimeZone(rebased.timeZone);
       setReviewEnabled(rebased.reviewEnabled);
       setAutoAcceptSeconds(rebased.autoAcceptSeconds);
@@ -175,27 +224,67 @@ export default function Admin() {
     }
   }, [adminKey, defaults, event]);
 
-  const loadPhotos = useCallback(async (reset = false) => {
+  const requestModerationPage = useCallback(async (input: {
+    reset: boolean;
+    filters: ModerationFilters;
+    cursor: string | null;
+    current: readonly ModerationPhoto[];
+  }) => {
+    const ticket = moderationCoordinator.current.begin(event, adminKey, input.filters);
+    input.reset ? setPhotosLoading(true) : setPhotosLoadingMore(true);
     setPhotosError("");
+    setModerationNotice("");
+    if (input.reset) {
+      setPhotos([]);
+      setPhotoCursor(null);
+      setPhotosLoaded(false);
+      setSelectedPhoto(null);
+      setConfirmDelete(false);
+      setCleanupPending(false);
+    }
     try {
+      const from = moderationFilterInstant(input.filters.from);
+      const to = moderationFilterInstant(input.filters.to);
+      if (
+        from === undefined
+        || to === undefined
+        || (from !== null && to !== null && Date.parse(from) > Date.parse(to))
+      ) {
+        throw new Error("Choose a valid time range.");
+      }
       const query = new URLSearchParams({ event });
-      if (!reset && photoCursor.current) query.set("after", photoCursor.current);
-      const response = await fetch(`/api/photos?${query}`, { cache: "no-store" });
-      if (!response.ok) throw new Error(`Photo feed returned ${response.status}`);
-      const data = await response.json();
-      if (!Array.isArray(data.photos)) throw new Error("Photo feed had an unexpected shape");
-      setPhotos((current) => {
-        if (reset || !photoCursor.current) return data.photos;
-        const incoming = data.photos as Photo[];
-        const keys = new Set(incoming.map((photo) => photo.key));
-        return [...incoming, ...current.filter((photo) => !keys.has(photo.key))];
+      if (!input.reset && input.cursor) query.set("cursor", input.cursor);
+      if (from !== null) query.set("from", from);
+      if (to !== null) query.set("to", to);
+      const response = await fetch(`/api/moderation/photos?${query}`, {
+        cache: "no-store",
+        headers: { "x-booth-key": adminKey },
       });
-      if (typeof data.cursor === "string" && data.cursor) photoCursor.current = data.cursor;
+      if (!moderationCoordinator.current.accepts(ticket)) return;
+      if (response.status === 401) {
+        invalidateAuth();
+        return;
+      }
+      if (!response.ok) throw new Error(`Moderation returned ${response.status}`);
+      const page = parseModerationPageResponse(await response.json());
+      if (!moderationCoordinator.current.accepts(ticket)) return;
+      if (!page) throw new Error("Moderation response had an unexpected shape");
+      setPhotos(input.reset
+        ? mergeModerationPage([], page.photos)
+        : mergeModerationPage(input.current, page.photos));
+      setPhotoCursor(page.nextCursor);
       setPhotosLoaded(true);
     } catch (cause) {
-      setPhotosError(cause instanceof Error ? cause.message : "Photos could not be loaded");
+      if (!moderationCoordinator.current.accepts(ticket)) return;
+      setPhotosError(cause instanceof Error
+        ? cause.message
+        : message(uiLocale, "moderationError"));
+    } finally {
+      if (moderationCoordinator.current.accepts(ticket)) {
+        input.reset ? setPhotosLoading(false) : setPhotosLoadingMore(false);
+      }
     }
-  }, [event]);
+  }, [adminKey, event, uiLocale]);
 
   const loadBoothStatus = useCallback(async () => {
     const coordinator = boothCoordinator.current;
@@ -386,11 +475,21 @@ export default function Admin() {
   }, [adminKey, boothMessageDraft, boothOperationalState, event]);
 
   useEffect(() => {
-    photoCursor.current = null;
-    void loadPhotos(true);
-    const poll = window.setInterval(() => void loadPhotos(), 5000);
-    return () => window.clearInterval(poll);
-  }, [loadPhotos]);
+    moderationCoordinator.current.reset();
+    if (auth !== "ready" || !adminKey) {
+      setPhotos([]);
+      setPhotoCursor(null);
+      setPhotosLoaded(false);
+      return;
+    }
+    void requestModerationPage({
+      reset: true,
+      filters: appliedFilters,
+      cursor: null,
+      current: [],
+    });
+    return () => moderationCoordinator.current.reset();
+  }, [adminKey, appliedFilters, auth, event, requestModerationPage]);
 
   useEffect(() => {
     if (auth !== "ready" || !adminKey) return;
@@ -649,30 +748,112 @@ export default function Admin() {
     }
   };
 
-  const deletePhoto = async (photo: Photo) => {
-    setDeleting(photo.key); setError("");
+  const deletePhoto = async (photo: ModerationPhoto) => {
+    setDeleting(true);
+    setPhotosError("");
     try {
       const response = await fetch(`/api/photos?event=${encodeURIComponent(event)}&key=${encodeURIComponent(photo.key)}`, {
         method: "DELETE", headers: { "x-booth-key": adminKey },
       });
-      if (response.status === 401) { invalidateAuth(); throw new Error("That admin key was rejected."); }
+      if (response.status === 401) {
+        invalidateAuth();
+        return;
+      }
       if (!response.ok) throw new Error(`Delete failed (${response.status})`);
-      setPhotos((current) => current.filter((item) => item.key !== photo.key));
-      setConfirmDelete("");
-      setNotice("Photo removed from the event.");
+      const value: unknown = await response.json();
+      if (
+        !value
+        || typeof value !== "object"
+        || (value as { deleted?: unknown }).deleted !== true
+        || (value as { key?: unknown }).key !== photo.key
+        || typeof (value as { cleanupPending?: unknown }).cleanupPending !== "boolean"
+      ) {
+        throw new Error("Delete response had an unexpected shape");
+      }
+      const pending = (value as { cleanupPending: boolean }).cleanupPending;
+      const removal = removeModeratedPhoto(photos, photo.key);
+      setPhotos(removal.photos);
+      setConfirmDelete(false);
+      setModerationNotice(message(uiLocale, "moderationDeleted"));
+      setCleanupPending(pending);
+      setDialogTrigger(null);
+      if (!pending) setSelectedPhoto(null);
+      window.setTimeout(() => {
+        if (removal.nextFocusKey) {
+          moderationPhotoRefs.current.get(removal.nextFocusKey)?.focus();
+        } else {
+          moderationHeading.current?.focus();
+        }
+      }, 0);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Photo could not be deleted");
-    } finally { setDeleting(""); }
+      setPhotosError(cause instanceof Error
+        ? cause.message
+        : message(uiLocale, "moderationDeleteError"));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const rebuildModerationIndex = async () => {
+    setRebuildingModeration(true);
+    setPhotosError("");
+    try {
+      const response = await fetch(
+        `/api/moderation/photos/rebuild?event=${encodeURIComponent(event)}`,
+        {
+          method: "POST",
+          cache: "no-store",
+          headers: { "x-booth-key": adminKey },
+        }
+      );
+      if (response.status === 401) {
+        invalidateAuth();
+        return;
+      }
+      if (!response.ok && response.status !== 202) {
+        throw new Error(`Index rebuild returned ${response.status}`);
+      }
+      const value: unknown = await response.json();
+      if (
+        !value
+        || typeof value !== "object"
+        || typeof (value as { complete?: unknown }).complete !== "boolean"
+        || typeof (value as { scanned?: unknown }).scanned !== "number"
+        || typeof (value as { indexed?: unknown }).indexed !== "number"
+      ) {
+        throw new Error("Index rebuild response had an unexpected shape");
+      }
+      setModerationRebuild({
+        complete: (value as { complete: boolean }).complete,
+        scanned: (value as { scanned: number }).scanned,
+        indexed: (value as { indexed: number }).indexed,
+      });
+      await requestModerationPage({
+        reset: true,
+        filters: appliedFilters,
+        cursor: null,
+        current: [],
+      });
+    } catch (cause) {
+      setPhotosError(cause instanceof Error
+        ? cause.message
+        : message(uiLocale, "moderationError"));
+    } finally {
+      setRebuildingModeration(false);
+    }
   };
 
   const facts: { label: string; value: string; tone: "good" | "bad" | "wait"; detail?: string }[] = [
     { label: "Config", value: configLoaded ? "Loaded" : configError ? "Error" : "Checking", tone: configLoaded ? "good" : configError ? "bad" : "wait" },
     { label: "Frames", value: `${frames.size} enabled`, tone: frames.size > 0 ? "good" : "bad" },
     { label: "Booth key", value: hasBoothKey ? "Installed" : "Missing", tone: hasBoothKey ? "good" : "bad" },
-    { label: "Photos", value: photosLoaded ? `${photos.length} live` : photosError ? "Error" : "Checking", tone: photosLoaded ? "good" : photosError ? "bad" : "wait" },
+    { label: "Photos", value: photosLoaded ? `${photos.length} loaded` : photosError ? "Error" : "Checking", tone: photosLoaded ? "good" : photosError ? "bad" : "wait" },
     { label: "Upload", value: health ? health.upload.status : "Unchecked", tone: health ? health.upload.status === "up" ? "good" : health.upload.status === "degraded" ? "wait" : "bad" : "wait", detail: health?.upload.detail },
     { label: "Live", value: health ? health.live.status : "Unchecked", tone: health ? health.live.status === "up" ? "good" : health.live.status === "degraded" ? "wait" : "bad" : "wait", detail: health?.live.detail },
   ];
+  const selectedIndex = selectedPhoto
+    ? photos.findIndex((photo) => photo.key === selectedPhoto.key)
+    : -1;
 
   if (auth !== "ready") {
     return (
@@ -786,16 +967,62 @@ export default function Admin() {
             onResume={() => void updateBoothOperationalState(false)}
           />
 
-          <section className={styles.section}>
-            <div className={styles.sectionHead}><div><span>04</span><h2>Recent contact sheet</h2></div><p>{photos.length} photograph{photos.length === 1 ? "" : "s"} currently in this event.</p></div>
-            {photosError && photos.length === 0 ? <div className={styles.failure}><strong>Photo feed unavailable</strong><p>{photosError}</p><button onClick={() => void loadPhotos(true)}>Retry photos</button></div> : photosLoaded && photos.length === 0 ?
-              <div className={styles.emptySheet}><strong>No exposures yet.</strong><p>Open the booth link and take a test photo before doors open.</p></div> :
-              <div className={styles.contactSheet}>{photos.slice(0, 16).map((photo) => <article key={photo.key} className={styles.contactPhoto}>
-                <img src={photo.url} alt={`Event photograph uploaded ${new Date(photo.uploadedAt).toLocaleString()}`} />
-                <div><time>{new Date(photo.uploadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><code title={photo.key}>{photo.key.split("/").pop()}</code></div>
-                {confirmDelete === photo.key ? <div className={styles.deleteConfirm}><span>Delete exactly this photo?</span><button onClick={() => void deletePhoto(photo)} disabled={deleting === photo.key}>{deleting === photo.key ? "Removing…" : "Yes, remove"}</button><button onClick={() => setConfirmDelete("")}>Keep</button></div> : <button className={styles.removePhoto} onClick={() => setConfirmDelete(photo.key)}>Remove</button>}
-              </article>)}</div>}
-          </section>
+          <ModerationPanel
+            locale={uiLocale}
+            photos={photos}
+            filters={draftFilters}
+            nextCursor={photoCursor}
+            loading={photosLoading}
+            loadingMore={photosLoadingMore}
+            error={photosError}
+            notice={moderationNotice}
+            rebuild={moderationRebuild}
+            rebuilding={rebuildingModeration}
+            timeZone={timeZone}
+            headingRef={moderationHeading}
+            photoRefs={moderationPhotoRefs}
+            onFiltersChange={setDraftFilters}
+            onApplyFilters={() => {
+              if (
+                appliedFilters.from === draftFilters.from
+                && appliedFilters.to === draftFilters.to
+              ) {
+                void requestModerationPage({
+                  reset: true,
+                  filters: draftFilters,
+                  cursor: null,
+                  current: [],
+                });
+              } else {
+                setAppliedFilters({ ...draftFilters });
+              }
+            }}
+            onClearFilters={() => {
+              const clear = { from: "", to: "" };
+              setDraftFilters(clear);
+              if (appliedFilters.from || appliedFilters.to) setAppliedFilters(clear);
+              else void requestModerationPage({
+                reset: true,
+                filters: clear,
+                cursor: null,
+                current: [],
+              });
+            }}
+            onLoadMore={() => void requestModerationPage({
+              reset: false,
+              filters: appliedFilters,
+              cursor: photoCursor,
+              current: photos,
+            })}
+            onOpen={(photo, trigger) => {
+              setSelectedPhoto(photo);
+              setDialogTrigger(trigger);
+              setConfirmDelete(false);
+              setCleanupPending(false);
+              setPhotosError("");
+            }}
+            onRebuild={() => void rebuildModerationIndex()}
+          />
         </div>
 
         <aside className={styles.sideColumn}>
@@ -836,6 +1063,39 @@ export default function Admin() {
           />
         </aside>
       </div>
+      {selectedPhoto && (
+        <ModerationDialog
+          locale={uiLocale}
+          photo={selectedPhoto}
+          position={selectedIndex >= 0 ? selectedIndex + 1 : 1}
+          loadedCount={Math.max(photos.length, 1)}
+          hasPrevious={selectedIndex > 0}
+          hasNext={selectedIndex >= 0 && selectedIndex < photos.length - 1}
+          confirming={confirmDelete}
+          deleting={deleting}
+          cleanupPending={cleanupPending}
+          error={photosError}
+          timeZone={timeZone}
+          returnFocus={dialogTrigger}
+          onPrevious={() => {
+            if (selectedIndex > 0) setSelectedPhoto(photos[selectedIndex - 1]);
+          }}
+          onNext={() => {
+            if (selectedIndex >= 0 && selectedIndex < photos.length - 1) {
+              setSelectedPhoto(photos[selectedIndex + 1]);
+            }
+          }}
+          onClose={() => {
+            setSelectedPhoto(null);
+            setConfirmDelete(false);
+            setCleanupPending(false);
+            setPhotosError("");
+          }}
+          onRequestDelete={() => setConfirmDelete(true)}
+          onCancelDelete={() => setConfirmDelete(false)}
+          onConfirmDelete={() => void deletePhoto(selectedPhoto)}
+        />
+      )}
     </main>
   );
 }
