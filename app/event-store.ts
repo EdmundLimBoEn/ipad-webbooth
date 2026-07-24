@@ -32,6 +32,12 @@ import {
   parsePhotoReceipt,
   type PhotoReceiptV1,
 } from "./photo-metadata";
+import {
+  decodeModerationCursor,
+  encodeModerationCursor,
+  parseModerationPhotoRecord,
+  type ModerationPhoto,
+} from "./moderation";
 export { canonicalEvent, InvalidEventSlugError, slugifyEvent };
 export { EVENT_CONFIG_VERSION };
 export type { EventConfig } from "./event-config";
@@ -256,6 +262,10 @@ export const photoReceiptKey = (event: string, key: string) =>
   `events/${event}/photo-metadata/${key.slice(eventPhotoPrefix(event).length)}.json`;
 export const photoIndexKey = (event: string, key: string, sortTime: number) =>
   `events/${event}/photo-index/v1/${String(9_999_999_999_999 - sortTime).padStart(13, "0")}-${base64url(key)}.json`;
+export const photoIndexRebuildCheckpointKey = (event: string) =>
+  `events/${event}/photo-index-rebuild/v1/checkpoint.json`;
+export const photoIndexRebuildCompleteKey = (event: string) =>
+  `events/${event}/photo-index-rebuild/v1/complete.json`;
 export const photoFeedHeadKey = (event: string) => `events/${event}/photo-feed/v1/head.json`;
 const photoFeedEntryKey = (event: string, key: string) =>
   `events/${event}/photo-feed/v1/entries/${base64url(key)}.json`;
@@ -304,6 +314,13 @@ export type ExportPhotoSource = {
   size: number;
   uploadedAt: string;
   receipt: Pick<PhotoReceiptV1, "capturedAt" | "source" | "frameKey"> | null;
+};
+export type ModerationPhotoPage = { photos: ModerationPhoto[]; nextCursor: string | null };
+export type PhotoIndexRebuildResult = {
+  complete: boolean;
+  scanned: number;
+  indexed: number;
+  checkpoint: string | null;
 };
 
 export class ConfigConflictError extends Error {
@@ -355,6 +372,18 @@ export class InvalidPhotoCursorError extends Error {
 export class InvalidPublicPhotoKeyError extends TypeError {
   constructor() {
     super("public photo key must be an exact Event-owned image key");
+  }
+}
+
+export class InvalidStoredModerationPhotoError extends Error {
+  constructor(readonly event: string, readonly indexKey: string) {
+    super(`stored moderation photo for ${event} is corrupt or uses an unsupported version`);
+  }
+}
+
+export class InvalidPhotoIndexRebuildStateError extends Error {
+  constructor(readonly event: string) {
+    super(`photo index rebuild state for ${event} is corrupt or uses an unsupported version`);
   }
 }
 
@@ -1181,6 +1210,247 @@ export class EventStore {
     await this.writePhotoFeedMarker(event, entry.key, node.sequence);
   }
 
+  async listModerationPhotos(
+    event: string,
+    options: {
+      cursor?: string;
+      limit?: number;
+      from?: number;
+      to?: number;
+    }
+  ): Promise<ModerationPhotoPage> {
+    const canonical = canonicalEvent(event);
+    const limit = options.limit ?? 48;
+    const from = options.from ?? null;
+    const to = options.to ?? null;
+    if (
+      !Number.isInteger(limit)
+      || limit < 1
+      || limit > 100
+      || !isNullableSafeTimestamp(from)
+      || !isNullableSafeTimestamp(to)
+      || (from !== null && to !== null && from > to)
+    ) {
+      throw new TypeError("invalid moderation page options");
+    }
+    const decoded = options.cursor === undefined
+      ? null
+      : decodeModerationCursor(options.cursor, { event: canonical, from, to });
+    const prefix = `events/${canonical}/photo-index/v1/`;
+    let startAfter = decoded?.afterIndexKey;
+    let exhausted = false;
+    let lastScanned: string | null = startAfter ?? null;
+    const seen = new Set<string>();
+    const photos: ModerationPhoto[] = [];
+
+    while (photos.length < limit && !exhausted) {
+      const page = await this.state.list({
+        prefix,
+        ...(startAfter ? { startAfter } : {}),
+        limit: Math.max(1, limit - photos.length),
+      });
+      if (page.objects.length === 0) {
+        if (page.truncated) throw new InvalidStoredModerationPhotoError(canonical, startAfter ?? prefix);
+        exhausted = true;
+        break;
+      }
+      for (const object of page.objects) {
+        lastScanned = object.key;
+        startAfter = object.key;
+        const stored = await this.state.get(object.key);
+        if (!stored) continue;
+        let value: unknown;
+        try {
+          value = await stored.json<unknown>();
+        } catch {
+          throw new InvalidStoredModerationPhotoError(canonical, object.key);
+        }
+        const record = parseModerationPhotoRecord(canonical, value);
+        if (!record) throw new InvalidStoredModerationPhotoError(canonical, object.key);
+        if (
+          seen.has(record.key)
+          || (from !== null && record.capturedAt < from)
+          || (to !== null && record.capturedAt > to)
+        ) {
+          continue;
+        }
+        seen.add(record.key);
+        const publicPhoto = await this.photos.get(record.key);
+        if (!publicPhoto || !isPhotoKey(canonical, publicPhoto.key)) continue;
+        photos.push({ ...record, url: this.publicUrl(record.key) });
+        if (photos.length === limit) break;
+      }
+      exhausted = !page.truncated;
+    }
+
+    return {
+      photos,
+      nextCursor: !exhausted && lastScanned
+        ? encodeModerationCursor({
+            version: 1,
+            event: canonical,
+            afterIndexKey: lastScanned,
+            from,
+            to,
+          })
+        : null,
+    };
+  }
+
+  async rebuildPhotoIndex(
+    event: string,
+    options: { batchSize: number }
+  ): Promise<PhotoIndexRebuildResult> {
+    const canonical = canonicalEvent(event);
+    if (!Number.isInteger(options.batchSize) || options.batchSize < 1 || options.batchSize > 1_000) {
+      throw new TypeError("photo index rebuild batch size must be an integer from 1 to 1000");
+    }
+    const completeKey = photoIndexRebuildCompleteKey(canonical);
+    const checkpointKey = photoIndexRebuildCheckpointKey(canonical);
+    const existingComplete = await this.state.get(completeKey);
+    if (existingComplete) {
+      await this.parseRebuildComplete(canonical, existingComplete);
+      const checkpoint = await this.readRebuildCheckpoint(canonical);
+      return {
+        complete: true,
+        scanned: 0,
+        indexed: 0,
+        checkpoint: checkpoint?.lastPhotoKey ?? null,
+      };
+    }
+
+    const checkpoint = await this.readRebuildCheckpoint(canonical);
+    const page = await this.photos.list({
+      prefix: eventPhotoPrefix(canonical),
+      ...(checkpoint ? { startAfter: checkpoint.lastPhotoKey } : {}),
+      limit: options.batchSize,
+    });
+    let indexed = 0;
+    let lastPhotoKey = checkpoint?.lastPhotoKey ?? null;
+
+    for (const object of page.objects) {
+      lastPhotoKey = object.key;
+      if (!isPhotoKey(canonical, object.key)) continue;
+      const current = await this.photos.get(object.key);
+      if (!current || !isPhotoKey(canonical, current.key)) continue;
+      const capturedAt = capturedAtFromLegacyPhotoKey(canonical, current.key)
+        ?? current.uploaded.getTime();
+      const metadata: PrivatePhotoMetadata = {
+        ...photoPrivateMetadata(current.key, current.uploaded),
+        capturedAt,
+      };
+      const created = await this.state.compareAndSwap(
+        photoIndexKey(canonical, current.key, capturedAt),
+        null,
+        JSON.stringify(metadata),
+        jsonWriteOptions()
+      );
+      if (created) indexed += 1;
+    }
+
+    if (page.objects.length > 0 && lastPhotoKey) {
+      const nextCheckpoint: PrivatePhotoIndexRebuildCheckpoint = {
+        version: 1,
+        event: canonical,
+        lastPhotoKey,
+      };
+      const advanced = await this.state.compareAndSwap(
+        checkpointKey,
+        checkpoint?.etag ?? null,
+        JSON.stringify(nextCheckpoint),
+        jsonWriteOptions()
+      );
+      if (!advanced) {
+        const current = await this.readRebuildCheckpoint(canonical);
+        if (!current) throw new InvalidPhotoIndexRebuildStateError(canonical);
+        return {
+          complete: false,
+          scanned: page.objects.length,
+          indexed,
+          checkpoint: current.lastPhotoKey,
+        };
+      }
+    }
+
+    const complete = !page.truncated;
+    if (complete) {
+      const marker: PrivatePhotoIndexRebuildComplete = {
+        version: 1,
+        event: canonical,
+        completedAt: this.now().toISOString(),
+      };
+      await this.state.compareAndSwap(
+        completeKey,
+        null,
+        JSON.stringify(marker),
+        jsonWriteOptions()
+      );
+      const stored = await this.state.get(completeKey);
+      if (!stored) throw new InvalidPhotoIndexRebuildStateError(canonical);
+      await this.parseRebuildComplete(canonical, stored);
+    }
+
+    return {
+      complete,
+      scanned: page.objects.length,
+      indexed,
+      checkpoint: lastPhotoKey,
+    };
+  }
+
+  private async readRebuildCheckpoint(
+    event: string
+  ): Promise<(PrivatePhotoIndexRebuildCheckpoint & { etag: string }) | null> {
+    const object = await this.state.get(photoIndexRebuildCheckpointKey(event));
+    if (!object) return null;
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidPhotoIndexRebuildStateError(event);
+    }
+    if (
+      !isRecord(value)
+      || !hasExactObjectKeys(value, ["version", "event", "lastPhotoKey"])
+      || value.version !== 1
+      || value.event !== event
+      || typeof value.lastPhotoKey !== "string"
+      || !value.lastPhotoKey.startsWith(eventPhotoPrefix(event))
+      || /[\\?#]/.test(value.lastPhotoKey)
+    ) {
+      throw new InvalidPhotoIndexRebuildStateError(event);
+    }
+    return {
+      version: 1,
+      event,
+      lastPhotoKey: value.lastPhotoKey,
+      etag: object.etag,
+    };
+  }
+
+  private async parseRebuildComplete(
+    event: string,
+    object: StoredObjectBody
+  ): Promise<PrivatePhotoIndexRebuildComplete> {
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidPhotoIndexRebuildStateError(event);
+    }
+    if (
+      !isRecord(value)
+      || !hasExactObjectKeys(value, ["version", "event", "completedAt"])
+      || value.version !== 1
+      || value.event !== event
+      || typeof value.completedAt !== "string"
+      || Number.isNaN(Date.parse(value.completedAt))
+    ) {
+      throw new InvalidPhotoIndexRebuildStateError(event);
+    }
+    return { version: 1, event, completedAt: value.completedAt };
+  }
+
   async *iteratePhotoObjects(event: string): AsyncGenerator<StoredObject> {
     let cursor: string | undefined;
     do {
@@ -1662,6 +1932,18 @@ type PhotoFeedCursor = {
 
 type PrivatePhotoMetadata = PhotoReceiptV1;
 
+type PrivatePhotoIndexRebuildCheckpoint = {
+  version: 1;
+  event: string;
+  lastPhotoKey: string;
+};
+
+type PrivatePhotoIndexRebuildComplete = {
+  version: 1;
+  event: string;
+  completedAt: string;
+};
+
 function photoPrivateMetadata(key: string, uploadedAt: Date, upload?: StableUpload): PrivatePhotoMetadata {
   return {
     version: 1,
@@ -1808,6 +2090,25 @@ function newestPublicObjectFirst(left: StoredObject, right: StoredObject): numbe
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length
+    && actual.every((key, index) => key === sortedExpected[index]);
+}
+
+function isNullableSafeTimestamp(value: unknown): value is number | null {
+  return value === null
+    || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+}
+
+function capturedAtFromLegacyPhotoKey(event: string, key: string): number | null {
+  const match = key.slice(eventPhotoPrefix(event).length).match(/^(\d{13})-/);
+  if (!match) return null;
+  const capturedAt = Number(match[1]);
+  return Number.isSafeInteger(capturedAt) ? capturedAt : null;
 }
 
 function isBoundedToken(value: unknown): value is string {

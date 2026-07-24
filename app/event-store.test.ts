@@ -7,6 +7,8 @@ import {
   EventStore,
   InMemoryObjectStore,
   InvalidEventSlugError,
+  InvalidStoredModerationPhotoError,
+  InvalidPhotoIndexRebuildStateError,
   InvalidPhotoCursorError,
   InvalidStoredConfigRevisionError,
   eventConfigKey,
@@ -20,6 +22,8 @@ import {
   photoFeedHeadKey,
   photoFeedMarkerKey,
   photoIndexKey,
+  photoIndexRebuildCheckpointKey,
+  photoIndexRebuildCompleteKey,
   photoReceiptKey,
   type ListOptions,
   type ListResult,
@@ -46,6 +50,58 @@ class FailPrivatePhotoWriteStore extends InMemoryObjectStore {
   ): Promise<boolean> {
     if (this.writesFail && key.startsWith(this.failingPrefix)) {
       throw new Error(`simulated private write failure for ${key}`);
+    }
+    return super.compareAndSwap(key, expectedEtag, value);
+  }
+}
+
+class CappedListStore extends InMemoryObjectStore {
+  constructor(private readonly cap: number) {
+    super();
+  }
+
+  override list(options: ListOptions = {}): Promise<ListResult> {
+    return super.list({ ...options, limit: Math.min(options.limit ?? this.cap, this.cap) });
+  }
+}
+
+class FailNextIndexCreateStore extends InMemoryObjectStore {
+  fail = true;
+
+  override async compareAndSwap(
+    key: string,
+    expectedEtag: string | null,
+    value: ArrayBuffer | ArrayBufferView | string
+  ): Promise<boolean> {
+    if (this.fail && key.includes("/photo-index/v1/")) {
+      this.fail = false;
+      throw new Error("simulated index write failure");
+    }
+    return super.compareAndSwap(key, expectedEtag, value);
+  }
+}
+
+class MissingDuringRebuildStore extends InMemoryObjectStore {
+  override async get(key: string): Promise<StoredObjectBody | null> {
+    if (key === "launch/1753315200000-gone.jpg") {
+      await this.delete(key);
+      return null;
+    }
+    return super.get(key);
+  }
+}
+
+class CrashBeforeCompleteMarkerStore extends InMemoryObjectStore {
+  crash = true;
+
+  override async compareAndSwap(
+    key: string,
+    expectedEtag: string | null,
+    value: ArrayBuffer | ArrayBufferView | string
+  ): Promise<boolean> {
+    if (this.crash && key === photoIndexRebuildCompleteKey("launch")) {
+      this.crash = false;
+      throw new Error("simulated crash before complete marker");
     }
     return super.compareAndSwap(key, expectedEtag, value);
   }
@@ -1840,6 +1896,193 @@ describe("EventStore", () => {
 
     await expect(store.getPublicPhoto("launch", "launch/0000000001000-missing.jpg")).resolves.toBeNull();
     expect(photos.reads).toEqual(["launch/0000000001000-missing.jpg"]);
+  });
+
+  test("pages the private inverse-time index newest-first across bounded storage pages", async () => {
+    const photos = new InMemoryObjectStore();
+    const state = new CappedListStore(1);
+    const store = new EventStore(photos, state, "https://photos.example");
+    const records = [
+      { key: "launch/0000000001000-a.jpg", capturedAt: 1_000 },
+      { key: "launch/0000000002000-b.jpg", capturedAt: 2_000 },
+      { key: "launch/0000000003000-c.jpg", capturedAt: 3_000 },
+    ];
+    for (const record of records) {
+      photos.set(record.key, record.key, new Date(record.capturedAt));
+      state.set(photoIndexKey("launch", record.key, record.capturedAt), JSON.stringify({
+        version: 1,
+        ...record,
+        uploadedAt: new Date(record.capturedAt).toISOString(),
+        source: "framed",
+        frameKey: "celebration",
+        configRevisionId: "private-revision",
+      }));
+    }
+
+    const first = await store.listModerationPhotos("launch", { limit: 2 });
+    expect(first.photos).toEqual([
+      {
+        key: records[2]!.key,
+        url: `https://photos.example/${records[2]!.key}`,
+        uploadedAt: new Date(3_000).toISOString(),
+        capturedAt: 3_000,
+        source: "framed",
+        frameKey: "celebration",
+      },
+      {
+        key: records[1]!.key,
+        url: `https://photos.example/${records[1]!.key}`,
+        uploadedAt: new Date(2_000).toISOString(),
+        capturedAt: 2_000,
+        source: "framed",
+        frameKey: "celebration",
+      },
+    ]);
+    expect(first.nextCursor).toStartWith("mod1.");
+
+    const newest = { key: "launch/0000000004000-new.jpg", capturedAt: 4_000 };
+    photos.set(newest.key, "new", new Date(newest.capturedAt));
+    state.set(photoIndexKey("launch", newest.key, newest.capturedAt), JSON.stringify({
+      version: 1,
+      ...newest,
+      uploadedAt: new Date(newest.capturedAt).toISOString(),
+    }));
+
+    const second = await store.listModerationPhotos("launch", {
+      limit: 2,
+      cursor: first.nextCursor!,
+    });
+    expect(second.photos.map((photo) => photo.key)).toEqual([records[0]!.key]);
+    expect(second.nextCursor).toBeNull();
+  });
+
+  test("filters inclusively, deduplicates exact keys, and skips missing public photos", async () => {
+    const photos = new InMemoryObjectStore({
+      "launch/0000000002000-b.jpg": "b",
+      "launch/0000000003000-c.jpg": "c",
+    });
+    const state = new InMemoryObjectStore();
+    const metadata = (key: string, capturedAt: number) => JSON.stringify({
+      version: 1,
+      key,
+      uploadedAt: new Date(capturedAt).toISOString(),
+      capturedAt,
+    });
+    state.set(photoIndexKey("launch", "launch/0000000004000-missing.jpg", 4_000),
+      metadata("launch/0000000004000-missing.jpg", 4_000));
+    state.set(photoIndexKey("launch", "launch/0000000003000-c.jpg", 3_500),
+      metadata("launch/0000000003000-c.jpg", 3_000));
+    state.set(photoIndexKey("launch", "launch/0000000003000-c.jpg", 3_000),
+      metadata("launch/0000000003000-c.jpg", 3_000));
+    state.set(photoIndexKey("launch", "launch/0000000002000-b.jpg", 2_000),
+      metadata("launch/0000000002000-b.jpg", 2_000));
+
+    const page = await new EventStore(photos, state, "https://photos.example")
+      .listModerationPhotos("launch", { limit: 10, from: 2_000, to: 3_000 });
+
+    expect(page.photos.map((photo) => photo.key)).toEqual([
+      "launch/0000000003000-c.jpg",
+      "launch/0000000002000-b.jpg",
+    ]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  test("fails explicitly on corrupt, future, expanded, or cross-Event index records", async () => {
+    const photos = new InMemoryObjectStore({ "launch/0000000001000-a.jpg": "a" });
+    for (const record of [
+      { version: 2, key: "launch/0000000001000-a.jpg", uploadedAt: new Date(1_000).toISOString(), capturedAt: 1_000 },
+      { version: 1, key: "other/0000000001000-a.jpg", uploadedAt: new Date(1_000).toISOString(), capturedAt: 1_000 },
+      { version: 1, key: "launch/0000000001000-a.jpg", uploadedAt: new Date(1_000).toISOString(), capturedAt: 1_000, heartbeat: true },
+    ]) {
+      const state = new InMemoryObjectStore({
+        [photoIndexKey("launch", "launch/0000000001000-a.jpg", 1_000)]: JSON.stringify(record),
+      });
+      await expect(new EventStore(photos, state, "https://photos.example")
+        .listModerationPhotos("launch", { limit: 10 }))
+        .rejects.toBeInstanceOf(InvalidStoredModerationPhotoError);
+    }
+  });
+
+  test("rebuilds legacy indexes in bounded add-only batches without receipts", async () => {
+    const photos = new InMemoryObjectStore();
+    photos.set("launch/1753315200000-a.jpg", "a", new Date("2025-07-25T00:00:00.000Z"));
+    photos.set("launch/legacy-b.jpg", "b", new Date("2025-07-26T00:00:00.000Z"));
+    photos.set("launch/notes.txt", "notes", new Date("2025-07-27T00:00:00.000Z"));
+    photos.set("other/1753315200000-other.jpg", "other");
+    const state = new InMemoryObjectStore();
+    const existingKey = photoIndexKey("launch", "launch/1753315200000-a.jpg", 1753315200000);
+    state.set(existingKey, "existing-bytes");
+    const existingEtag = (await state.get(existingKey))!.etag;
+    const store = new EventStore(photos, state, "https://photos.example");
+
+    const first = await store.rebuildPhotoIndex("launch", { batchSize: 2 });
+    expect(first).toMatchObject({ complete: false, scanned: 2, indexed: 1 });
+    expect(first.checkpoint).toBe("launch/legacy-b.jpg");
+    expect((await state.get(existingKey))!.etag).toBe(existingEtag);
+
+    const second = await store.rebuildPhotoIndex("launch", { batchSize: 2 });
+    expect(second).toMatchObject({ complete: true, scanned: 1, indexed: 0 });
+    expect(state.has(photoIndexKey(
+      "launch",
+      "launch/legacy-b.jpg",
+      new Date("2025-07-26T00:00:00.000Z").getTime()
+    ))).toBe(true);
+    expect(state.has(photoReceiptKey("launch", "launch/1753315200000-a.jpg"))).toBe(false);
+    expect(state.has(photoReceiptKey("launch", "launch/legacy-b.jpg"))).toBe(false);
+    expect(state.has(photoIndexRebuildCompleteKey("launch"))).toBe(true);
+    expect((await state.list({ prefix: "events/other/" })).objects).toHaveLength(0);
+  });
+
+  test("does not checkpoint past a failed index batch and safely retries create-only writes", async () => {
+    const photos = new InMemoryObjectStore({
+      "launch/1753315200000-a.jpg": "a",
+      "launch/1753315200001-b.jpg": "b",
+    });
+    const state = new FailNextIndexCreateStore();
+    const store = new EventStore(photos, state, "https://photos.example");
+
+    await expect(store.rebuildPhotoIndex("launch", { batchSize: 2 })).rejects.toThrow("index");
+    expect(state.has(photoIndexRebuildCheckpointKey("launch"))).toBe(false);
+    const retried = await store.rebuildPhotoIndex("launch", { batchSize: 2 });
+    expect(retried).toMatchObject({ complete: true, scanned: 2, indexed: 2 });
+  });
+
+  test("rechecks public truth and recovers a crash after the final checkpoint", async () => {
+    const photos = new MissingDuringRebuildStore({
+      "launch/1753315200000-gone.jpg": "gone",
+      "launch/1753315200001-kept.jpg": "kept",
+    });
+    const state = new CrashBeforeCompleteMarkerStore();
+    const store = new EventStore(photos, state, "https://photos.example");
+
+    await expect(store.rebuildPhotoIndex("launch", { batchSize: 10 }))
+      .rejects.toThrow("complete marker");
+    expect(state.has(photoIndexKey("launch", "launch/1753315200000-gone.jpg", 1753315200000))).toBe(false);
+    expect(state.has(photoIndexRebuildCheckpointKey("launch"))).toBe(true);
+    expect(state.has(photoIndexRebuildCompleteKey("launch"))).toBe(false);
+
+    const recovered = await store.rebuildPhotoIndex("launch", { batchSize: 10 });
+    expect(recovered).toEqual({
+      complete: true,
+      scanned: 0,
+      indexed: 0,
+      checkpoint: "launch/1753315200001-kept.jpg",
+    });
+  });
+
+  test("rejects corrupt rebuild checkpoints without touching photos", async () => {
+    const photos = new InMemoryObjectStore({ "launch/1753315200000-a.jpg": "a" });
+    const state = new InMemoryObjectStore({
+      [photoIndexRebuildCheckpointKey("launch")]: JSON.stringify({
+        version: 2,
+        event: "launch",
+        lastPhotoKey: "launch/1753315200000-a.jpg",
+      }),
+    });
+    await expect(new EventStore(photos, state, "https://photos.example")
+      .rebuildPhotoIndex("launch", { batchSize: 10 }))
+      .rejects.toBeInstanceOf(InvalidPhotoIndexRebuildStateError);
+    expect(photos.has("launch/1753315200000-a.jpg")).toBe(true);
   });
 
   test("writes an exact private heartbeat with a server-controlled timestamp", async () => {
