@@ -141,3 +141,19 @@ export function projectPublicConfig(config: EventConfig | null): PublicEventConf
     ...(gallery ? { gallery } : {}),
   };
 }
+
+/**
+ * The Booth preflight contract intentionally has a smaller projection than
+ * operator-facing config: credentials and revision bookkeeping never leave
+ * private Event state.
+ */
+export function projectEventExperience(config: EventConfig): EventExperience {
+  return {
+    frames: [...config.frames],
+    ...(config.locales ? { locales: [...config.locales] } : {}),
+    ...(config.defaultLocale ? { defaultLocale: config.defaultLocale } : {}),
+    ...(config.timeZone ? { timeZone: config.timeZone } : {}),
+    ...(config.capture ? { capture: { ...config.capture } } : {}),
+    ...(config.gallery ? { gallery: { ...config.gallery } } : {}),
+  };
+}

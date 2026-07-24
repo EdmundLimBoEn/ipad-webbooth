@@ -3,6 +3,7 @@ import {
   isRevisionId,
   parseConfigRevision,
   parseEventConfig,
+  projectEventExperience,
   projectPublicConfig,
 } from "./event-config";
 
@@ -54,6 +55,18 @@ describe("event config schema", () => {
     expect(json).not.toContain("boothKeyHash");
     expect(json).not.toContain("currentRevisionId");
     expect(projectPublicConfig(null)).toEqual({ frames: null, hasBoothKey: false });
+  });
+
+  test("projects a Booth experience without private configuration fields", () => {
+    const projected = projectEventExperience({
+      frames: ["square"],
+      boothKeyHash: "salt:hash",
+      currentRevisionId: "018f0000-0000-4000-8000-000000000001",
+    });
+
+    expect(projected).toEqual({ frames: ["square"] });
+    expect(JSON.stringify(projected)).not.toContain("boothKeyHash");
+    expect(JSON.stringify(projected)).not.toContain("currentRevisionId");
   });
 
   test("revision parsing rejects credentials inside experience", () => {
