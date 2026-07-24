@@ -62,13 +62,23 @@ function parseExperience(value: unknown): EventExperience | null {
   if (gallery?.title !== undefined && (typeof gallery.title !== "string" || gallery.title.length > 120)) return null;
   if (gallery?.accentColor !== undefined && (typeof gallery.accentColor !== "string" || !HEX_COLOR.test(gallery.accentColor))) return null;
 
+  const parsedCapture = capture && {
+    ...(typeof capture.reviewEnabled === "boolean" ? { reviewEnabled: capture.reviewEnabled } : {}),
+    ...(typeof capture.autoAcceptSeconds === "number" ? { autoAcceptSeconds: capture.autoAcceptSeconds } : {}),
+    ...(typeof capture.countdownAudioDefault === "boolean" ? { countdownAudioDefault: capture.countdownAudioDefault } : {}),
+  };
+  const parsedGallery = gallery && {
+    ...(typeof gallery.title === "string" ? { title: gallery.title } : {}),
+    ...(typeof gallery.accentColor === "string" ? { accentColor: gallery.accentColor } : {}),
+  };
+
   return {
     frames: [...v.frames] as string[],
     ...(v.locales ? { locales: [...v.locales] as string[] } : {}),
     ...(typeof v.defaultLocale === "string" ? { defaultLocale: v.defaultLocale } : {}),
     ...(typeof v.timeZone === "string" ? { timeZone: v.timeZone } : {}),
-    ...(capture ? { capture: { ...capture } as EventExperience["capture"] } : {}),
-    ...(gallery ? { gallery: { ...gallery } as EventExperience["gallery"] } : {}),
+    ...(parsedCapture ? { capture: parsedCapture } : {}),
+    ...(parsedGallery ? { gallery: parsedGallery } : {}),
   };
 }
 
@@ -112,13 +122,22 @@ export function parseConfigRevision(value: unknown): ConfigRevision | null {
 
 export function projectPublicConfig(config: EventConfig | null): PublicEventConfig {
   if (!config) return { frames: null, hasBoothKey: false };
+  const capture = config.capture && {
+    ...(config.capture.reviewEnabled !== undefined ? { reviewEnabled: config.capture.reviewEnabled } : {}),
+    ...(config.capture.autoAcceptSeconds !== undefined ? { autoAcceptSeconds: config.capture.autoAcceptSeconds } : {}),
+    ...(config.capture.countdownAudioDefault !== undefined ? { countdownAudioDefault: config.capture.countdownAudioDefault } : {}),
+  };
+  const gallery = config.gallery && {
+    ...(config.gallery.title !== undefined ? { title: config.gallery.title } : {}),
+    ...(config.gallery.accentColor !== undefined ? { accentColor: config.gallery.accentColor } : {}),
+  };
   return {
     frames: [...config.frames],
     hasBoothKey: Boolean(config.boothKeyHash),
     ...(config.locales ? { locales: [...config.locales] } : {}),
     ...(config.defaultLocale ? { defaultLocale: config.defaultLocale } : {}),
     ...(config.timeZone ? { timeZone: config.timeZone } : {}),
-    ...(config.capture ? { capture: { ...config.capture } } : {}),
-    ...(config.gallery ? { gallery: { ...config.gallery } } : {}),
+    ...(capture ? { capture } : {}),
+    ...(gallery ? { gallery } : {}),
   };
 }

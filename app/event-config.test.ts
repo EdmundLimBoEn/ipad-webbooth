@@ -98,6 +98,45 @@ describe("event config schema", () => {
     expect(parseEventConfig({ version: 1, frames: [], gallery: [] })).toBeNull();
   });
 
+  test("omits unknown nested fields from parsed and public config", () => {
+    const nestedCapture = {
+      reviewEnabled: true,
+      boothKeyHash: "leak",
+      currentRevisionId: "018f0000-0000-7000-8000-000000000001",
+      unknownNestedField: "discard",
+    };
+    const nestedGallery = {
+      title: "Launch Night",
+      boothKeyHash: "leak",
+      currentRevisionId: "018f0000-0000-7000-8000-000000000001",
+      unknownNestedField: "discard",
+    };
+    const expectedExperience = {
+      frames: ["square"],
+      capture: { reviewEnabled: true },
+      gallery: { title: "Launch Night" },
+    };
+
+    expect(parseEventConfig({ version: 1, ...expectedExperience, capture: nestedCapture, gallery: nestedGallery }))
+      .toEqual(expectedExperience);
+    expect(parseConfigRevision({
+      version: 1,
+      id: "018f0000-0000-7000-8000-000000000001",
+      createdAt: "2026-07-24T00:00:00.000Z",
+      parentRevisionId: null,
+      reason: "baseline",
+      config: { ...expectedExperience, capture: nestedCapture, gallery: nestedGallery },
+    })?.config).toEqual(expectedExperience);
+    expect(projectPublicConfig({
+      ...expectedExperience,
+      capture: nestedCapture,
+      gallery: nestedGallery,
+    } as Parameters<typeof projectPublicConfig>[0])).toEqual({
+      ...expectedExperience,
+      hasBoothKey: false,
+    });
+  });
+
   test("accepts UUID mutation/revision IDs only", () => {
     expect(isRevisionId("018f0000-0000-7000-8000-000000000001")).toBe(true);
     expect(isRevisionId("../config")).toBe(false);
