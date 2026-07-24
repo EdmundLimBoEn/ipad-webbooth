@@ -59,13 +59,20 @@ function originalBasename(key: string): string {
   return key.split("/").at(-1) ?? "";
 }
 
+function splitArchiveExtension(value: string): { stem: string; extension: string } {
+  const dot = value.lastIndexOf(".");
+  const hasBoundedExtension = dot > 0 && value.length - dot <= 16;
+  return hasBoundedExtension
+    ? { stem: value.slice(0, dot), extension: value.slice(dot) }
+    : { stem: value, extension: "" };
+}
+
 function sanitizeFilename(value: string): string {
   let safe = value.replace(/[^A-Za-z0-9._-]/gu, "_");
   if (safe === "" || safe === "." || safe === "..") safe = "photo";
   if (safe.length > MAX_ARCHIVE_FILENAME_LENGTH) {
-    const dot = safe.lastIndexOf(".");
-    const extension = dot > 0 && safe.length - dot <= 16 ? safe.slice(dot) : "";
-    safe = `${safe.slice(0, MAX_ARCHIVE_FILENAME_LENGTH - extension.length)}${extension}`;
+    const { stem, extension } = splitArchiveExtension(safe);
+    safe = `${stem.slice(0, MAX_ARCHIVE_FILENAME_LENGTH - extension.length)}${extension}`;
   }
   return safe;
 }
@@ -76,10 +83,7 @@ function uniqueFilename(candidate: string, emitted: Set<string>): string {
     emitted.add(collisionKey);
     return candidate;
   }
-  const dot = candidate.lastIndexOf(".");
-  const hasExtension = dot > 0;
-  const stem = hasExtension ? candidate.slice(0, dot) : candidate;
-  const extension = hasExtension ? candidate.slice(dot) : "";
+  const { stem, extension } = splitArchiveExtension(candidate);
   for (let suffix = 2; ; suffix += 1) {
     const suffixText = `-${suffix}`;
     const stemLength = MAX_ARCHIVE_FILENAME_LENGTH

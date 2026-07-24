@@ -57,6 +57,17 @@ describe("event package rows", () => {
     expect(rows[1]!.filename).toBe(`${"a".repeat(154)}-2.jpg`);
   });
 
+  test("does not treat a long dotted suffix as an unbounded extension", () => {
+    const filename = `a.${"b".repeat(158)}`;
+    const rows = preparePackageRows([
+      source(`launch/${filename}`),
+      source(`launch/duplicate/${filename}`),
+    ], () => undefined);
+
+    expect(rows.map(({ filename: value }) => value.length)).toEqual([160, 160]);
+    expect(rows[1]!.filename).toEndWith("-2");
+  });
+
   test("uses receipt, filename, then upload timestamps and allowlisted metadata", () => {
     const rows = preparePackageRows([
       source("launch/1753315200000-first.jpg", {
