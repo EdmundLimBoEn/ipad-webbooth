@@ -4,14 +4,22 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { useParams } from "next/navigation";
 import QRCode from "qrcode";
 import { GROUPS, TEMPLATES } from "../../templates";
+import type { ConfigRevision, PublicEventConfig } from "../../event-config";
 import type { Template } from "../../frame-packs/types";
+import { ConfigHistoryPanel } from "./config-history-panel";
 import styles from "./admin.module.css";
 
 type Photo = { key: string; url: string; uploadedAt: string };
 type AuthState = "missing" | "ready" | "invalid";
 type Probe = { status: "up" | "degraded" | "down"; detail: string };
 type Health = { upload: Probe; live: Probe };
+type ConfigHistoryResponse = {
+  config: PublicEventConfig;
+  currentRevisionId: string | null;
+  revisions: ConfigRevision[];
+};
 type FilePickerWindow = Window & { showSaveFilePicker?: (options: { suggestedName: string; types: { description: string; accept: Record<string, string[]> }[] }) => Promise<{ createWritable(): Promise<WritableStream<Uint8Array>> }> };
+const CONFIG_CONFLICT_MESSAGE = "Configuration changed; review the latest version before saving.";
 
 function FramePreview({ frame }: { frame: Template }) {
   return (
@@ -41,6 +49,9 @@ export default function Admin() {
   const [frames, setFrames] = useState<Set<string>>(new Set());
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configError, setConfigError] = useState("");
+  const [currentRevisionId, setCurrentRevisionId] = useState<string | null>(null);
+  const [revisions, setRevisions] = useState<ConfigRevision[]>([]);
+  const [restoringRevisionId, setRestoringRevisionId] = useState<string | null>(null);
   const [hasBoothKey, setHasBoothKey] = useState(false);
   const [boothKey, setBoothKey] = useState("");
   const [boothKeySaved, setBoothKeySaved] = useState(false);
@@ -60,10 +71,16 @@ export default function Admin() {
   const [health, setHealth] = useState<Health | null>(null);
   const [checkingHealth, setCheckingHealth] = useState(false);
   const photoCursor = useRef<string | null>(null);
+  const pendingSaveMutationId = useRef<string | null>(null);
+  const pendingRestoreMutationIds = useRef(new Map<string, string>());
 
   const boothUrl = `${origin}/${event}`;
   const liveUrl = `${boothUrl}/live`;
   const defaults = useMemo(() => Object.keys(TEMPLATES).filter((key) => !TEMPLATES[key].group), []);
+  const clearPendingSave = () => {
+    pendingSaveMutationId.current = null;
+    setError((current) => current === CONFIG_CONFLICT_MESSAGE ? "" : current);
+  };
 
   const runHealth = useCallback(async (key = adminKey) => {
     setCheckingHealth(true); setError("");
@@ -98,18 +115,36 @@ export default function Admin() {
   }, [boothUrl, liveUrl, origin]);
 
   const loadConfig = useCallback(async () => {
+    setConfigLoaded(false);
     setConfigError("");
     try {
-      const response = await fetch(`/api/config?event=${encodeURIComponent(event)}`, { cache: "no-store" });
-      if (!response.ok) throw new Error(`Config returned ${response.status}`);
-      const data = await response.json();
-      setFrames(new Set(Array.isArray(data.frames) ? data.frames : defaults));
-      setHasBoothKey(Boolean(data.hasBoothKey));
+      const response = await fetch(`/api/config/revisions?event=${encodeURIComponent(event)}`, {
+        cache: "no-store",
+        headers: { "x-booth-key": adminKey },
+      });
+      if (response.status === 401) {
+        sessionStorage.removeItem("adminKey");
+        setAuth("invalid");
+        throw new Error("That admin key was rejected.");
+      }
+      if (!response.ok) throw new Error(`Configuration history returned ${response.status}`);
+      const data = await response.json() as ConfigHistoryResponse;
+      if (
+        !data.config
+        || !Array.isArray(data.revisions)
+        || (data.currentRevisionId !== null && typeof data.currentRevisionId !== "string")
+      ) {
+        throw new Error("Configuration history had an unexpected shape");
+      }
+      setFrames(new Set(Array.isArray(data.config.frames) ? data.config.frames : defaults));
+      setHasBoothKey(Boolean(data.config.hasBoothKey));
+      setCurrentRevisionId(data.currentRevisionId);
+      setRevisions(data.revisions);
       setConfigLoaded(true);
     } catch (cause) {
       setConfigError(cause instanceof Error ? cause.message : "Config could not be loaded");
     }
-  }, [defaults, event]);
+  }, [adminKey, defaults, event]);
 
   const loadPhotos = useCallback(async (reset = false) => {
     setPhotosError("");
@@ -134,12 +169,16 @@ export default function Admin() {
   }, [event]);
 
   useEffect(() => {
-    void loadConfig();
     photoCursor.current = null;
     void loadPhotos(true);
     const poll = window.setInterval(() => void loadPhotos(), 5000);
     return () => window.clearInterval(poll);
-  }, [loadConfig, loadPhotos]);
+  }, [loadPhotos]);
+
+  useEffect(() => {
+    if (auth !== "ready" || !adminKey) return;
+    void loadConfig();
+  }, [adminKey, auth, loadConfig]);
 
   const authenticate = (submitEvent: FormEvent) => {
     submitEvent.preventDefault();
@@ -158,6 +197,7 @@ export default function Admin() {
   };
 
   const toggle = (key: string) => {
+    clearPendingSave();
     setFrames((current) => {
       const next = new Set(current);
       if (next.has(key)) next.delete(key); else next.add(key);
@@ -167,6 +207,7 @@ export default function Admin() {
   };
 
   const setGroup = (group: string, enabled: boolean) => {
+    clearPendingSave();
     const keys = Object.keys(TEMPLATES).filter((key) => TEMPLATES[key].group === group);
     setFrames((current) => {
       const next = new Set(current);
@@ -176,6 +217,7 @@ export default function Admin() {
   };
 
   const generateBoothKey = () => {
+    clearPendingSave();
     const bytes = crypto.getRandomValues(new Uint8Array(12));
     setBoothKey(Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""));
     setBoothKeySaved(false);
@@ -193,24 +235,86 @@ export default function Admin() {
   };
 
   const save = async () => {
+    if (!configLoaded) return;
     if (boothKey && boothKey.length < 12) {
       setError("Booth keys need at least 12 characters.");
       return;
     }
     setSaving(true); setError(""); setNotice("");
+    const mutationId = pendingSaveMutationId.current ?? crypto.randomUUID();
+    pendingSaveMutationId.current = mutationId;
     try {
       const response = await fetch(`/api/config?event=${encodeURIComponent(event)}`, {
         method: "PUT",
         headers: { "x-booth-key": adminKey, "content-type": "application/json" },
-        body: JSON.stringify({ frames: [...frames], ...(boothKey ? { boothKey } : {}) }),
+        body: JSON.stringify({
+          frames: [...frames],
+          ...(boothKey ? { boothKey } : {}),
+          mutationId,
+          baseRevisionId: currentRevisionId,
+        }),
       });
+      if ([400, 401, 409].includes(response.status)) pendingSaveMutationId.current = null;
       if (response.status === 401) { invalidateAuth(); throw new Error("That admin key was rejected."); }
+      if (response.status === 409) {
+        await loadConfig();
+        setError(CONFIG_CONFLICT_MESSAGE);
+        return;
+      }
       if (!response.ok) throw new Error(`Save failed (${response.status})`);
+      const data = await response.json() as PublicEventConfig & { currentRevisionId: string };
+      pendingSaveMutationId.current = null;
+      setCurrentRevisionId(data.currentRevisionId);
       if (boothKey) { setHasBoothKey(true); setBoothKeySaved(true); }
+      await loadConfig();
       setNotice(boothKey ? "Event saved. Keep the new booth key somewhere secure." : "Event configuration saved.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Event could not be saved");
     } finally { setSaving(false); }
+  };
+
+  const restoreRevision = async (revisionId: string) => {
+    if (!configLoaded) return;
+    const pending = pendingRestoreMutationIds.current;
+    const mutationId = pending.get(revisionId) ?? crypto.randomUUID();
+    pending.set(revisionId, mutationId);
+    setRestoringRevisionId(revisionId);
+    setError("");
+    setNotice("");
+    try {
+      const response = await fetch(`/api/config/revisions/restore?event=${encodeURIComponent(event)}`, {
+        method: "POST",
+        headers: { "x-booth-key": adminKey, "content-type": "application/json" },
+        body: JSON.stringify({
+          revisionId,
+          mutationId,
+          baseRevisionId: currentRevisionId,
+        }),
+      });
+      if ([400, 401, 404, 409].includes(response.status)) pending.delete(revisionId);
+      if (response.status === 401) { invalidateAuth(); throw new Error("That admin key was rejected."); }
+      if (response.status === 409) {
+        await loadConfig();
+        setError(CONFIG_CONFLICT_MESSAGE);
+        return;
+      }
+      if (!response.ok) throw new Error(`Restore failed (${response.status})`);
+      const data = await response.json() as PublicEventConfig & { currentRevisionId: string };
+      pending.delete(revisionId);
+      pendingSaveMutationId.current = null;
+      setFrames(new Set(Array.isArray(data.frames) ? data.frames : defaults));
+      setHasBoothKey(Boolean(data.hasBoothKey));
+      setCurrentRevisionId(data.currentRevisionId);
+      setBoothKey("");
+      setBoothKeySaved(false);
+      setCopied((current) => current === "key" ? "" : current);
+      await loadConfig();
+      setNotice("Configuration restored.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Configuration could not be restored");
+    } finally {
+      setRestoringRevisionId(null);
+    }
   };
 
   const exportZip = async () => {
@@ -317,8 +421,19 @@ export default function Admin() {
             </div>}
           </section>
 
+          <ConfigHistoryPanel
+            currentFrames={[...frames]}
+            currentRevisionId={currentRevisionId}
+            revisions={revisions}
+            loading={!configLoaded && !configError}
+            restoringRevisionId={restoringRevisionId}
+            error={configError}
+            onReload={() => void loadConfig()}
+            onRestore={(revisionId) => void restoreRevision(revisionId)}
+          />
+
           <section className={styles.section}>
-            <div className={styles.sectionHead}><div><span>02</span><h2>Recent contact sheet</h2></div><p>{photos.length} photograph{photos.length === 1 ? "" : "s"} currently in this event.</p></div>
+            <div className={styles.sectionHead}><div><span>03</span><h2>Recent contact sheet</h2></div><p>{photos.length} photograph{photos.length === 1 ? "" : "s"} currently in this event.</p></div>
             {photosError && photos.length === 0 ? <div className={styles.failure}><strong>Photo feed unavailable</strong><p>{photosError}</p><button onClick={() => void loadPhotos(true)}>Retry photos</button></div> : photosLoaded && photos.length === 0 ?
               <div className={styles.emptySheet}><strong>No exposures yet.</strong><p>Open the booth link and take a test photo before doors open.</p></div> :
               <div className={styles.contactSheet}>{photos.slice(0, 16).map((photo) => <article key={photo.key} className={styles.contactPhoto}>
@@ -331,11 +446,11 @@ export default function Admin() {
 
         <aside className={styles.sideColumn}>
           <section className={styles.sideCard}>
-            <span className={styles.cardNumber}>03</span><h2>Booth credential</h2>
+            <span className={styles.cardNumber}>04</span><h2>Booth credential</h2>
             <p>{hasBoothKey ? "A booth key is installed. Generate a replacement only when rotating iPad access." : "No booth key yet. Generate one before the booth can upload."}</p>
-            <div className={styles.keyRow}><input aria-label="New booth key" value={boothKey} onChange={(e) => { setBoothKey(e.target.value.trim()); setBoothKeySaved(false); }} placeholder={hasBoothKey ? "Unchanged" : "Generate a key"} autoComplete="off" /><button onClick={generateBoothKey}>Generate</button></div>
+            <div className={styles.keyRow}><input aria-label="New booth key" value={boothKey} onChange={(e) => { clearPendingSave(); setBoothKey(e.target.value.trim()); setBoothKeySaved(false); }} placeholder={hasBoothKey ? "Unchanged" : "Generate a key"} autoComplete="off" /><button onClick={generateBoothKey}>Generate</button></div>
             {boothKey && <button className={styles.copyWide} onClick={() => void copy(boothKey, "key")}>{copied === "key" ? "Copied ✓" : "Copy generated key"}</button>}
-            {boothKey && boothKeySaved && <button className={styles.clearKey} onClick={() => { setBoothKey(""); setBoothKeySaved(false); setCopied(""); }}>Stored safely — clear key</button>}
+            {boothKey && boothKeySaved && <button className={styles.clearKey} onClick={() => { clearPendingSave(); setBoothKey(""); setBoothKeySaved(false); setCopied(""); }}>Stored safely — clear key</button>}
           </section>
 
           <LinkCard label="Booth / iPad" url={boothUrl} qr={boothQr} copied={copied === "booth"} copy={() => void copy(boothUrl, "booth")} />
