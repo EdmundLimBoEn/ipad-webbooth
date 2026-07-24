@@ -11,6 +11,8 @@ import {
   eventConfigKey,
   eventConfigMutationKey,
   eventConfigRevisionKey,
+  boothHeartbeatKey,
+  boothOperationalStateKey,
   legacyEventConfigKey,
   PhotoIndexWriteError,
   photoFeedCommittedKey,
@@ -22,6 +24,7 @@ import {
   type ListResult,
   type StoredObjectBody,
 } from "./event-store";
+import type { BoothHeartbeatInput } from "./booth-control";
 
 class FailPrivatePhotoWriteStore extends InMemoryObjectStore {
   private writesFail = true;
@@ -239,6 +242,25 @@ async function saveSameContentHistory(
     mutationId: secondMutationId,
   });
   return { first, second };
+}
+
+function boothHeartbeat(
+  deviceId: string,
+  changes: Partial<BoothHeartbeatInput> = {}
+): BoothHeartbeatInput {
+  return {
+    version: 1,
+    deviceId,
+    sessionStartedAt: 1753315200000,
+    pendingCount: 0,
+    durableStorage: true,
+    online: true,
+    installed: true,
+    camera: "ready",
+    upload: "idle",
+    buildId: "release_1",
+    ...changes,
+  };
 }
 
 describe("ObjectStore", () => {
@@ -1702,5 +1724,116 @@ describe("EventStore", () => {
     expect(await store.deletePhoto("launch", "launch/0000000001000-a.jpg")).toBe(true);
     expect(photos.has("launch/0000000001000-a.jpg")).toBe(false);
     expect(photos.has("other/0000000001000-b.jpg")).toBe(true);
+  });
+
+  test("writes an exact private heartbeat with a server-controlled timestamp", async () => {
+    const now = new Date("2026-07-24T00:00:00.000Z");
+    const photos = new InMemoryObjectStore();
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(photos, state, "https://photos.example", () => now);
+    const input = boothHeartbeat("018f0000-0000-4000-8000-000000000001", {
+      pendingCount: 2,
+      upload: "retry-wait",
+    });
+
+    const record = await store.writeBoothHeartbeat("launch", input);
+
+    expect(record).toEqual({ ...input, lastSeenAt: now.toISOString() });
+    const stored = await state.get(boothHeartbeatKey("launch", input.deviceId));
+    expect(await stored!.json<unknown>()).toEqual(record);
+    expect((await photos.list()).objects).toHaveLength(0);
+    await expect(store.writeBoothHeartbeat("launch", {
+      ...input,
+      lastSeenAt: "2099-01-01T00:00:00.000Z",
+    } as unknown as BoothHeartbeatInput)).rejects.toBeInstanceOf(TypeError);
+  });
+
+  test("pages bounded private heartbeats, derives stale records, and overwrites exact devices", async () => {
+    let now = new Date("2026-07-24T00:00:00.000Z");
+    const photos = new InMemoryObjectStore();
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(photos, state, "https://photos.example", () => now);
+    const firstDevice = "018f0000-0000-4000-8000-000000000001";
+    const secondDevice = "018f0000-0000-4000-8000-000000000002";
+    const thirdDevice = "018f0000-0000-4000-8000-000000000003";
+    await store.writeBoothHeartbeat("launch", boothHeartbeat(firstDevice));
+    await store.writeBoothHeartbeat("launch", boothHeartbeat(secondDevice));
+    await store.writeBoothHeartbeat("launch", boothHeartbeat(thirdDevice));
+    now = new Date("2026-07-24T00:00:45.001Z");
+
+    const firstPage = await store.listBoothHeartbeats("launch", { limit: 2 });
+    const secondPage = await store.listBoothHeartbeats("launch", { limit: 2, cursor: firstPage.cursor });
+
+    expect(firstPage.booths.map((record) => record.deviceId)).toEqual([firstDevice, secondDevice]);
+    expect(firstPage.booths.every((record) => record.stale)).toBe(true);
+    expect(firstPage.cursor).not.toBeNull();
+    expect(secondPage.booths.map((record) => record.deviceId)).toEqual([thirdDevice]);
+    expect(secondPage.cursor).toBeNull();
+    await store.writeBoothHeartbeat("launch", boothHeartbeat(firstDevice, { pendingCount: 3 }));
+    const refreshed = await store.listBoothHeartbeats("launch", { limit: 100 });
+    expect(refreshed.booths).toHaveLength(3);
+    expect(refreshed.booths.find((record) => record.deviceId === firstDevice)).toMatchObject({
+      pendingCount: 3,
+      stale: false,
+      lastSeenAt: now.toISOString(),
+    });
+    await expect(store.listBoothHeartbeats("launch", { limit: 101 })).rejects.toBeInstanceOf(TypeError);
+    expect((await photos.list()).objects).toHaveLength(0);
+  });
+
+  test("isolates heartbeats by Event and fails closed on malformed or future private records", async () => {
+    const deviceId = "018f0000-0000-4000-8000-000000000001";
+    const photos = new InMemoryObjectStore();
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(photos, state, "https://photos.example", () => new Date("2026-07-24T00:00:00.000Z"));
+    await store.writeBoothHeartbeat("launch", boothHeartbeat(deviceId));
+    await store.writeBoothHeartbeat("other", boothHeartbeat(deviceId, { pendingCount: 9 }));
+
+    expect((await store.listBoothHeartbeats("launch", {})).booths).toMatchObject([{ deviceId, pendingCount: 0 }]);
+    expect((await store.listBoothHeartbeats("other", {})).booths).toMatchObject([{ deviceId, pendingCount: 9 }]);
+    expect(state.has(boothHeartbeatKey("launch", deviceId))).toBe(true);
+    expect(state.has(boothHeartbeatKey("other", deviceId))).toBe(true);
+    state.set(boothHeartbeatKey("launch", "018f0000-0000-4000-8000-000000000004"), "not json");
+    await expect(store.listBoothHeartbeats("launch", {})).rejects.toThrow("booth heartbeat");
+
+    const futureState = new InMemoryObjectStore({
+      [boothHeartbeatKey("launch", deviceId)]: JSON.stringify({
+        ...boothHeartbeat(deviceId),
+        version: 2,
+        lastSeenAt: "2026-07-24T00:00:00.000Z",
+      }),
+    });
+    const futureStore = new EventStore(photos, futureState, "https://photos.example");
+    await expect(futureStore.listBoothHeartbeats("launch", {})).rejects.toThrow("booth heartbeat");
+    expect((await photos.list()).objects).toHaveLength(0);
+  });
+
+  test("returns an unpaused default without writing and stores bounded localized pause state privately", async () => {
+    const now = new Date("2026-07-24T00:00:00.000Z");
+    const photos = new InMemoryObjectStore();
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(photos, state, "https://photos.example", () => now);
+
+    expect(await store.readBoothOperationalState("launch")).toEqual({
+      version: 1,
+      paused: false,
+      updatedAt: now.toISOString(),
+    });
+    expect(state.has(boothOperationalStateKey("launch"))).toBe(false);
+    const written = await store.writeBoothOperationalState("launch", {
+      paused: true,
+      messages: { en: "The Booth is briefly paused.", "zh-SG": "暂时暂停" },
+    });
+    expect(written).toEqual({
+      version: 1,
+      paused: true,
+      messages: { en: "The Booth is briefly paused.", "zh-SG": "暂时暂停" },
+      updatedAt: now.toISOString(),
+    });
+    expect(await store.readBoothOperationalState("launch")).toEqual(written);
+    expect((await photos.list()).objects).toHaveLength(0);
+
+    state.set(boothOperationalStateKey("other"), JSON.stringify({ version: 2, paused: false, updatedAt: now.toISOString() }));
+    await expect(store.readBoothOperationalState("other")).rejects.toThrow("booth operational state");
   });
 });

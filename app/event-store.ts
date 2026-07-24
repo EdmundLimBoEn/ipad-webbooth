@@ -13,6 +13,18 @@ import {
   type EventConfig,
   type EventExperience,
 } from "./event-config";
+import {
+  BOOTH_STALE_AFTER_MS,
+  parseBoothHeartbeat,
+  parseBoothHeartbeatRecord,
+  parseBoothOperationalState,
+  parseBoothOperationalStateInput,
+  type AdminBoothRecord,
+  type BoothHeartbeatInput,
+  type BoothHeartbeatRecord,
+  type BoothOperationalState,
+  type BoothOperationalStateInput,
+} from "./booth-control";
 import type { StableCaptureIdentity, StableUpload } from "./upload-contract";
 export { canonicalEvent, InvalidEventSlugError, slugifyEvent } from "./event-identity";
 export { EVENT_CONFIG_VERSION };
@@ -225,6 +237,11 @@ export const eventConfigRevisionKey = (event: string, id: string) =>
   `${eventConfigRevisionPrefix(event)}${id}.json`;
 export const eventConfigMutationKey = (event: string, mutationId: string) =>
   `events/${event}/config-mutations/${mutationId}.json`;
+export const boothHeartbeatKey = (event: string, deviceId: string) =>
+  `events/${event}/booths/${deviceId}.json`;
+export const boothHeartbeatPrefix = (event: string) => `events/${event}/booths/`;
+export const boothOperationalStateKey = (event: string) =>
+  `events/${event}/booth-state.json`;
 export const legacyEventConfigKey = (event: string) => `_config/${event}.json`;
 export const eventPhotoPrefix = (event: string) => `${event}/`;
 export const stablePhotoKey = (event: string, id: StableCaptureIdentity) =>
@@ -273,6 +290,8 @@ export type ConfigHistory = {
   currentRevisionId: string | null;
   revisions: ConfigRevision[];
 };
+export type BoothHeartbeatListOptions = { cursor?: string | null; limit?: number };
+export type BoothHeartbeatPage = { booths: AdminBoothRecord[]; cursor: string | null };
 
 export class ConfigConflictError extends Error {
   constructor(readonly expectedRevisionId: string | null, readonly currentRevisionId: string | null) {
@@ -317,6 +336,18 @@ export class PhotoIndexWriteError extends Error {
 export class InvalidPhotoCursorError extends Error {
   constructor() {
     super("photo feed cursor is invalid for this Event");
+  }
+}
+
+export class InvalidStoredBoothHeartbeatError extends Error {
+  constructor(readonly event: string) {
+    super(`stored booth heartbeat for ${event} is corrupt or uses an unsupported version`);
+  }
+}
+
+export class InvalidStoredBoothOperationalStateError extends Error {
+  constructor(readonly event: string) {
+    super(`stored booth operational state for ${event} is corrupt or uses an unsupported version`);
   }
 }
 
@@ -572,6 +603,73 @@ export class EventStore {
     await this.tryWritePhotoFeedRecord(event, key, metadata);
     const receiptStored = await this.tryWritePhotoReceipt(event, key, metadata);
     return { ...photo, indexStored, receiptStored };
+  }
+
+  async writeBoothHeartbeat(event: string, input: BoothHeartbeatInput): Promise<BoothHeartbeatRecord> {
+    const heartbeat = parseBoothHeartbeat(input);
+    if (!heartbeat) throw new TypeError("invalid booth heartbeat");
+    const record: BoothHeartbeatRecord = { ...heartbeat, lastSeenAt: this.now().toISOString() };
+    await this.state.put(boothHeartbeatKey(event, record.deviceId), JSON.stringify(record), jsonWriteOptions());
+    return record;
+  }
+
+  async listBoothHeartbeats(
+    event: string,
+    options: BoothHeartbeatListOptions = {}
+  ): Promise<BoothHeartbeatPage> {
+    const limit = options.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new TypeError("booth heartbeat limit must be an integer from 1 to 100");
+    }
+    const cursor = options.cursor ?? undefined;
+    if (cursor !== undefined && (typeof cursor !== "string" || cursor.length === 0 || cursor.length > 2048)) {
+      throw new TypeError("booth heartbeat cursor is invalid");
+    }
+    const page = await this.state.list({
+      prefix: boothHeartbeatPrefix(event),
+      ...(cursor !== undefined ? { cursor } : {}),
+      limit,
+    });
+    const now = this.now().getTime();
+    const booths = await Promise.all(page.objects.map(async (object): Promise<AdminBoothRecord> => {
+      const record = await this.readBoothHeartbeat(event, object.key);
+      return {
+        ...record,
+        stale: now - Date.parse(record.lastSeenAt) >= BOOTH_STALE_AFTER_MS,
+      };
+    }));
+    return { booths, cursor: page.truncated ? page.cursor ?? null : null };
+  }
+
+  async readBoothOperationalState(event: string): Promise<BoothOperationalState> {
+    const object = await this.state.get(boothOperationalStateKey(event));
+    if (!object) {
+      return { version: 1, paused: false, updatedAt: this.now().toISOString() };
+    }
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredBoothOperationalStateError(event);
+    }
+    const state = parseBoothOperationalState(value);
+    if (!state) throw new InvalidStoredBoothOperationalStateError(event);
+    return state;
+  }
+
+  async writeBoothOperationalState(
+    event: string,
+    input: BoothOperationalStateInput
+  ): Promise<BoothOperationalState> {
+    const operational = parseBoothOperationalStateInput(input);
+    if (!operational) throw new TypeError("invalid booth operational state");
+    const state: BoothOperationalState = {
+      version: 1,
+      ...operational,
+      updatedAt: this.now().toISOString(),
+    };
+    await this.state.put(boothOperationalStateKey(event), JSON.stringify(state), jsonWriteOptions());
+    return state;
   }
 
   async listPhotos(event: string, after: string | null = null): Promise<PhotoFeed> {
@@ -1123,6 +1221,22 @@ export class EventStore {
     } catch {
       return false;
     }
+  }
+
+  private async readBoothHeartbeat(event: string, key: string): Promise<BoothHeartbeatRecord> {
+    const object = await this.state.get(key);
+    if (!object) throw new InvalidStoredBoothHeartbeatError(event);
+    let value: unknown;
+    try {
+      value = await object.json<unknown>();
+    } catch {
+      throw new InvalidStoredBoothHeartbeatError(event);
+    }
+    const record = parseBoothHeartbeatRecord(value);
+    if (!record || key !== boothHeartbeatKey(event, record.deviceId)) {
+      throw new InvalidStoredBoothHeartbeatError(event);
+    }
+    return record;
   }
 
   private async readJson(store: ObjectStore, key: string): Promise<unknown | null> {
