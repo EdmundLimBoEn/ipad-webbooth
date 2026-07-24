@@ -85,3 +85,35 @@ export function applyDocumentLocale(
   documentElement.lang = locale;
   documentElement.dir = localeDirection(locale);
 }
+
+type DocumentLocaleRoot = Pick<HTMLElement, "lang" | "dir">;
+
+export class DocumentLocaleLease {
+  private readonly originalLang: string;
+  private readonly originalDir: string;
+  private activeEvent: string | null = null;
+
+  constructor(private readonly documentElement: DocumentLocaleRoot) {
+    this.originalLang = documentElement.lang;
+    this.originalDir = documentElement.dir;
+  }
+
+  apply(event: string, locale: SupportedLocale): void {
+    this.activeEvent = event;
+    applyDocumentLocale(this.documentElement, locale);
+  }
+
+  restore(event?: string): boolean {
+    if (
+      this.activeEvent === null
+      || (event !== undefined && event !== this.activeEvent)
+    ) {
+      return false;
+    }
+
+    this.documentElement.lang = this.originalLang;
+    this.documentElement.dir = this.originalDir;
+    this.activeEvent = null;
+    return true;
+  }
+}

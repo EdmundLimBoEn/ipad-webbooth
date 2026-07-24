@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   applyDocumentLocale,
+  DocumentLocaleLease,
   deviceLocaleStorageKey,
   resolveDeviceLocale,
   resolveEnabledLocales,
@@ -127,5 +128,23 @@ describe("guest locale resolution", () => {
     expect(root).toEqual({ lang: "ar", dir: "rtl" });
     applyDocumentLocale(root, "zh-SG");
     expect(root).toEqual({ lang: "zh-SG", dir: "ltr" });
+  });
+
+  test("restores prior document language only for the active Event or unmount", () => {
+    const root = { lang: "fr", dir: "ltr" };
+    const lease = new DocumentLocaleLease(root);
+
+    lease.apply("launch", "ar");
+    expect(root).toEqual({ lang: "ar", dir: "rtl" });
+    expect(lease.restore("other-event")).toBe(false);
+    expect(root).toEqual({ lang: "ar", dir: "rtl" });
+
+    expect(lease.restore("launch")).toBe(true);
+    expect(root).toEqual({ lang: "fr", dir: "ltr" });
+
+    lease.apply("wedding", "zh-SG");
+    expect(root).toEqual({ lang: "zh-SG", dir: "ltr" });
+    expect(lease.restore()).toBe(true);
+    expect(root).toEqual({ lang: "fr", dir: "ltr" });
   });
 });

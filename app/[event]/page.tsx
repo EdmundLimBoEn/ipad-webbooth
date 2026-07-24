@@ -82,7 +82,7 @@ import {
 } from "./booth-session/handoff";
 import { HandoffPanel } from "./handoff-panel";
 import {
-  applyDocumentLocale,
+  DocumentLocaleLease,
   deviceLocaleStorageKey,
   resolveDeviceLocale,
   resolveEnabledLocales,
@@ -183,6 +183,7 @@ export default function Booth() {
   const captureFlowRef = useRef(INITIAL_CAPTURE_FLOW_STATE);
   const acceptingCandidatesRef = useRef(new Set<string>());
   const tonesRef = useRef(new CountdownToneController());
+  const documentLocaleRef = useRef<DocumentLocaleLease | null>(null);
   const [status, setStatus] = useState<Status>("starting");
   const [accessState, setAccessState] = useState<BoothAccessState>("locked");
   const [accessFeedback, setAccessFeedback] =
@@ -348,6 +349,7 @@ export default function Booth() {
         ),
       onReset: () => {
         const initial = createBoothOperationalSessionState(Date.now());
+        documentLocaleRef.current?.restore(event);
         pauseBoundary.reset();
         clearFrame();
         operationalRef.current = initial.operational;
@@ -383,7 +385,10 @@ export default function Booth() {
       onFrames: setEnabled,
       onExperience: (nextExperience) => {
         setExperience(nextExperience);
-        if (!nextExperience) return;
+        if (!nextExperience) {
+          documentLocaleRef.current?.restore(event);
+          return;
+        }
         let storedLocale: string | null = null;
         try {
           storedLocale = window.localStorage.getItem(
@@ -400,7 +405,10 @@ export default function Booth() {
           navigatorLanguages: navigator.languages,
         });
         setLocale(nextLocale);
-        applyDocumentLocale(document.documentElement, nextLocale);
+        documentLocaleRef.current ??= new DocumentLocaleLease(
+          document.documentElement,
+        );
+        documentLocaleRef.current.apply(event, nextLocale);
       },
       onOperationalState: (value) => {
         const state = parseBoothOperationalState(value);
@@ -499,6 +507,13 @@ export default function Booth() {
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
   }, [durableHandoffActive, status, uploadState.pendingCount]);
+
+  useEffect(
+    () => () => {
+      documentLocaleRef.current?.restore(event);
+    },
+    [event],
+  );
 
   // grab the current video frame, mirrored to match the preview, at full res
   const grabFrame = useCallback((): HTMLCanvasElement => {
@@ -947,7 +962,10 @@ export default function Booth() {
     } catch {
       // Accessing storage itself can be denied in a restricted browser.
     }
-    applyDocumentLocale(document.documentElement, nextLocale);
+    documentLocaleRef.current ??= new DocumentLocaleLease(
+      document.documentElement,
+    );
+    documentLocaleRef.current.apply(event, nextLocale);
   };
 
   const changeFrame = () => {
@@ -1071,12 +1089,12 @@ export default function Booth() {
           <label className={styles.fileBtn}>
             {label("takePhoto")}
             <input
+              className={styles.fileInput}
               type="file"
               accept="image/*"
               capture="user"
               onChange={onFile}
               disabled={accessState !== "ready" || operational.paused}
-              hidden
             />
           </label>
         </div>

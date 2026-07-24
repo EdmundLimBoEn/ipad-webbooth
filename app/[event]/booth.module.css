@@ -239,6 +239,8 @@
 }
 
 .fileBtn {
+  position: relative;
+  overflow: hidden;
   display: inline-flex;
   min-height: 56px;
   align-items: center;
@@ -352,6 +354,19 @@
   text-align: center;
   text-decoration: none;
   cursor: pointer;
+}
+
+.fileInput {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.fileInput:disabled {
+  cursor: not-allowed;
 }
 
 .reviewActions .reviewPrimary,

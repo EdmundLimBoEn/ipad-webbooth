@@ -27,8 +27,16 @@ export class CountdownToneController {
       this.active = this.context.state === "running";
       return this.active;
     } catch {
+      const context = this.context;
       this.active = false;
-      this.context = null;
+      if (context && context.state !== "closed") {
+        try {
+          await context.close();
+        } catch {
+          // Audio is optional; cleanup failure must not block the booth.
+        }
+      }
+      if (this.context === context) this.context = null;
       return false;
     }
   }

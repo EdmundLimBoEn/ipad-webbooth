@@ -134,6 +134,17 @@ describe("Booth page safety wiring", () => {
     expect(source).toContain("await lifecycle.leaveEvent(session)");
     expect(source).not.toContain("await sessionRef.current?.stop()");
   });
+
+  test("keeps the file-camera input keyboard and switch accessible", async () => {
+    const source = await Bun.file(`${import.meta.dir}/page.tsx`).text();
+    const css = await Bun.file(`${import.meta.dir}/booth.module.css`).text();
+
+    expect(source).toContain("className={styles.fileInput}");
+    expect(source).not.toContain("disabled={accessState !== \"ready\" || operational.paused}\n              hidden");
+    expect(css).toContain(".fileInput");
+    expect(css).toContain(".fileBtn:focus-within");
+    expect(css).toContain("min-height: 56px");
+  });
 });
 
 describe("Booth unlock presentation", () => {

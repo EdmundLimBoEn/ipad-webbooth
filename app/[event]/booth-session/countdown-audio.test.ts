@@ -79,6 +79,21 @@ describe("CountdownToneController", () => {
     }).not.toThrow();
   });
 
+  test("resume rejection closes the allocated context before forgetting it", async () => {
+    const harness = audioHarness();
+    harness.context.resume = async () => {
+      throw new DOMException("gesture rejected", "NotAllowedError");
+    };
+    const tones = new CountdownToneController(
+      () => harness.context as unknown as AudioContext,
+    );
+
+    await expect(tones.activate()).resolves.toBe(false);
+    expect(harness.closes()).toBe(1);
+    await tones.dispose();
+    expect(harness.closes()).toBe(1);
+  });
+
   test("dispose closes the context and permanently releases it", async () => {
     const harness = audioHarness();
     const tones = new CountdownToneController(() => harness.context as unknown as AudioContext);
