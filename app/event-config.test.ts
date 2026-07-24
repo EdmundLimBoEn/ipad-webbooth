@@ -68,6 +68,36 @@ describe("event config schema", () => {
     expect(parseConfigRevision({ ...base, config: { frames: ["square"], boothKeyHash: "leak" } })).toBeNull();
   });
 
+  test("revision parsing rejects top-level credentials", () => {
+    expect(parseConfigRevision({
+      version: 1,
+      id: "018f0000-0000-7000-8000-000000000001",
+      createdAt: "2026-07-24T00:00:00.000Z",
+      parentRevisionId: null,
+      reason: "baseline",
+      boothKeyHash: "leak",
+      config: { frames: ["square"] },
+    })).toBeNull();
+  });
+
+  test("revision parsing rejects invalid source IDs", () => {
+    const base = {
+      version: 1,
+      id: "018f0000-0000-7000-8000-000000000001",
+      createdAt: "2026-07-24T00:00:00.000Z",
+      parentRevisionId: null,
+      reason: "baseline",
+      config: { frames: ["square"] },
+    };
+    expect(parseConfigRevision({ ...base, sourceRevisionId: "../revision" })).toBeNull();
+    expect(parseConfigRevision({ ...base, sourcePresetId: "preset<script>" })).toBeNull();
+  });
+
+  test("rejects array capture and gallery settings", () => {
+    expect(parseEventConfig({ version: 1, frames: [], capture: [] })).toBeNull();
+    expect(parseEventConfig({ version: 1, frames: [], gallery: [] })).toBeNull();
+  });
+
   test("accepts UUID mutation/revision IDs only", () => {
     expect(isRevisionId("018f0000-0000-7000-8000-000000000001")).toBe(true);
     expect(isRevisionId("../config")).toBe(false);

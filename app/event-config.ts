@@ -52,13 +52,13 @@ function parseExperience(value: unknown): EventExperience | null {
   if (v.timeZone !== undefined && (typeof v.timeZone !== "string" || v.timeZone.length > 128)) return null;
 
   const capture = v.capture as Record<string, unknown> | undefined;
-  if (capture !== undefined && (!capture || typeof capture !== "object")) return null;
+  if (capture !== undefined && (!capture || typeof capture !== "object" || Array.isArray(capture))) return null;
   if (capture?.reviewEnabled !== undefined && typeof capture.reviewEnabled !== "boolean") return null;
   if (capture?.countdownAudioDefault !== undefined && typeof capture.countdownAudioDefault !== "boolean") return null;
   if (capture?.autoAcceptSeconds !== undefined && (typeof capture.autoAcceptSeconds !== "number" || !Number.isInteger(capture.autoAcceptSeconds) || capture.autoAcceptSeconds < 1 || capture.autoAcceptSeconds > 30)) return null;
 
   const gallery = v.gallery as Record<string, unknown> | undefined;
-  if (gallery !== undefined && (!gallery || typeof gallery !== "object")) return null;
+  if (gallery !== undefined && (!gallery || typeof gallery !== "object" || Array.isArray(gallery))) return null;
   if (gallery?.title !== undefined && (typeof gallery.title !== "string" || gallery.title.length > 120)) return null;
   if (gallery?.accentColor !== undefined && (typeof gallery.accentColor !== "string" || !HEX_COLOR.test(gallery.accentColor))) return null;
 
@@ -93,9 +93,21 @@ export function parseConfigRevision(value: unknown): ConfigRevision | null {
   if (v.version !== 1 || !isRevisionId(v.id) || typeof v.createdAt !== "string") return null;
   if (v.parentRevisionId !== null && !isRevisionId(v.parentRevisionId)) return null;
   if (!["baseline", "save", "restore", "preset"].includes(String(v.reason))) return null;
+  if (v.boothKeyHash !== undefined) return null;
+  if (v.sourceRevisionId !== undefined && !isRevisionId(v.sourceRevisionId)) return null;
+  if (v.sourcePresetId !== undefined && (typeof v.sourcePresetId !== "string" || !TOKEN.test(v.sourcePresetId))) return null;
   const config = parseExperience(v.config);
   if (!config || (v.config as Record<string, unknown>).boothKeyHash !== undefined) return null;
-  return { ...v, config } as ConfigRevision;
+  return {
+    version: EVENT_CONFIG_VERSION,
+    id: v.id,
+    createdAt: v.createdAt,
+    parentRevisionId: v.parentRevisionId,
+    reason: v.reason as ConfigRevision["reason"],
+    ...(typeof v.sourceRevisionId === "string" ? { sourceRevisionId: v.sourceRevisionId } : {}),
+    ...(typeof v.sourcePresetId === "string" ? { sourcePresetId: v.sourcePresetId } : {}),
+    config,
+  };
 }
 
 export function projectPublicConfig(config: EventConfig | null): PublicEventConfig {
