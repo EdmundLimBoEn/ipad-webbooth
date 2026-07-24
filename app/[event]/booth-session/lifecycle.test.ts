@@ -342,6 +342,25 @@ describe("Booth lifecycle coordination", () => {
     ]);
   });
 
+  test("credential-only rejection preserves the exact Outbox auth item for resume", async () => {
+    const stopping = deferred<void>();
+    const session = new FakeSession();
+    session.stopWork = stopping.promise;
+    const h = harness({ stored: { launch: "initial-key" } });
+    await h.coordinator.beginEvent("launch", session, credential());
+
+    void h.coordinator.authRequired(session, "auth-photo");
+    void h.coordinator.authRequired(session);
+    const unlocking = h.coordinator.unlock("replacement-key");
+    await Promise.resolve();
+    expect(session.actions).not.toContain("resume-auth:auth-photo");
+
+    stopping.resolve();
+    await unlocking;
+
+    expect(session.actions.at(-1)).toBe("resume-auth:auth-photo");
+  });
+
   test("fresh-page recovery resumes a persisted auth oldest item and drains FIFO", async () => {
     const store = new MemoryOutboxStore();
     await store.put({

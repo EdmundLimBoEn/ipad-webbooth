@@ -393,7 +393,7 @@ export default function Booth() {
     const reporter = new BoothHeartbeatReporter({
       event,
       boothKey: () => credential.key,
-      onAuthRequired: () => lifecycle.authRequired(session, ""),
+      onAuthRequired: () => lifecycle.authRequired(session),
     });
     heartbeatReporterRef.current = reporter;
     const entering = lifecycle.beginEvent(event, session, credential);

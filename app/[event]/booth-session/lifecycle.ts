@@ -169,10 +169,10 @@ export class BoothLifecycleCoordinator<Result> {
     return this.checkCredential(active, active.key);
   }
 
-  authRequired(session: BoothLifecycleSession, itemId: string) {
+  authRequired(session: BoothLifecycleSession, itemId?: string) {
     const active = this.active;
     if (!active || active.session !== session) return Promise.resolve();
-    active.authBlockedItemId = itemId;
+    if (itemId !== undefined) active.authBlockedItemId = itemId;
     return this.relock(active);
   }
 
