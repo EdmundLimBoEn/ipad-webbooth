@@ -694,7 +694,7 @@ export class EventStore {
       await this.ensurePhotoFeedHeadCommitted(event, head.head);
       if (await this.hasValidPhotoFeedMarker(event, key, entryKey)) return;
 
-      const existingClaim = await this.readPhotoFeedClaim(event, key, entryKey);
+      let existingClaim = await this.readPhotoFeedClaim(event, key, entryKey);
       if (!existingClaim) {
         const candidate = this.photoFeedClaimForHead(event, entryKey, head.head);
         const claimed = await this.state.compareAndSwap(
@@ -704,30 +704,43 @@ export class EventStore {
           jsonWriteOptions()
         );
         if (!claimed) continue;
-        // The claim is durable before either its node or the Event head. A
-        // lost acknowledgement here is finalized by the next exact retry.
-        continue;
+        // The claim is durable before either its node or the Event head.
+        // Finalize it in this same logical attempt; a crash after the claim
+        // remains recoverable by the next caller reading this exact record.
+        const outcome = await this.finalizePhotoFeedClaim(event, key, entry, candidate);
+        if (outcome === "committed") return;
+        if (outcome === "retry") continue;
+        existingClaim = await this.readPhotoFeedClaim(event, key, entryKey);
+        if (!existingClaim || !samePhotoFeedClaim(existingClaim.claim, candidate)) continue;
+      } else {
+        const outcome = await this.finalizePhotoFeedClaim(
+          event,
+          key,
+          entry,
+          existingClaim.claim
+        );
+        if (outcome === "committed") return;
+        if (outcome === "retry") continue;
       }
-
-      const outcome = await this.finalizePhotoFeedClaim(
-        event,
-        key,
-        entry,
-        existingClaim.claim
-      );
-      if (outcome === "committed") return;
-      if (outcome === "retry") continue;
 
       const current = await this.readPhotoFeedHead(event);
       await this.ensurePhotoFeedHeadCommitted(event, current.head);
       if (await this.hasValidPhotoFeedMarker(event, key, entryKey)) return;
       const replacement = this.photoFeedClaimForHead(event, entryKey, current.head);
-      await this.state.compareAndSwap(
+      const replaced = await this.state.compareAndSwap(
         photoFeedClaimKey(event, key),
         existingClaim.etag,
         JSON.stringify(replacement),
         jsonWriteOptions()
       );
+      if (!replaced) continue;
+      const replacementOutcome = await this.finalizePhotoFeedClaim(
+        event,
+        key,
+        entry,
+        replacement
+      );
+      if (replacementOutcome === "committed") return;
     }
     throw new Error("photo feed append contention exceeded retry budget");
   }
@@ -1666,6 +1679,14 @@ function samePhotoFeedNode(left: PrivatePhotoFeedNode, right: PrivatePhotoFeedNo
   return left.version === right.version
     && left.sequence === right.sequence
     && left.entryKey === right.entryKey
+    && left.previousNodeKey === right.previousNodeKey;
+}
+
+function samePhotoFeedClaim(left: PrivatePhotoFeedClaim, right: PrivatePhotoFeedClaim): boolean {
+  return left.version === right.version
+    && left.entryKey === right.entryKey
+    && left.nodeKey === right.nodeKey
+    && left.sequence === right.sequence
     && left.previousNodeKey === right.previousNodeKey;
 }
 

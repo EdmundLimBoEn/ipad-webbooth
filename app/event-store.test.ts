@@ -1387,6 +1387,32 @@ describe("EventStore", () => {
     expect(new Set(delta.photos.map((photo) => photo.key)).size).toBe(2);
   });
 
+  test("commits nine concurrent distinct arrivals without exhausting the append budget", async () => {
+    const state = new InMemoryObjectStore();
+    const store = new EventStore(new InMemoryObjectStore(), state, "https://photos.example");
+    const before = await store.listPhotos("launch");
+
+    const uploads = await Promise.all(Array.from({ length: 9 }, (_, index) =>
+      store.putPhoto("launch", new Uint8Array([index]).buffer, {
+        upload: {
+          captureId: `018f0000-0000-4000-8000-${String(140 + index).padStart(12, "0")}`,
+          capturedAt: 1753315200040 + index,
+        },
+      })
+    ));
+    const delta = await store.listPhotos("launch", before.cursor);
+    const committed = await state.list({
+      prefix: "events/launch/photo-feed/v1/committed/",
+    });
+
+    expect(delta.photos).toHaveLength(9);
+    expect(new Set(delta.photos.map((photo) => photo.key))).toEqual(
+      new Set(uploads.map((photo) => photo.key))
+    );
+    expect(decodePhotoFeedCursor(delta.cursor!).sequence).toBe(9);
+    expect(committed.objects).toHaveLength(9);
+  });
+
   test("takes a feed-head waterline before the initial public scan", async () => {
     const photos = new WaterlinePhotoStore();
     const store = new EventStore(photos, new InMemoryObjectStore(), "https://photos.example");
