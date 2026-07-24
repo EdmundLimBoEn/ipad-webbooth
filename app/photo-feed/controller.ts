@@ -101,9 +101,15 @@ function unitRandom(value: number): number {
   return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
 }
 
-function quietDelay(profile: FeedProfile, random: number): number {
+function quietDelay(profile: FeedProfile, quietCount: number, random: number): number {
   const range = Math.max(0, profile.quietMaxMs - profile.quietMinMs);
-  return Math.round(profile.quietMinMs + range * unitRandom(random));
+  const step = range / 3;
+  const floor = Math.min(
+    profile.quietMaxMs,
+    profile.quietMinMs + step * Math.max(0, quietCount - 1),
+  );
+  const ceiling = Math.min(profile.quietMaxMs, floor + step);
+  return Math.round(floor + (ceiling - floor) * unitRandom(random));
 }
 
 function errorDelay(profile: FeedProfile, failures: number, random: number): number {
@@ -192,7 +198,7 @@ export function reducePhotoFeed(
       const delayMs =
         merged.inserted.length > 0
           ? event.profile.activeMs
-          : quietDelay(event.profile, event.random);
+          : quietDelay(event.profile, quietCount, event.random);
       return {
         state: next,
         effects: next.visible ? [{ type: "schedule", delayMs }] : [],

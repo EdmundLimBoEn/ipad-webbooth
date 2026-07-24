@@ -183,17 +183,23 @@ describe("reducePhotoFeed", () => {
     });
     expect(result.effects).toEqual([{ type: "schedule", delayMs: 2_000 }]);
 
-    state = reducePhotoFeed(result.state, { type: "timer" }).state;
-    result = reducePhotoFeed(state, {
-      type: "request-success",
-      requestId: 2,
-      generation: 0,
-      photos: [],
-      cursor: null,
-      profile: PROJECTOR_FEED_PROFILE,
-      random: 1,
-    });
-    expect(result.effects).toEqual([{ type: "schedule", delayMs: 20_000 }]);
+    const quietDelays: number[] = [];
+    for (let requestId = 2; requestId <= 5; requestId += 1) {
+      state = reducePhotoFeed(result.state, { type: "timer" }).state;
+      result = reducePhotoFeed(state, {
+        type: "request-success",
+        requestId,
+        generation: 0,
+        photos: [],
+        cursor: null,
+        profile: PROJECTOR_FEED_PROFILE,
+        random: 0,
+      });
+      quietDelays.push(
+        (result.effects[0] as { type: "schedule"; delayMs: number }).delayMs,
+      );
+    }
+    expect(quietDelays).toEqual([10_000, 13_333, 16_667, 20_000]);
 
     state = {
       ...reducePhotoFeed(result.state, { type: "timer" }).state,
@@ -201,7 +207,7 @@ describe("reducePhotoFeed", () => {
     };
     result = reducePhotoFeed(state, {
       type: "request-error",
-      requestId: 3,
+      requestId: 6,
       generation: 0,
       error: "still offline",
       profile: PROJECTOR_FEED_PROFILE,

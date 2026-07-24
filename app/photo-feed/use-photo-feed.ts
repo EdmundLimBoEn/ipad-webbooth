@@ -69,8 +69,10 @@ function browserProviders(): PhotoFeedRuntimeProviders {
       clearTimeout: (handle) => window.clearTimeout(handle as number),
     },
     visibility: {
-      isVisible: () => document.visibilityState !== "hidden",
+      isVisible: () =>
+        typeof document === "undefined" || document.visibilityState !== "hidden",
       subscribe(listener) {
+        if (typeof document === "undefined") return () => {};
         document.addEventListener("visibilitychange", listener);
         return () => document.removeEventListener("visibilitychange", listener);
       },
@@ -266,14 +268,21 @@ export function usePhotoFeed(
   profile: FeedProfile,
   providers?: PhotoFeedRuntimeProviders,
 ): PhotoFeedSnapshot & { refresh(): void } {
+  const resolvedProviders = useMemo(
+    () => providers ?? browserProviders(),
+    [providers],
+  );
   const runtime = useMemo(
-    () => new PhotoFeedRuntime(event, profile, providers ?? browserProviders()),
-    [event, profile, providers],
+    () => new PhotoFeedRuntime(event, profile, resolvedProviders),
+    [profile, resolvedProviders],
   );
   useEffect(() => {
     runtime.start();
     return () => runtime.dispose();
   }, [runtime]);
+  useEffect(() => {
+    runtime.setEvent(event);
+  }, [event, runtime]);
   const snapshot = useSyncExternalStore(runtime.subscribe, runtime.snapshot, runtime.snapshot);
   return { ...snapshot, refresh: runtime.refresh };
 }

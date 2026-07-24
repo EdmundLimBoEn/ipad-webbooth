@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { PhotoFeedRuntime, type PhotoFeedRuntimeProviders } from "./use-photo-feed";
+import { createElement } from "react";
+import { renderToString } from "react-dom/server";
+import {
+  PhotoFeedRuntime,
+  usePhotoFeed,
+  type PhotoFeedRuntimeProviders,
+} from "./use-photo-feed";
 import { PROJECTOR_FEED_PROFILE } from "./controller";
 
 function deferred<T>() {
@@ -66,6 +72,15 @@ function harness() {
 }
 
 describe("PhotoFeedRuntime", () => {
+  test("the production hook is safe during Next server rendering", () => {
+    function Probe() {
+      const feed = usePhotoFeed("show", PROJECTOR_FEED_PROFILE);
+      return createElement("span", null, feed.status);
+    }
+
+    expect(() => renderToString(createElement(Probe))).not.toThrow();
+  });
+
   test("validates a response and exposes latest inserted photos", async () => {
     const h = harness();
     const runtime = new PhotoFeedRuntime("show", PROJECTOR_FEED_PROFILE, h.providers);
