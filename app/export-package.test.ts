@@ -45,6 +45,18 @@ describe("event package rows", () => {
     expect(rows[0]?.key).toBe("launch/1753315200000-normal.jpg");
   });
 
+  test("keeps collision suffixes inside the archive filename limit", () => {
+    const filename = `${"a".repeat(156)}.jpg`;
+    const rows = preparePackageRows([
+      source(`launch/${filename}`),
+      source(`launch/duplicate/${filename}`),
+    ], () => undefined);
+
+    expect(rows[0]!.filename).toHaveLength(160);
+    expect(rows[1]!.filename).toHaveLength(160);
+    expect(rows[1]!.filename).toBe(`${"a".repeat(154)}-2.jpg`);
+  });
+
   test("uses receipt, filename, then upload timestamps and allowlisted metadata", () => {
     const rows = preparePackageRows([
       source("launch/1753315200000-first.jpg", {

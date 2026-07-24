@@ -46,6 +46,8 @@ export type ExportSummaryV1 = {
   busiestPeriods: Array<{ period: string; count: number }>;
 };
 
+const MAX_ARCHIVE_FILENAME_LENGTH = 160;
+
 function validEpoch13(value: unknown): value is number {
   return typeof value === "number"
     && Number.isSafeInteger(value)
@@ -60,10 +62,10 @@ function originalBasename(key: string): string {
 function sanitizeFilename(value: string): string {
   let safe = value.replace(/[^A-Za-z0-9._-]/gu, "_");
   if (safe === "" || safe === "." || safe === "..") safe = "photo";
-  if (safe.length > 160) {
+  if (safe.length > MAX_ARCHIVE_FILENAME_LENGTH) {
     const dot = safe.lastIndexOf(".");
     const extension = dot > 0 && safe.length - dot <= 16 ? safe.slice(dot) : "";
-    safe = `${safe.slice(0, 160 - extension.length)}${extension}`;
+    safe = `${safe.slice(0, MAX_ARCHIVE_FILENAME_LENGTH - extension.length)}${extension}`;
   }
   return safe;
 }
@@ -79,7 +81,11 @@ function uniqueFilename(candidate: string, emitted: Set<string>): string {
   const stem = hasExtension ? candidate.slice(0, dot) : candidate;
   const extension = hasExtension ? candidate.slice(dot) : "";
   for (let suffix = 2; ; suffix += 1) {
-    const next = `${stem}-${suffix}${extension}`;
+    const suffixText = `-${suffix}`;
+    const stemLength = MAX_ARCHIVE_FILENAME_LENGTH
+      - suffixText.length
+      - extension.length;
+    const next = `${stem.slice(0, Math.max(1, stemLength))}${suffixText}${extension}`;
     const nextKey = next.toLowerCase();
     if (!emitted.has(nextKey)) {
       emitted.add(nextKey);
