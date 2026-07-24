@@ -19,16 +19,21 @@ export type BoothPreflightResult =
 export interface BoothLifecycleSession {
   recover(): Promise<void>;
   start(): Promise<void> | void;
-  retry(): Promise<void>;
+  resumeAuth(itemId: string): Promise<void>;
   stop(): Promise<void>;
 }
+
+export type BoothCredentialHolder = {
+  key: string;
+};
 
 type ActiveSession = {
   id: number;
   event: string;
   session: BoothLifecycleSession;
+  credential: BoothCredentialHolder;
   key: string;
-  authBlocked: boolean;
+  authBlockedItemId: string | null;
   stopPromise?: Promise<void>;
 };
 
@@ -44,7 +49,6 @@ type BoothLifecycleDependencies<Result> = {
   onOutboxRecovered: () => void;
   onAccess: (state: BoothAccessState, feedback: BoothAccessFeedback) => void;
   onFrames: (frames: string[] | null) => void;
-  onCredential: (key: string) => void;
   onCameraStart: () => void;
   onCameraStop: () => void;
   onUploaded: (result: Result) => void;
@@ -70,22 +74,30 @@ export class BoothLifecycleCoordinator<Result> {
     return this.active?.session === session;
   }
 
-  async beginEvent(event: string, session: BoothLifecycleSession) {
+  async beginEvent(
+    event: string,
+    session: BoothLifecycleSession,
+    credential: BoothCredentialHolder
+  ) {
     const previous = this.active;
     this.preflightController?.abort();
-    if (previous) void this.ensureStopped(previous);
+    if (previous) {
+      previous.credential.key = "";
+      void this.ensureStopped(previous);
+    }
     this.deps.onCameraStop();
+    credential.key = "";
 
     const active: ActiveSession = {
       id: ++this.nextSessionId,
       event,
       session,
+      credential,
       key: "",
-      authBlocked: false,
+      authBlockedItemId: null,
     };
     this.active = active;
     this.deps.onReset(event);
-    this.deps.onCredential("");
     this.deps.onFrames(null);
     this.deps.onAccess("locked", "recovering");
 
@@ -104,7 +116,6 @@ export class BoothLifecycleCoordinator<Result> {
     const stored = this.deps.loadCredential(event);
     if (!stored) return;
     active.key = stored.key;
-    this.deps.onCredential(stored.key);
     await this.checkCredential(active, stored.key);
   }
 
@@ -113,6 +124,7 @@ export class BoothLifecycleCoordinator<Result> {
     if (!active || active.session !== session) return;
     this.active = null;
     this.preflightController?.abort();
+    active.credential.key = "";
     this.deps.onCameraStop();
     await this.ensureStopped(active);
   }
@@ -121,7 +133,6 @@ export class BoothLifecycleCoordinator<Result> {
     const active = this.active;
     if (!active || !key) return Promise.resolve();
     active.key = key;
-    this.deps.onCredential(key);
     return this.checkCredential(active, key);
   }
 
@@ -131,10 +142,10 @@ export class BoothLifecycleCoordinator<Result> {
     return this.checkCredential(active, active.key);
   }
 
-  authRequired(session: BoothLifecycleSession) {
+  authRequired(session: BoothLifecycleSession, itemId: string) {
     const active = this.active;
     if (!active || active.session !== session) return Promise.resolve();
-    active.authBlocked = true;
+    active.authBlockedItemId = itemId;
     return this.relock(active);
   }
 
@@ -165,7 +176,7 @@ export class BoothLifecycleCoordinator<Result> {
     if (!this.isCurrent(active)) return Promise.resolve();
     this.preflightController?.abort();
     active.key = "";
-    this.deps.onCredential("");
+    active.credential.key = "";
     this.deps.clearCredential(active.event);
     this.deps.onFrames(null);
     this.deps.onCameraStop();
@@ -211,18 +222,32 @@ export class BoothLifecycleCoordinator<Result> {
       return;
     }
 
-    if (active.stopPromise) await active.stopPromise;
+    const stopPromise = active.stopPromise;
+    if (stopPromise) {
+      await stopPromise;
+    }
     if (!this.isCurrent(active, preflightId)) return;
 
+    active.credential.key = key;
     this.deps.onFrames(frames);
     this.deps.onAccess("ready", "ready");
-    void Promise.resolve(active.session.start()).catch(() => {
+    let startWork: Promise<void> | void;
+    try {
+      startWork = active.session.start();
+    } catch {
+      return;
+    }
+    if (stopPromise && active.stopPromise === stopPromise) {
+      active.stopPromise = undefined;
+    }
+    void Promise.resolve(startWork).catch(() => {
       // Session state reports upload failures without invalidating preflight.
     });
     this.deps.onCameraStart();
-    if (active.authBlocked) {
-      active.authBlocked = false;
-      await active.session.retry();
+    const authBlockedItemId = active.authBlockedItemId;
+    if (authBlockedItemId) {
+      active.authBlockedItemId = null;
+      await active.session.resumeAuth(authBlockedItemId);
     }
   }
 }

@@ -51,9 +51,12 @@ export function unlockFormReducer(
   return { ...state, key: "" };
 }
 
-function pendingLabel(pendingCount: number) {
+function pendingLabel(pendingCount: number, durable: boolean) {
   if (pendingCount === 0) return "No photos waiting";
-  return `${pendingCount} photo${pendingCount === 1 ? "" : "s"} waiting safely`;
+  const photos = `${pendingCount} photo${pendingCount === 1 ? "" : "s"}`;
+  return durable
+    ? `${photos} waiting safely`
+    : `${photos} waiting in this open page`;
 }
 
 export function BoothUnlock({
@@ -95,7 +98,9 @@ export function BoothUnlock({
     : feedback === "checking"
       ? "Checking Booth access online."
       : feedback === "network"
-        ? "Could not reach Booth service. Pending photos are still safe."
+        ? durable
+          ? "Could not reach Booth service. Pending photos are still safe."
+          : "Could not reach Booth service. Keep this page open; reload recovery is unavailable."
         : feedback === "unavailable"
           ? "This Event is not ready for Booth capture."
           : feedback === "recovering"
@@ -134,7 +139,7 @@ export function BoothUnlock({
         <div className={styles.readinessRail} aria-label="Booth readiness">
           <div data-ready={outboxRecovered}>
             <span>Photo Outbox</span>
-            <strong>{outboxRecovered ? pendingLabel(pendingCount) : "Recovering"}</strong>
+            <strong>{outboxRecovered ? pendingLabel(pendingCount, durable) : "Recovering"}</strong>
           </div>
           <div data-ready={false}>
             <span>Booth access</span>
@@ -159,7 +164,7 @@ export function BoothUnlock({
           role={feedback === "rejected-key" ? "alert" : "status"}
           aria-live={feedback === "rejected-key" ? "assertive" : "polite"}
         >
-          <strong>{pendingLabel(pendingCount)}</strong>
+          <strong>{pendingLabel(pendingCount, durable)}</strong>
           <span>{accessMessage}</span>
           <span>
             {durable

@@ -596,6 +596,7 @@ describe("BoothSession outbox", () => {
   test("persists auth failure before notifying the credential owner", async () => {
     const store = new MemoryOutboxStore();
     let persistedBeforeCallback = false;
+    const notifiedItemIds: string[] = [];
     const session = new BoothSession(
       "party",
       store,
@@ -606,10 +607,11 @@ describe("BoothSession outbox", () => {
       () => "018f0000-0000-4000-8000-000000000001",
       () => 1_000,
       {
-        onAuthRequired: async () => {
+        onAuthRequired: async (itemId) => {
           const [item] = await store.list("party");
           persistedBeforeCallback =
             item.failureKind === "auth" && item.errorClass === "auth";
+          notifiedItemIds.push(itemId);
         },
       }
     );
@@ -620,11 +622,89 @@ describe("BoothSession outbox", () => {
     await session.process();
 
     expect(persistedBeforeCallback).toBe(true);
+    expect(notifiedItemIds).toEqual(["018f0000-0000-4000-8000-000000000001"]);
     expect(await store.list("party")).toMatchObject([{
       attempts: 1,
       failureKind: "auth",
       errorClass: "auth",
     }]);
+  });
+
+  test("resumes only the exact auth-blocked oldest item and preserves FIFO under concurrent calls", async () => {
+    const store = new MemoryOutboxStore();
+    await store.put({
+      id: "auth-oldest",
+      event: "party",
+      blob: photo("auth"),
+      createdAt: 1,
+      attempts: 1,
+      lastError: "expired key",
+      failureKind: "auth",
+      errorClass: "auth",
+    });
+    await store.put({
+      id: "ready-next",
+      event: "party",
+      blob: photo("next"),
+      createdAt: 2,
+      attempts: 0,
+    });
+    const uploads: string[] = [];
+    const session = new BoothSession("party", store, async (item) => {
+      uploads.push(item.id);
+      return { url: `/${item.id}` };
+    });
+
+    await session.start();
+    await Promise.all([
+      session.resumeAuth("auth-oldest"),
+      session.resumeAuth("auth-oldest"),
+    ]);
+
+    expect(uploads).toEqual(["auth-oldest", "ready-next"]);
+    expect(await store.list("party")).toEqual([]);
+    await session.stop();
+  });
+
+  test("does not override a permanent oldest item when the expected auth row was removed", async () => {
+    const store = new MemoryOutboxStore();
+    await store.put({
+      id: "auth-row",
+      event: "party",
+      blob: photo("auth"),
+      createdAt: 1,
+      attempts: 1,
+      lastError: "expired key",
+      failureKind: "auth",
+      errorClass: "auth",
+    });
+    let uploads = 0;
+    const session = new BoothSession("party", store, async () => {
+      uploads++;
+      return { url: "/unexpected" };
+    });
+
+    await session.start();
+    await store.remove("auth-row");
+    await store.put({
+      id: "permanent-next",
+      event: "party",
+      blob: photo("permanent"),
+      createdAt: 2,
+      attempts: 1,
+      lastError: "invalid photo",
+      failureKind: "permanent",
+      errorClass: "payload",
+    });
+    await session.resumeAuth("auth-row");
+
+    expect(uploads).toBe(0);
+    expect(await store.list("party")).toMatchObject([{
+      id: "permanent-next",
+      failureKind: "permanent",
+      lastError: "invalid photo",
+    }]);
+    await session.stop();
   });
 
   test("one Event lease prevents two Sessions from draining simultaneously", async () => {

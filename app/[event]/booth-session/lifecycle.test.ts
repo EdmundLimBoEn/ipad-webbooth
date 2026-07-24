@@ -3,6 +3,7 @@ import {
   BoothLifecycleCoordinator,
   usablePreflightFrames,
   type BoothLifecycleSession,
+  type BoothCredentialHolder,
   type BoothPreflightResult,
 } from "./lifecycle";
 
@@ -18,7 +19,7 @@ class FakeSession implements BoothLifecycleSession {
   readonly actions: string[] = [];
   recoverWork: Promise<void> = Promise.resolve();
   stopWork: Promise<void> = Promise.resolve();
-  onRetry: () => void = () => {};
+  onResumeAuth: (itemId: string) => void = () => {};
 
   async recover() {
     this.actions.push("recover");
@@ -31,9 +32,9 @@ class FakeSession implements BoothLifecycleSession {
     return Promise.resolve();
   }
 
-  async retry() {
-    this.actions.push("retry");
-    this.onRetry();
+  async resumeAuth(itemId: string) {
+    this.actions.push(`resume-auth:${itemId}`);
+    this.onResumeAuth(itemId);
   }
 
   async stop() {
@@ -54,7 +55,6 @@ function harness(options: {
   const events: string[] = [];
   const access: string[] = [];
   const frames: Array<string[] | null> = [];
-  const credentials: string[] = [];
   const uploaded: string[] = [];
   const cleared: string[] = [];
   let cameraStarts = 0;
@@ -72,7 +72,6 @@ function harness(options: {
     onOutboxRecovered: () => events.push("outbox-recovered"),
     onAccess: (state, feedback) => access.push(`${state}:${feedback}`),
     onFrames: (next) => frames.push(next),
-    onCredential: (key) => credentials.push(key),
     onCameraStart: () => {
       cameraStarts++;
     },
@@ -86,13 +85,16 @@ function harness(options: {
     events,
     access,
     frames,
-    credentials,
     uploaded,
     cleared,
     cameraStarts: () => cameraStarts,
     cameraStops: () => cameraStops,
     loads: () => loads,
   };
+}
+
+function credential(): BoothCredentialHolder {
+  return { key: "" };
 }
 
 describe("Booth lifecycle coordination", () => {
@@ -109,7 +111,7 @@ describe("Booth lifecycle coordination", () => {
       },
     });
 
-    const entering = h.coordinator.beginEvent("launch", session);
+    const entering = h.coordinator.beginEvent("launch", session, credential());
     expect(session.actions).toEqual(["recover"]);
     expect(h.loads()).toBe(0);
     expect(calls).toEqual([]);
@@ -129,25 +131,30 @@ describe("Booth lifecycle coordination", () => {
     const session = new FakeSession();
     session.stopWork = stopping.promise;
     const h = harness({ stored: { launch: "first-key" } });
-    session.onRetry = () => h.coordinator.acceptUploaded(session, { url: "/acked" });
-    await h.coordinator.beginEvent("launch", session);
+    const sessionCredential = credential();
+    session.onResumeAuth = () => h.coordinator.acceptUploaded(session, { url: "/acked" });
+    await h.coordinator.beginEvent("launch", session, sessionCredential);
+    expect(sessionCredential.key).toBe("first-key");
 
-    void h.coordinator.authRequired(session);
+    void h.coordinator.authRequired(session, "auth-photo");
+    expect(sessionCredential.key).toBe("");
     expect(h.cleared).toEqual(["launch"]);
     expect(h.access.at(-1)).toBe("locked:rejected-key");
     expect(session.actions).toContain("stop");
 
     const unlocking = h.coordinator.unlock("correct-key");
     await Promise.resolve();
+    expect(sessionCredential.key).toBe("");
     expect(session.actions.filter((action) => action === "start")).toHaveLength(1);
-    expect(session.actions).not.toContain("retry");
+    expect(session.actions).not.toContain("resume-auth:auth-photo");
     expect(h.uploaded).toEqual([]);
 
     stopping.resolve();
     await unlocking;
 
+    expect(sessionCredential.key).toBe("correct-key");
     expect(session.actions.filter((action) => action === "start")).toHaveLength(2);
-    expect(session.actions.at(-1)).toBe("retry");
+    expect(session.actions.at(-1)).toBe("resume-auth:auth-photo");
     expect(h.uploaded).toEqual(["/acked"]);
     expect(h.cameraStarts()).toBe(2);
   });
@@ -160,12 +167,15 @@ describe("Booth lifecycle coordination", () => {
       preflight: async () => (++attempts === 1 ? first.promise : second.promise),
     });
     const session = new FakeSession();
-    await h.coordinator.beginEvent("launch", session);
+    const sessionCredential = credential();
+    await h.coordinator.beginEvent("launch", session, sessionCredential);
 
     const stale = h.coordinator.unlock("old-key");
     const current = h.coordinator.unlock("new-key");
+    expect(sessionCredential.key).toBe("");
     second.resolve({ kind: "ready", frames: ["square"] });
     await current;
+    expect(sessionCredential.key).toBe("new-key");
     first.resolve({ kind: "unauthorized" });
     await stale;
 
@@ -181,7 +191,7 @@ describe("Booth lifecycle coordination", () => {
     oldSession.recoverWork = recovery.promise;
     const h = harness({ stored: { launch: "stored-key" } });
 
-    const entering = h.coordinator.beginEvent("launch", oldSession);
+    const entering = h.coordinator.beginEvent("launch", oldSession, credential());
     await h.coordinator.leaveEvent(oldSession);
     recovery.resolve();
     await entering;
@@ -195,10 +205,12 @@ describe("Booth lifecycle coordination", () => {
     const h = harness();
     const first = new FakeSession();
     const second = new FakeSession();
-    await h.coordinator.beginEvent("first", first);
+    const firstCredential = credential();
+    await h.coordinator.beginEvent("first", first, firstCredential);
     h.coordinator.acceptUploaded(first, { url: "/first-before-switch" });
 
-    await h.coordinator.beginEvent("second", second);
+    const secondCredential = credential();
+    await h.coordinator.beginEvent("second", second, secondCredential);
     h.coordinator.acceptUploaded(first, { url: "/stale" });
     h.coordinator.acceptUploaded(second, { url: "/second" });
 
@@ -207,9 +219,71 @@ describe("Booth lifecycle coordination", () => {
       "second",
     ]);
     expect(h.uploaded).toEqual(["/first-before-switch", "/second"]);
-    expect(h.credentials.at(-1)).toBe("");
+    expect(firstCredential.key).toBe("");
+    expect(secondCredential.key).toBe("");
     expect(h.frames.at(-1)).toBeNull();
     expect(h.cameraStops()).toBeGreaterThanOrEqual(2);
+  });
+
+  test("an old deferred upload can never observe the next Event credential", async () => {
+    const uploadGate = deferred<void>();
+    const sent: Array<{ event: string; key: string }> = [];
+    const firstCredential = credential();
+    const secondCredential = credential();
+    const h = harness();
+    const first = new FakeSession();
+    const second = new FakeSession();
+
+    await h.coordinator.beginEvent("first", first, firstCredential);
+    await h.coordinator.unlock("first-key");
+    const oldUpload = (async () => {
+      await uploadGate.promise;
+      sent.push({ event: "first", key: firstCredential.key });
+    })();
+
+    await h.coordinator.beginEvent("second", second, secondCredential);
+    await h.coordinator.unlock("second-key");
+    uploadGate.resolve();
+    await oldUpload;
+
+    expect(firstCredential.key).toBe("");
+    expect(secondCredential.key).toBe("second-key");
+    expect(sent).toEqual([{ event: "first", key: "" }]);
+    expect(sent.some(({ key }) => key === "second-key")).toBe(false);
+  });
+
+  test("uses a fresh stop epoch for each auth failure and serializes each resume", async () => {
+    const firstStop = deferred<void>();
+    const secondStop = deferred<void>();
+    const session = new FakeSession();
+    const h = harness();
+    await h.coordinator.beginEvent("launch", session, credential());
+    await h.coordinator.unlock("initial-key");
+
+    session.stopWork = firstStop.promise;
+    void h.coordinator.authRequired(session, "first-auth");
+    const firstUnlock = h.coordinator.unlock("first-replacement");
+    await Promise.resolve();
+    expect(session.actions.filter((action) => action === "stop")).toHaveLength(1);
+    expect(session.actions).not.toContain("resume-auth:first-auth");
+    firstStop.resolve();
+    await firstUnlock;
+    expect(session.actions.at(-1)).toBe("resume-auth:first-auth");
+
+    session.stopWork = secondStop.promise;
+    void h.coordinator.authRequired(session, "second-auth");
+    const secondUnlock = h.coordinator.unlock("second-replacement");
+    await Promise.resolve();
+    expect(session.actions.filter((action) => action === "stop")).toHaveLength(2);
+    expect(session.actions).not.toContain("resume-auth:second-auth");
+    secondStop.resolve();
+    await secondUnlock;
+
+    expect(session.actions.at(-1)).toBe("resume-auth:second-auth");
+    expect(session.actions.filter((action) => action.startsWith("resume-auth:"))).toEqual([
+      "resume-auth:first-auth",
+      "resume-auth:second-auth",
+    ]);
   });
 });
 
@@ -237,7 +311,7 @@ describe("preflight Frame validation", () => {
     async (reply) => {
       const h = harness({ preflight: async () => reply });
       const session = new FakeSession();
-      await h.coordinator.beginEvent("launch", session);
+      await h.coordinator.beginEvent("launch", session, credential());
       await h.coordinator.unlock("key");
 
       expect(h.access.at(-1)).toBe("unavailable:unavailable");

@@ -22,7 +22,7 @@ export type BoothSessionOptions = {
   ownerId?: string;
   leaseTtlMs?: number;
   random?: () => number;
-  onAuthRequired?: () => void | Promise<void>;
+  onAuthRequired?: (itemId: string) => void | Promise<void>;
   setTimer?: (callback: () => void, delayMs: number) => unknown;
   clearTimer?: (timer: unknown) => void;
 };
@@ -40,11 +40,13 @@ export class BoothSession {
   private retryAt: number | null = null;
   private manualRetryRequested = false;
   private environmentalRetryRequested = false;
+  private authRetryItemId: string | null = null;
+  private authRetryInFlightId: string | null = null;
   private timer: unknown = null;
   private readonly ownerId: string;
   private readonly leaseTtlMs: number;
   private readonly random: () => number;
-  private readonly onAuthRequired: () => void | Promise<void>;
+  private readonly onAuthRequired: (itemId: string) => void | Promise<void>;
   private readonly setTimer: (callback: () => void, delayMs: number) => unknown;
   private readonly clearTimer: (timer: unknown) => void;
 
@@ -187,13 +189,28 @@ export class BoothSession {
     await this.process();
   }
 
+  async resumeAuth(itemId: string) {
+    if (this.stopRequested) return;
+    if (this.authRetryInFlightId !== itemId) this.authRetryItemId = itemId;
+    if (!this.processing) {
+      this.retryAt = null;
+      this.cancelTimer();
+    }
+    await this.process();
+  }
+
   private async drain() {
     if (!await this.ensureLease()) return;
     let pending = await this.store.list(this.event);
     while (pending.length > 0) {
       let item = pending[0];
+      const expectedAuthItemId = this.authRetryItemId;
+      this.authRetryItemId = null;
+      const forceAuthRetry =
+        expectedAuthItemId === item.id && item.failureKind === "auth";
       const forceRetry =
         this.manualRetryRequested ||
+        forceAuthRetry ||
         (this.environmentalRetryRequested && item.failureKind === "retryable");
       this.manualRetryRequested = false;
       this.environmentalRetryRequested = false;
@@ -209,6 +226,7 @@ export class BoothSession {
         item = ready;
         pending = [item, ...pending.slice(1)];
       }
+      if (forceAuthRetry) this.authRetryInFlightId = item.id;
       if (item.failureKind === "retryable" && (item.nextAttemptAt ?? 0) > this.now()) {
         this.retryAt = item.nextAttemptAt ?? null;
         this.publish({
@@ -246,12 +264,14 @@ export class BoothSession {
         result = await this.upload(item);
       } catch (error) {
         await this.recordUploadFailure(item, error, pending.length);
+        if (this.authRetryInFlightId === item.id) this.authRetryInFlightId = null;
         return;
       }
 
       try {
         await this.store.remove(item.id);
       } catch (error) {
+        if (this.authRetryInFlightId === item.id) this.authRetryInFlightId = null;
         // The Event store already acknowledged the upload. Do not classify or
         // recreate this row if local outbox cleanup fails; a later manual retry
         // uses the stable identity and receives the idempotent acknowledgement.
@@ -264,6 +284,7 @@ export class BoothSession {
         });
         return;
       }
+      if (this.authRetryInFlightId === item.id) this.authRetryInFlightId = null;
 
       // Everything below runs after the upload was acknowledged and the exact
       // item was removed. Post-ack failures may pause reconciliation, but can
@@ -347,13 +368,13 @@ export class BoothSession {
       error: message,
       durable: this.store.isDurable(),
     });
-    if (disposition.kind === "auth-required") this.notifyAuthRequired();
+    if (disposition.kind === "auth-required") this.notifyAuthRequired(failed.id);
     this.scheduleWake();
   }
 
-  private notifyAuthRequired() {
+  private notifyAuthRequired(itemId: string) {
     try {
-      void Promise.resolve(this.onAuthRequired()).catch(() => {
+      void Promise.resolve(this.onAuthRequired(itemId)).catch(() => {
         // Credential UI cannot affect the already-persisted queue state.
       });
     } catch {

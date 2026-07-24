@@ -22,6 +22,7 @@ import {
 import {
   BoothLifecycleCoordinator,
   type BoothAccessFeedback,
+  type BoothCredentialHolder,
   type BoothPreflightResult,
 } from "./booth-session/lifecycle";
 import { BoothUnlock } from "./booth-unlock";
@@ -73,7 +74,6 @@ export default function Booth() {
   const captureRef = useRef<AbortController | null>(null);
   const cameraRequestRef = useRef(0);
   const unmountedRef = useRef(false);
-  const keyRef = useRef("");
   const [status, setStatus] = useState<Status>("starting");
   const [accessState, setAccessState] = useState<BoothAccessState>("locked");
   const [accessFeedback, setAccessFeedback] =
@@ -175,9 +175,6 @@ export default function Booth() {
         setAccessFeedback(feedback);
       },
       onFrames: setEnabled,
-      onCredential: (key) => {
-        keyRef.current = key;
-      },
       onCameraStart: () => {
         void startCamera();
       },
@@ -208,12 +205,13 @@ export default function Booth() {
     return c;
   }, []);
 
-  const uploadOne = useCallback(
-    async (item: OutboxItem) => {
+  useEffect(() => {
+    const credential: BoothCredentialHolder = { key: "" };
+    const uploadOne = async (item: OutboxItem) => {
       const res = await fetch(`/api/upload?event=${encodeURIComponent(event)}`, {
         method: "POST",
         headers: {
-          "x-booth-key": keyRef.current,
+          "x-booth-key": credential.key,
           "content-type": "image/jpeg",
           ...outboxUploadHeaders(item),
         },
@@ -227,11 +225,7 @@ export default function Booth() {
         );
       }
       return res.json() as Promise<{ url: string; key?: string; duplicate?: boolean }>;
-    },
-    [event]
-  );
-
-  useEffect(() => {
+    };
     let session!: BoothSession;
     session = new BoothSession(
       event,
@@ -241,11 +235,11 @@ export default function Booth() {
       undefined,
       undefined,
       {
-        onAuthRequired: () => lifecycle.authRequired(session),
+        onAuthRequired: (itemId) => lifecycle.authRequired(session, itemId),
       }
     );
     sessionRef.current = session;
-    const entering = lifecycle.beginEvent(event, session);
+    const entering = lifecycle.beginEvent(event, session, credential);
     const unsubscribe = session.subscribe((next) => {
       if (lifecycle.isActive(session)) setUploadState(next);
     });
@@ -263,7 +257,7 @@ export default function Booth() {
       if (sessionRef.current === session) sessionRef.current = null;
       void lifecycle.leaveEvent(session);
     };
-  }, [event, lifecycle, uploadOne]);
+  }, [event, lifecycle]);
 
   const unlock = useCallback((key: string, remember: boolean) => {
     saveBoothCredential(

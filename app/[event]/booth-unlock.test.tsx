@@ -12,14 +12,15 @@ const secret = "never-render-this-booth-key";
 function render(
   state: "locked" | "checking" | "recovery-only" | "unavailable",
   pendingCount = 0,
-  feedback?: BoothAccessFeedback
+  feedback?: BoothAccessFeedback,
+  durable = true
 ) {
   return renderToStaticMarkup(
     <BoothUnlock
       event="launch"
       state={state}
       pendingCount={pendingCount}
-      durable
+      durable={durable}
       feedback={feedback}
       onUnlock={(key) => {
         if (key === secret) throw new Error("not called during static render");
@@ -96,6 +97,14 @@ describe("Booth unlock", () => {
     }
   );
 
+  test("never describes memory-only pending photos as safe", () => {
+    const html = render("recovery-only", 2, "network", false);
+
+    expect(html).toContain("2 photos waiting in this open page");
+    expect(html).toContain("reload recovery is unavailable");
+    expect(html.toLowerCase()).not.toContain("safe");
+  });
+
   test("changing Event identity clears typed key and remember state", () => {
     let form = createUnlockFormState("first");
     form = unlockFormReducer(form, { type: "key-changed", key: secret });
@@ -114,6 +123,9 @@ describe("Booth page safety wiring", () => {
     expect(source).not.toContain("window.prompt");
     expect(source).not.toContain("/api/config?event=");
     expect(source).toContain("key={event}");
+    expect(source).toContain('const credential: BoothCredentialHolder = { key: "" }');
+    expect(source).toContain('"x-booth-key": credential.key');
+    expect(source).not.toContain("keyRef");
   });
 });
 
