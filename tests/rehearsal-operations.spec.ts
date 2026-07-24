@@ -50,6 +50,7 @@ type RehearsalFixture = {
   view: ReturnType<typeof rehearsalView> | null;
   appliedRevisionId: string | null;
   appliedPresetId: string | null;
+  failEvidenceKindOnce: string | null;
 };
 
 function rehearsalView(
@@ -265,6 +266,11 @@ async function installAdminMocks(
         kind: string;
         photoKey?: string;
       };
+      if (fixture.failEvidenceKindOnce === evidence.kind) {
+        fixture.failEvidenceKindOnce = null;
+        await json({ error: "temporary" }, 503);
+        return;
+      }
       if (evidence.photoKey && evidence.kind === "canary-deleted") {
         updateDisposition(fixture, evidence.photoKey, "canary-deleted");
       }
@@ -304,8 +310,12 @@ async function installAdminMocks(
 async function unlock(page: Page) {
   await page.goto(`/${EVENT}/admin`);
   const input = page.getByLabel("Admin key");
-  await input.fill(ADMIN_KEY);
-  await input.press("Enter");
+  const heading = page.getByRole("heading", { name: EVENT, exact: true }).first();
+  await expect(input.or(heading)).toBeVisible();
+  if (await input.isVisible()) {
+    await input.fill(ADMIN_KEY);
+    await input.press("Enter");
+  }
   await expect(page.getByRole("heading", { name: EVENT })).toBeVisible();
 }
 
@@ -326,6 +336,7 @@ function createFixture(
     view: options.view ?? null,
     appliedRevisionId: null,
     appliedPresetId: null,
+    failEvidenceKindOnce: null,
   };
 }
 
@@ -410,10 +421,31 @@ test("guided rehearsal uses only exact tracked-photo dispositions", async ({
   const deleteKey = `${EVENT}/1753315200001-delete.jpg`;
 
   const canaryRow = page.getByRole("listitem").filter({ hasText: canaryKey });
+  fixture.failEvidenceKindOnce = "canary-deleted";
   await canaryRow.getByRole("button", {
     name: "Delete as exact canary",
   }).click();
-  await expect(canaryRow.getByText("canary-deleted", { exact: true }))
+  const canaryDialog = canaryRow.getByRole("alertdialog");
+  await expect(canaryDialog).toContainText(canaryKey);
+  await canaryDialog.getByRole("button", {
+    name: "Delete as exact canary",
+  }).click();
+  await expect(page.getByText("That rehearsal action did not finish."))
+    .toBeVisible();
+
+  // A confirmed public delete survives page reload. Retrying finalizes only
+  // the private evidence and must never issue the exact DELETE again.
+  await unlock(page);
+  const recoveredCanaryRow = page.getByRole("listitem").filter({
+    hasText: canaryKey,
+  });
+  await recoveredCanaryRow.getByRole("button", {
+    name: "Delete as exact canary",
+  }).click();
+  await recoveredCanaryRow.getByRole("alertdialog").getByRole("button", {
+    name: "Delete as exact canary",
+  }).click();
+  await expect(recoveredCanaryRow.getByText("canary-deleted", { exact: true }))
     .toBeVisible();
 
   const retainRow = page.getByRole("listitem").filter({ hasText: retainKey });
@@ -449,6 +481,7 @@ test("guided rehearsal uses only exact tracked-photo dispositions", async ({
     .map(({ body }) => (body as { kind: string }).kind);
   expect(evidenceKinds).toEqual([
     "canary-designated",
+    "canary-deleted",
     "canary-deleted",
     "photo-retained",
     "photo-deleted",
