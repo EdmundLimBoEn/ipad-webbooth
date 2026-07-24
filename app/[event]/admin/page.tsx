@@ -11,7 +11,13 @@ import {
   FrameProgrammeControls,
   SaveConfigurationButton,
 } from "./admin-config-controls";
-import { boothOperationalStateInput, mergeBoothPages } from "./booth-operations";
+import {
+  BoothOperationsCoordinator,
+  boothOperationalStateInput,
+  mergeBoothPages,
+  parseAdminBoothPage,
+  parseBoothOperationalStateResponse,
+} from "./booth-operations";
 import { BoothOperationsPanel } from "./booth-operations-panel";
 import { ConfigHistoryPanel } from "./config-history-panel";
 import {
@@ -28,7 +34,6 @@ type Photo = { key: string; url: string; uploadedAt: string };
 type AuthState = "missing" | "ready" | "invalid";
 type Probe = { status: "up" | "degraded" | "down"; detail: string };
 type Health = { upload: Probe; live: Probe };
-type BoothPage = { booths: AdminBoothRecord[]; cursor: string | null };
 type FilePickerWindow = Window & { showSaveFilePicker?: (options: { suggestedName: string; types: { description: string; accept: Record<string, string[]> }[] }) => Promise<{ createWritable(): Promise<WritableStream<Uint8Array>> }> };
 const CONFIG_CONFLICT_MESSAGE = "Configuration changed; review the latest version before saving.";
 
@@ -69,8 +74,7 @@ export default function Admin() {
   const [boothStatusError, setBoothStatusError] = useState(false);
   const [boothMessageDraft, setBoothMessageDraft] = useState("");
   const photoCursor = useRef<string | null>(null);
-  const boothCursorRef = useRef<string | null>(null);
-  const boothRequestBusy = useRef(false);
+  const boothCoordinator = useRef(new BoothOperationsCoordinator());
   const boothMessageEditing = useRef(false);
   const configMutationBusy = useRef(false);
   const pendingSaveMutationId = useRef<string | null>(null);
@@ -180,8 +184,9 @@ export default function Admin() {
   }, [event]);
 
   const loadBoothStatus = useCallback(async () => {
-    if (boothRequestBusy.current) return;
-    boothRequestBusy.current = true;
+    const coordinator = boothCoordinator.current;
+    const ticket = coordinator.beginRead(event, adminKey);
+    if (!ticket) return;
     setBoothStatusLoading(true);
     setBoothStatusError(false);
     try {
@@ -189,56 +194,81 @@ export default function Admin() {
       const devicesUrl = `/api/booths?event=${encodeURIComponent(event)}`;
       const headers = { "x-booth-key": adminKey };
       const [stateResult, devicesResult] = await Promise.allSettled([
-        fetch(stateUrl, { cache: "no-store", headers }),
-        fetch(devicesUrl, { cache: "no-store", headers }),
+        fetch(stateUrl, { cache: "no-store", headers, signal: ticket.signal }),
+        fetch(devicesUrl, { cache: "no-store", headers, signal: ticket.signal }),
       ]);
+      if (!coordinator.isReadCurrent(ticket)) return;
 
       let failed = false;
       if (stateResult.status === "rejected") {
         failed = true;
       } else if (stateResult.value.status === 401) {
+        coordinator.disposeScope();
         invalidateAuth();
-        failed = true;
+        return;
       } else if (!stateResult.value.ok) {
         failed = true;
       } else {
-        const nextState = await stateResult.value.json() as BoothOperationalState;
-        setBoothOperationalState(nextState);
-        setBoothMessageDraft((current) => boothMessageEditing.current
-          ? current
-          : nextState.messages?.en ?? "");
+        let nextState: BoothOperationalState | null = null;
+        try {
+          nextState = parseBoothOperationalStateResponse(await stateResult.value.json());
+        } catch {
+          // Invalid JSON is handled through the same fixed panel error.
+        }
+        if (!coordinator.isReadCurrent(ticket)) return;
+        if (!nextState) {
+          failed = true;
+        } else {
+          if (!coordinator.isReadCurrent(ticket)) return;
+          setBoothOperationalState(nextState);
+          if (!coordinator.isReadCurrent(ticket)) return;
+          if (!boothMessageEditing.current) {
+            setBoothMessageDraft(nextState.messages?.en ?? "");
+          }
+        }
       }
 
       if (devicesResult.status === "rejected") {
         failed = true;
       } else if (devicesResult.value.status === 401) {
+        coordinator.disposeScope();
         invalidateAuth();
-        failed = true;
+        return;
       } else if (!devicesResult.value.ok) {
         failed = true;
       } else {
-        const page = await devicesResult.value.json() as BoothPage;
-        if (!Array.isArray(page.booths) || (page.cursor !== null && typeof page.cursor !== "string")) {
+        let page = null;
+        try {
+          page = parseAdminBoothPage(await devicesResult.value.json());
+        } catch {
+          // Invalid JSON is handled through the same fixed panel error.
+        }
+        if (!coordinator.isReadCurrent(ticket)) return;
+        if (!page) {
           failed = true;
         } else {
+          if (!coordinator.isReadCurrent(ticket)) return;
           setBoothRecords((current) => mergeBoothPages(current, page.booths));
-          boothCursorRef.current = page.cursor;
-          setBoothCursor(page.cursor);
+          const tailCursor = coordinator.acceptFirstPage(ticket, page.cursor);
+          if (!coordinator.isReadCurrent(ticket)) return;
+          setBoothCursor(tailCursor);
         }
       }
+      if (!coordinator.isReadCurrent(ticket)) return;
       setBoothStatusError(failed);
     } catch {
-      setBoothStatusError(true);
+      if (coordinator.isReadCurrent(ticket)) setBoothStatusError(true);
     } finally {
-      boothRequestBusy.current = false;
-      setBoothStatusLoading(false);
+      if (coordinator.finishRead(ticket)) setBoothStatusLoading(false);
     }
   }, [adminKey, event]);
 
   const loadMoreBooths = useCallback(async () => {
-    const cursor = boothCursorRef.current;
-    if (cursor === null || boothRequestBusy.current) return;
-    boothRequestBusy.current = true;
+    const coordinator = boothCoordinator.current;
+    const cursor = coordinator.tailCursor();
+    if (cursor === null) return;
+    const ticket = coordinator.beginRead(event, adminKey);
+    if (!ticket) return;
     setBoothLoadingMore(true);
     setBoothStatusError(false);
     try {
@@ -246,34 +276,52 @@ export default function Admin() {
       const response = await fetch(`/api/booths?${query}`, {
         cache: "no-store",
         headers: { "x-booth-key": adminKey },
+        signal: ticket.signal,
       });
+      if (!coordinator.isReadCurrent(ticket)) return;
       if (response.status === 401) {
+        coordinator.disposeScope();
         invalidateAuth();
-        setBoothStatusError(true);
         return;
       }
       if (!response.ok) {
+        if (!coordinator.isReadCurrent(ticket)) return;
         setBoothStatusError(true);
         return;
       }
-      const page = await response.json() as BoothPage;
-      if (!Array.isArray(page.booths) || (page.cursor !== null && typeof page.cursor !== "string")) {
+      let page = null;
+      try {
+        page = parseAdminBoothPage(await response.json());
+      } catch {
+        // Invalid JSON is handled through the same fixed panel error.
+      }
+      if (!coordinator.isReadCurrent(ticket)) return;
+      if (!page) {
         setBoothStatusError(true);
         return;
       }
+      if (!coordinator.isReadCurrent(ticket)) return;
       setBoothRecords((current) => mergeBoothPages(current, page.booths));
-      boothCursorRef.current = page.cursor;
-      setBoothCursor(page.cursor);
+      const tailCursor = coordinator.advanceTail(ticket, page.cursor);
+      if (!coordinator.isReadCurrent(ticket)) return;
+      setBoothCursor(tailCursor);
     } catch {
-      setBoothStatusError(true);
+      if (coordinator.isReadCurrent(ticket)) setBoothStatusError(true);
     } finally {
-      boothRequestBusy.current = false;
-      setBoothLoadingMore(false);
+      if (coordinator.finishRead(ticket)) setBoothLoadingMore(false);
     }
   }, [adminKey, event]);
 
   const updateBoothOperationalState = useCallback(async (paused: boolean) => {
-    if (boothMutationBusy || !boothOperationalState) return;
+    if (!boothOperationalState) return;
+    const coordinator = boothCoordinator.current;
+    const mutation = coordinator.beginMutation(event, adminKey);
+    if (!mutation) return;
+    const { ticket, abortedRead } = mutation;
+    if (abortedRead) {
+      setBoothStatusLoading(false);
+      setBoothLoadingMore(false);
+    }
     setBoothMutationBusy(true);
     setBoothStatusError(false);
     try {
@@ -281,31 +329,47 @@ export default function Admin() {
         method: "PUT",
         cache: "no-store",
         headers: { "x-booth-key": adminKey, "content-type": "application/json" },
+        signal: ticket.signal,
         body: JSON.stringify(boothOperationalStateInput(
           boothOperationalState.messages,
           boothMessageDraft,
           paused
         )),
       });
+      if (!coordinator.isMutationCurrent(ticket)) return;
       if (response.status === 401) {
+        coordinator.disposeScope();
         invalidateAuth();
-        setBoothStatusError(true);
         return;
       }
       if (!response.ok) {
+        if (!coordinator.isMutationCurrent(ticket)) return;
         setBoothStatusError(true);
         return;
       }
-      const nextState = await response.json() as BoothOperationalState;
+      let nextState: BoothOperationalState | null = null;
+      try {
+        nextState = parseBoothOperationalStateResponse(await response.json());
+      } catch {
+        // Invalid JSON is handled through the same fixed panel error.
+      }
+      if (!coordinator.isMutationCurrent(ticket)) return;
+      if (!nextState) {
+        setBoothStatusError(true);
+        return;
+      }
+      if (!coordinator.isMutationCurrent(ticket)) return;
       setBoothOperationalState(nextState);
+      if (!coordinator.isMutationCurrent(ticket)) return;
       boothMessageEditing.current = false;
+      if (!coordinator.isMutationCurrent(ticket)) return;
       setBoothMessageDraft(nextState.messages?.en ?? "");
     } catch {
-      setBoothStatusError(true);
+      if (coordinator.isMutationCurrent(ticket)) setBoothStatusError(true);
     } finally {
-      setBoothMutationBusy(false);
+      if (coordinator.finishMutation(ticket)) setBoothMutationBusy(false);
     }
-  }, [adminKey, boothMessageDraft, boothMutationBusy, boothOperationalState, event]);
+  }, [adminKey, boothMessageDraft, boothOperationalState, event]);
 
   useEffect(() => {
     photoCursor.current = null;
@@ -320,12 +384,20 @@ export default function Admin() {
   }, [adminKey, auth, loadConfig]);
 
   useEffect(() => {
-    if (auth !== "ready" || !adminKey) return;
-    boothCursorRef.current = null;
+    const coordinator = boothCoordinator.current;
+    if (auth !== "ready" || !adminKey) {
+      coordinator.disposeScope();
+      return;
+    }
+    coordinator.activateScope(event, adminKey);
     boothMessageEditing.current = false;
     setBoothRecords([]);
     setBoothCursor(null);
     setBoothOperationalState(null);
+    setBoothMessageDraft("");
+    setBoothStatusLoading(false);
+    setBoothLoadingMore(false);
+    setBoothMutationBusy(false);
     setBoothStatusError(false);
     let cancelled = false;
     let nextPoll: number | undefined;
@@ -337,6 +409,7 @@ export default function Admin() {
     return () => {
       cancelled = true;
       if (nextPoll !== undefined) window.clearTimeout(nextPoll);
+      coordinator.disposeScope();
     };
   }, [adminKey, auth, event, loadBoothStatus]);
 
