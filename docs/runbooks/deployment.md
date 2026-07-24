@@ -37,10 +37,25 @@ bun run typecheck:tests
 bun test
 bun run validate:frames
 bun run build
+bunx playwright install webkit
+bun run test:browser
 bun run deploy:staging
 ```
 
-Run the pre-event readiness smoke checks with a throwaway staging Event. Confirm staging photos do not appear in production and staging config does not affect production. Then promote explicitly:
+Run the complete real-iPad section in `pre-event-readiness.md` with a
+throwaway canonical staging Event that is distinct from production. The
+automated WebKit journey does not prove real Safari camera permission,
+orientation/crop, camera-indicator shutdown, Add-to-Home-Screen launch,
+standalone background/foreground behavior, Screen Wake Lock, IndexedDB
+survival across relaunch, Safari cross-tab leases, venue-network reconnect
+timing, real multi-shot pause timing, or camera/wake release during Operator
+exit.
+
+Confirm staging photos do not appear in production and staging config does not
+affect production. For smoke-test moderation, delete only one complete
+Event-owned throwaway image key. Stop promotion on any failed real-device
+check. Only after recording a passing iPad rehearsal should you promote
+explicitly:
 
 ```bash
 bun run deploy:production

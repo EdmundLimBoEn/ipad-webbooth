@@ -9,6 +9,8 @@ next-env.d.ts
 .gstack/
 .open-next/
 .wrangler/
+/test-results/
+/playwright-report/
 scripts/.migrated.json
 .claude/
 .worktrees/
