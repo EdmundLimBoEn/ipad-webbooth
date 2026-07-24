@@ -4,6 +4,7 @@ import {
   ConfigConflictError,
   ConfigMutationConflictError,
   ConfigRevisionNotFoundError,
+  EventPresetNotFoundError,
   EventStore,
   InMemoryObjectStore,
   InvalidEventSlugError,
@@ -2746,6 +2747,82 @@ describe("EventStore", () => {
       expect((await store.listEventPresets()).presets.map(({ label }) => label)).toEqual([
         "Alpha",
       ]);
+    });
+
+    test("applies a preset through the shared revision head while preserving credentials", async () => {
+      const store = new EventStore(
+        new InMemoryObjectStore(),
+        new InMemoryObjectStore(),
+        "https://photos.example",
+        () => new Date("2026-07-24T00:00:00.000Z"),
+      );
+      const current = await store.saveConfigRevision("launch", {
+        config: { frames: ["old"], boothKeyHash: "stored-secret-hash" },
+        baseRevisionId: null,
+        mutationId: "018f0000-0000-4000-8000-000000000201",
+        boothKeyMutationFingerprint: "a".repeat(64),
+      });
+      await store.putEventPreset("launch-night", {
+        label: "Launch Night",
+        config: experience,
+        expectedUpdatedAt: null,
+      });
+      const input = {
+        presetId: "launch-night",
+        mutationId: "018f0000-0000-4000-8000-000000000202",
+        baseRevisionId: current.revision.id,
+      };
+
+      const applied = await store.applyEventPreset("launch", input);
+      const retried = await store.applyEventPreset("launch", input);
+
+      expect(applied.idempotent).toBeFalse();
+      expect(retried.idempotent).toBeTrue();
+      expect(applied.revision).toMatchObject({
+        id: input.mutationId,
+        reason: "preset",
+        sourcePresetId: "launch-night",
+        config: experience,
+      });
+      expect(applied.config).toMatchObject({
+        ...experience,
+        boothKeyHash: "stored-secret-hash",
+        currentRevisionId: input.mutationId,
+      });
+      expect(JSON.stringify(applied.revision)).not.toContain("stored-secret-hash");
+    });
+
+    test("binds preset content to its retry intent and rejects a missing preset", async () => {
+      const store = new EventStore(
+        new InMemoryObjectStore(),
+        new InMemoryObjectStore(),
+        "https://photos.example",
+        () => new Date("2026-07-24T00:00:00.000Z"),
+      );
+      await expect(store.applyEventPreset("launch", {
+        presetId: "missing",
+        mutationId: "018f0000-0000-4000-8000-000000000203",
+        baseRevisionId: null,
+      })).rejects.toBeInstanceOf(EventPresetNotFoundError);
+
+      const created = await store.putEventPreset("launch-night", {
+        label: "Launch Night",
+        config: experience,
+        expectedUpdatedAt: null,
+      });
+      const input = {
+        presetId: "launch-night",
+        mutationId: "018f0000-0000-4000-8000-000000000204",
+        baseRevisionId: null,
+      };
+      await store.applyEventPreset("launch", input);
+      await store.putEventPreset("launch-night", {
+        label: "Launch Night Updated",
+        config: { ...experience, frames: ["square"] },
+        expectedUpdatedAt: created.updatedAt,
+      });
+      await expect(store.applyEventPreset("launch", input))
+        .rejects.toBeInstanceOf(ConfigMutationConflictError);
     });
 
     test("fails explicitly for corrupt stored presets and never offers deletion", async () => {

@@ -71,21 +71,28 @@ export type ConfigRestoreInput = {
   baseRevisionId: string | null;
   mutationId: string;
 };
+export type ConfigPresetApplyInput = {
+  presetId: string;
+  mutationId: string;
+  baseRevisionId: string | null;
+};
 type ConfigMutationIntent = {
   version: typeof EVENT_CONFIG_VERSION;
   config: EventExperience;
   baseRevisionId: string | null;
   boothKeyMutationFingerprint: string | null;
-  reason: "save" | "restore";
+  reason: "save" | "restore" | "preset";
   sourceRevisionId?: string;
+  sourcePresetId?: string;
 };
 type ConfigAppendInput = {
   config: EventConfig;
   baseRevisionId: string | null;
   mutationId: string;
   boothKeyMutationFingerprint: string | null;
-  reason: "save" | "restore";
+  reason: "save" | "restore" | "preset";
   sourceRevisionId?: string;
+  sourcePresetId?: string;
 };
 
 export type StoredObject = {
@@ -478,6 +485,12 @@ export class PresetConflictError extends Error {
   }
 }
 
+export class EventPresetNotFoundError extends Error {
+  constructor(readonly presetId: string) {
+    super(`Event preset ${presetId} was not found`);
+  }
+}
+
 export class PhotoIndexWriteError extends Error {
   constructor(
     readonly photo: Pick<PutPhotoResult, "key" | "url" | "duplicate">,
@@ -810,6 +823,29 @@ export class EventStore {
     });
   }
 
+  async applyEventPreset(
+    event: string,
+    input: ConfigPresetApplyInput,
+  ): Promise<ConfigMutationResult> {
+    if (
+      !isPresetId(input.presetId)
+      || !isRevisionId(input.mutationId)
+      || (input.baseRevisionId !== null && !isRevisionId(input.baseRevisionId))
+    ) {
+      throw new TypeError("invalid preset application");
+    }
+    const preset = await this.getEventPreset(input.presetId);
+    if (!preset) throw new EventPresetNotFoundError(input.presetId);
+    return this.appendConfigRevision(canonicalEvent(event), {
+      config: preset.config,
+      baseRevisionId: input.baseRevisionId,
+      mutationId: input.mutationId,
+      boothKeyMutationFingerprint: null,
+      reason: "preset",
+      sourcePresetId: preset.id,
+    });
+  }
+
   private async appendConfigRevision(
     event: string,
     input: ConfigAppendInput
@@ -823,7 +859,8 @@ export class EventStore {
       input.baseRevisionId,
       input.boothKeyMutationFingerprint,
       input.reason,
-      input.sourceRevisionId
+      input.sourceRevisionId,
+      input.sourcePresetId,
     );
     const existing = await this.readRevision(event, input.mutationId);
 
@@ -864,6 +901,7 @@ export class EventStore {
       parentRevisionId,
       reason: input.reason,
       ...(input.sourceRevisionId ? { sourceRevisionId: input.sourceRevisionId } : {}),
+      ...(input.sourcePresetId ? { sourcePresetId: input.sourcePresetId } : {}),
       config: requestedExperience,
     };
     const appended = await this.state.compareAndSwap(
@@ -1946,8 +1984,9 @@ export class EventStore {
     config: EventExperience,
     baseRevisionId: string | null,
     boothKeyMutationFingerprint: string | null,
-    reason: "save" | "restore",
-    sourceRevisionId?: string
+    reason: "save" | "restore" | "preset",
+    sourceRevisionId?: string,
+    sourcePresetId?: string,
   ): Promise<void> {
     const intent: ConfigMutationIntent = {
       version: EVENT_CONFIG_VERSION,
@@ -1956,6 +1995,7 @@ export class EventStore {
       boothKeyMutationFingerprint,
       reason,
       ...(sourceRevisionId ? { sourceRevisionId } : {}),
+      ...(sourcePresetId ? { sourcePresetId } : {}),
     };
     const key = eventConfigMutationKey(event, mutationId);
     const created = await this.state.compareAndSwap(
@@ -1981,6 +2021,7 @@ export class EventStore {
       || parsed.boothKeyMutationFingerprint !== boothKeyMutationFingerprint
       || parsed.reason !== reason
       || parsed.sourceRevisionId !== sourceRevisionId
+      || parsed.sourcePresetId !== sourcePresetId
       || !sameExperience(parsed.config, config)
     ) {
       throw new ConfigMutationConflictError();
@@ -2023,7 +2064,7 @@ export class EventStore {
       revision.id !== input.mutationId
       || revision.reason !== input.reason
       || revision.sourceRevisionId !== input.sourceRevisionId
-      || revision.sourcePresetId !== undefined
+      || revision.sourcePresetId !== input.sourcePresetId
       || !sameExperience(revision.config, requested)
     ) {
       throw new ConfigMutationConflictError();
@@ -2127,11 +2168,19 @@ function parseConfigMutationIntent(value: unknown): ConfigMutationIntent | null 
   const reason = intent.reason;
   if (
     intent.version !== EVENT_CONFIG_VERSION
-    || (reason !== "save" && reason !== "restore")
+    || (reason !== "save" && reason !== "restore" && reason !== "preset")
     || (
       reason === "save"
-        ? Object.keys(intent).length !== 5 || "sourceRevisionId" in intent
-        : Object.keys(intent).length !== 6 || !isRevisionId(intent.sourceRevisionId)
+        ? Object.keys(intent).length !== 5
+          || "sourceRevisionId" in intent
+          || "sourcePresetId" in intent
+        : reason === "restore"
+          ? Object.keys(intent).length !== 6
+            || !isRevisionId(intent.sourceRevisionId)
+            || "sourcePresetId" in intent
+          : Object.keys(intent).length !== 6
+            || !isPresetId(intent.sourcePresetId)
+            || "sourceRevisionId" in intent
     )
     || (
       intent.baseRevisionId !== null
@@ -2167,6 +2216,7 @@ function parseConfigMutationIntent(value: unknown): ConfigMutationIntent | null 
     boothKeyMutationFingerprint: intent.boothKeyMutationFingerprint as string | null,
     reason,
     ...(reason === "restore" ? { sourceRevisionId: intent.sourceRevisionId as string } : {}),
+    ...(reason === "preset" ? { sourcePresetId: intent.sourcePresetId as string } : {}),
   };
 }
 
