@@ -77,14 +77,23 @@ function sanitizeFilename(value: string): string {
   return safe;
 }
 
-function uniqueFilename(candidate: string, emitted: Set<string>): string {
+function uniqueFilename(
+  candidate: string,
+  emitted: Set<string>,
+  nextSuffixByCollisionKey: Map<string, number>,
+): string {
   const collisionKey = candidate.toLowerCase();
   if (!emitted.has(collisionKey)) {
     emitted.add(collisionKey);
+    nextSuffixByCollisionKey.set(collisionKey, 2);
     return candidate;
   }
   const { stem, extension } = splitArchiveExtension(candidate);
-  for (let suffix = 2; ; suffix += 1) {
+  for (
+    let suffix = nextSuffixByCollisionKey.get(collisionKey) ?? 2;
+    ;
+    suffix += 1
+  ) {
     const suffixText = `-${suffix}`;
     const stemLength = MAX_ARCHIVE_FILENAME_LENGTH
       - suffixText.length
@@ -93,6 +102,7 @@ function uniqueFilename(candidate: string, emitted: Set<string>): string {
     const nextKey = next.toLowerCase();
     if (!emitted.has(nextKey)) {
       emitted.add(nextKey);
+      nextSuffixByCollisionKey.set(collisionKey, suffix + 1);
       return next;
     }
   }
@@ -112,9 +122,14 @@ export function preparePackageRows(
   frameLabelFor: (frameKey: string) => string | undefined,
 ): PackagePhotoRow[] {
   const emitted = new Set<string>();
+  const nextSuffixByCollisionKey = new Map<string, number>();
   return sources.map((source) => {
     const original = originalBasename(source.key);
-    const filename = uniqueFilename(sanitizeFilename(original), emitted);
+    const filename = uniqueFilename(
+      sanitizeFilename(original),
+      emitted,
+      nextSuffixByCollisionKey,
+    );
     const receiptTimestamp = source.receipt?.capturedAt;
     const fromFilename = filenameTimestamp(original);
     let capturedAtEpochMs: number;

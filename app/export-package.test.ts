@@ -68,6 +68,33 @@ describe("event package rows", () => {
     expect(rows[1]!.filename).toEndWith("-2");
   });
 
+  test("resolves a large normalized collision group with bounded membership probes", () => {
+    const originalHas = Set.prototype.has;
+    let membershipProbes = 0;
+    Set.prototype.has = function (value) {
+      membershipProbes += 1;
+      return originalHas.call(this, value);
+    };
+
+    try {
+      const rows = preparePackageRows(
+        Array.from({ length: 1_024 }, (_, index) =>
+          source(`launch/${index}/${index % 2 === 0 ? "a?b.jpg" : "A*b.JPG"}`)),
+        () => undefined,
+      );
+
+      expect(rows[0]!.filename).toBe("a_b.jpg");
+      expect(rows[1]!.filename).toBe("A_b-2.JPG");
+      expect(rows.at(-1)!.filename).toBe("A_b-1024.JPG");
+      expect(new Set(rows.map(({ filename }) => filename.toLowerCase())).size).toBe(
+        rows.length,
+      );
+      expect(membershipProbes).toBeLessThan(5_000);
+    } finally {
+      Set.prototype.has = originalHas;
+    }
+  });
+
   test("uses receipt, filename, then upload timestamps and allowlisted metadata", () => {
     const rows = preparePackageRows([
       source("launch/1753315200000-first.jpg", {
