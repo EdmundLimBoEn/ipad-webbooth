@@ -70,16 +70,26 @@
   padding-bottom: 12px;
 }
 
+.tileButton {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: #111;
+  cursor: pointer;
+}
+
 .tile {
   display: block;
   width: 100%;
   height: auto; /* full image, not cropped */
   border-radius: 10px;
-  cursor: pointer;
   background: #111;
   animation: pop 400ms ease-out;
 }
-.tile:focus-visible { outline: 4px solid #ff2d8b; outline-offset: -4px; }
+.tileButton:focus-visible { outline: 4px solid #ff2d8b; outline-offset: 3px; }
 
 @keyframes pop {
   from { opacity: 0; transform: scale(0.9); }
@@ -156,4 +166,13 @@
 @media (prefers-reduced-motion: reduce) {
   .tile, .pulse { animation: none; }
   .colInner { will-change: auto; }
+}
+
+@media (forced-colors: active) {
+  .tileButton:focus-visible,
+  .feedStatus button:focus-visible,
+  .feedToast button:focus-visible {
+    outline: 3px solid Highlight;
+    outline-offset: 3px;
+  }
 }

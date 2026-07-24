@@ -17,8 +17,12 @@ function concat(...parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
-// Local file header + name + data — the streamable per-file chunk.
-export function localPart(name: Uint8Array, data: Uint8Array): { bytes: Uint8Array; crc: number } {
+// Local file header + name only. Keeping the body separate lets callers
+// enqueue one already-loaded photo without allocating a second full copy.
+export function storedEntryHeader(
+  name: Uint8Array,
+  data: Uint8Array,
+): { header: Uint8Array; crc: number; size: number } {
   const crc = crc32(data);
   const header = concat(
     le32(0x04034b50),
@@ -33,7 +37,13 @@ export function localPart(name: Uint8Array, data: Uint8Array): { bytes: Uint8Arr
     le16(name.length),
     le16(0) // extra field length
   );
-  return { bytes: concat(header, name, data), crc };
+  return { header: concat(header, name), crc, size: data.length };
+}
+
+// Local file header + name + data — retained byte-for-byte for compatibility.
+export function localPart(name: Uint8Array, data: Uint8Array): { bytes: Uint8Array; crc: number } {
+  const { header, crc } = storedEntryHeader(name, data);
+  return { bytes: concat(header, data), crc };
 }
 
 // Central directory record for one file, pointing back at its local header.
@@ -71,5 +81,18 @@ export function endPart(count: number, centralLen: number, centralOffset: number
     le32(centralLen),
     le32(centralOffset),
     le16(0) // comment length
+  );
+}
+
+/** Exact byte estimate for a classic STORE archive with no ZIP comment/extra fields. */
+export function estimateStoreZipBytes(
+  entries: readonly { nameBytes: number; dataBytes: number }[],
+): number {
+  return entries.reduce(
+    (total, entry) =>
+      total
+      + 30 + entry.nameBytes + entry.dataBytes
+      + 46 + entry.nameBytes,
+    22,
   );
 }

@@ -1,12 +1,26 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import QRCode from "qrcode";
+import { message, SUPPORTED_LOCALES, type SupportedLocale } from "@/app/i18n/catalog";
+import {
+  applyDocumentLocale,
+  deviceLocaleStorageKey,
+  resolveDeviceLocale,
+} from "@/app/i18n/locale";
+import { PROJECTOR_FEED_PROFILE } from "@/app/photo-feed/controller";
+import type { FeedPhoto } from "@/app/photo-feed/types";
+import { usePhotoFeed } from "@/app/photo-feed/use-photo-feed";
+import { PhotoLightbox } from "../gallery/photo-lightbox";
 import styles from "./live.module.css";
+import {
+  MANUAL_PAUSE_MS,
+  marqueeTileKey,
+  shouldAnimateMarquee,
+  suppressActivationAfterDrag,
+} from "./marquee";
 import { wrap } from "./wrap";
-
-type Photo = { key: string; url: string; uploadedAt: string };
 
 const SPEED = 40; // px/sec
 const GAP = 12; // must match the CSS gap/padding-bottom on .copy
@@ -14,12 +28,10 @@ const PAD = 14;
 
 export default function Live() {
   const { event } = useParams<{ event: string }>();
-  const [photos, setPhotos] = useState<Photo[]>([]);
-  const [feedState, setFeedState] = useState<"loading" | "ready" | "error">("loading");
-  const [feedError, setFeedError] = useState("");
-  const [full, setFull] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [saveMsg, setSaveMsg] = useState("");
+  const feed = usePhotoFeed(event, PROJECTOR_FEED_PROFILE);
+  const photos = feed.photos;
+  const [full, setFull] = useState<FeedPhoto | null>(null);
+  const [locale, setLocale] = useState<SupportedLocale>("en");
   // measured height/width per photo url, so columns can be balanced by real height
   const [ratios, setRatios] = useState<Record<string, number>>({});
   const [vw, setVw] = useState(0);
@@ -30,10 +42,30 @@ export default function Live() {
   const [reducedMotion, setReducedMotion] = useState(false);
 
   useEffect(() => {
-    QRCode.toDataURL(window.location.href, { width: 300, margin: 1 })
+    const galleryUrl = new URL(`/${encodeURIComponent(event)}/gallery`, window.location.origin);
+    QRCode.toDataURL(galleryUrl.toString(), { width: 300, margin: 1 })
       .then(setQr)
       .catch(() => {});
-  }, []);
+  }, [event]);
+
+  useEffect(() => {
+    let storedLocale: string | null = null;
+    try {
+      storedLocale = window.localStorage.getItem(deviceLocaleStorageKey(event));
+    } catch {
+      // Storage is an enhancement; browser language still provides a locale.
+    }
+    setLocale(resolveDeviceLocale({
+      event,
+      configured: SUPPORTED_LOCALES,
+      storedLocale,
+      navigatorLanguages: navigator.languages,
+    }));
+  }, [event]);
+
+  useEffect(() => {
+    applyDocumentLocale(document.documentElement, locale);
+  }, [locale]);
 
   useEffect(() => {
     const query = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -51,50 +83,9 @@ export default function Live() {
   const fullRef = useRef(false);
   // cumulative pointer travel of the last drag; >10px suppresses the tile click
   const dragDistRef = useRef(0);
-  const cursorRef = useRef<string | null>(null);
   useEffect(() => {
     fullRef.current = !!full;
   }, [full]);
-
-  const pollPhotos = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const after = cursorRef.current;
-      const query = new URLSearchParams({ event });
-      if (after) query.set("after", after);
-      const res = await fetch(`/api/photos?${query}`, { cache: "no-store", signal });
-      if (!res.ok) throw new Error(`Gallery feed returned ${res.status}`);
-      const data = await res.json();
-      if (!Array.isArray(data.photos)) throw new Error("Gallery feed had an unexpected shape");
-      const incoming = data.photos as Photo[];
-      setPhotos((current) => {
-        if (!after) return incoming;
-        const seen = new Set(incoming.map((photo) => photo.key || photo.url));
-        return [...incoming, ...current.filter((photo) => !seen.has(photo.key || photo.url))];
-      });
-      if (typeof data.cursor === "string" && data.cursor) cursorRef.current = data.cursor;
-      setFeedState("ready");
-      setFeedError("");
-    } catch (cause) {
-      if (cause instanceof DOMException && cause.name === "AbortError") return;
-      setFeedState("error");
-      setFeedError(cause instanceof Error ? cause.message : "The gallery feed is unavailable");
-    }
-  }, [event]);
-
-  useEffect(() => {
-    let alive = true;
-    const controller = new AbortController();
-    cursorRef.current = null;
-    setPhotos([]);
-    setFeedState("loading");
-    void pollPhotos(controller.signal);
-    const id = setInterval(() => { if (alive) void pollPhotos(controller.signal); }, 3000);
-    return () => {
-      alive = false;
-      controller.abort();
-      clearInterval(id);
-    };
-  }, [event, pollPhotos]);
 
   useEffect(() => {
     const calc = () => {
@@ -112,14 +103,18 @@ export default function Live() {
   // Balanced masonry: drop each photo into the shortest column so far (by
   // measured aspect ratio, since all columns share one width), so columns
   // end at nearly the same height.
-  const columns: Photo[][] = Array.from({ length: cols }, () => []);
+  const columns: FeedPhoto[][] = Array.from({ length: cols }, () => []);
   const heights = new Array<number>(cols).fill(0); // px incl. trailing gap
   for (const p of photos) {
     const i = heights.indexOf(Math.min(...heights));
     columns[i].push(p);
     heights[i] += (ratios[p.url] ?? 1) * colW + GAP; // assume square until measured
   }
-  const animate = !reducedMotion && vh > 0 && Math.max(0, ...heights) > vh;
+  const animate = shouldAnimateMarquee({
+    reducedMotion,
+    viewportHeight: vh,
+    tallestColumnHeight: Math.max(0, ...heights),
+  });
 
   // Measure each column's loop period (one copy's height, incl. its trailing
   // padding) after every render, so the wrap always lands on identical pixels.
@@ -150,7 +145,7 @@ export default function Live() {
     let dragY: number | null = null; // pointer y while dragging, else null
     let lastMoveT = 0;
     const bump = () => {
-      idleUntil = performance.now() + 4000;
+      idleUntil = performance.now() + MANUAL_PAUSE_MS;
     };
 
     const move = (delta: number) => {
@@ -228,69 +223,15 @@ export default function Live() {
     };
   }, [animate]);
 
-  // Pre-fetch the open photo's bytes so save() can call navigator.share()
-  // immediately — Safari drops the transient user activation if share() comes
-  // after a slow awaited fetch, making "Save photo" silently do nothing.
-  const fullBlobRef = useRef<{ url: string; blob: Blob } | null>(null);
-  useEffect(() => {
-    if (!full) return;
-    setSaveMsg("");
-    let alive = true;
-    fetch(full)
-      .then((r) => r.blob())
-      .then((blob) => {
-        if (alive) fullBlobRef.current = { url: full, blob };
-      })
-      .catch(() => {});
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setFull(null);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => {
-      alive = false;
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [full]);
-
-  // Save to device. On mobile, prefer the native share sheet (Save to Photos
-  // on iOS); fall back to a download link on desktop. Cross-origin-safe: the
-  // bytes are fetched, then shared/linked as a same-origin object.
-  const save = useCallback(async (url: string) => {
-    setSaving(true);
-    setSaveMsg("");
-    try {
-      const blob =
-        fullBlobRef.current?.url === url ? fullBlobRef.current.blob : await (await fetch(url)).blob();
-      const file = new File([blob], `photobooth-${Date.now()}.jpg`, { type: "image/jpeg" });
-      if (typeof navigator.canShare === "function" && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file] });
-      } else {
-        const obj = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = obj;
-        a.download = file.name;
-        a.click();
-        URL.revokeObjectURL(obj);
-      }
-    } catch (e) {
-      // cancelling the share sheet is fine; anything else deserves feedback
-      if (!(e instanceof DOMException && e.name === "AbortError")) {
-        setSaveMsg("Couldn't save — try pressing and holding the photo instead");
-      }
-    } finally {
-      setSaving(false);
-    }
-  }, []);
-
   return (
-    <main className={styles.live}>
-      {photos.length === 0 && feedState === "loading" && <div className={styles.feedStatus}><span className={styles.pulse} /> <p>Opening the gallery…</p></div>}
-      {photos.length === 0 && feedState === "ready" && <div className={styles.feedStatus}><strong>Ready for the first photo.</strong><p>New photographs will appear here automatically.</p></div>}
-      {feedState === "error" && <div className={photos.length ? styles.feedToast : styles.feedStatus} role="alert"><strong>Gallery connection lost</strong><p>{feedError}</p><button onClick={() => void pollPhotos()}>Try again now</button></div>}
+    <main className={styles.live} lang={locale} dir={locale === "ar" ? "rtl" : "ltr"}>
+      {photos.length === 0 && feed.status === "loading" && <div className={styles.feedStatus}><span className={styles.pulse} /> <p>{message(locale, "galleryBrowseLoading")}</p></div>}
+      {photos.length === 0 && feed.status === "ready" && <div className={styles.feedStatus}><strong>{message(locale, "galleryBrowseEmpty")}</strong><p>{message(locale, "galleryBrowseEmptyBody")}</p></div>}
+      {feed.status === "error" && <div className={photos.length ? styles.feedToast : styles.feedStatus} role="alert"><strong>{message(locale, "galleryConnectionLost")}</strong><p>{feed.error}</p><button onClick={feed.refresh}>{message(locale, "galleryRetry")}</button></div>}
 
       {qr && (
         // eslint-disable-next-line @next/next/no-img-element
-        <img className={styles.qr} src={qr} alt="Scan to view this live gallery on your phone" />
+        <img className={styles.qr} src={qr} alt={message(locale, "galleryQrAlt")} />
       )}
 
       <div className={styles.grid}>
@@ -298,45 +239,44 @@ export default function Live() {
           // repeat the column's photos until one copy fills the screen, so the
           // two-copy loop never exposes empty space
           const m = animate && heights[i] > 0 ? Math.max(1, Math.ceil(vh / heights[i])) : 1;
-          const unit: Photo[] = [];
+          const unit: FeedPhoto[] = [];
           for (let k = 0; k < m; k++) unit.push(...col);
 
           // key by url + occurrence, not list index: a new photo at the head
           // must not re-key (remount + replay the pop animation on) every
           // tile after it
           const seen = new Map<string, number>();
-          const tileKey = (url: string) => {
-            const n = seen.get(url) ?? 0;
-            seen.set(url, n + 1);
-            return `${url}#${n}`;
+          const tileKey = (key: string) => {
+            const n = seen.get(key) ?? 0;
+            seen.set(key, n + 1);
+            return marqueeTileKey(key, n);
           };
           const copy = (prefix: string) => (
             <div key={prefix} className={styles.copy} aria-hidden={prefix === "b" || undefined}>
               {unit.map((p) => (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  key={tileKey(p.url)}
-                  src={p.url}
-                  alt=""
-                  loading="lazy"
-                  className={styles.tile}
-                  role="button"
-                  tabIndex={prefix === "b" ? -1 : 0}
+                <button
+                  key={tileKey(p.key)}
+                  type="button"
+                  className={styles.tileButton}
+                  tabIndex={prefix === "b" ? -1 : undefined}
                   onClick={() => {
-                    if (dragDistRef.current > 10) return; // was a drag, not a tap
-                    setFull(p.url);
+                    if (suppressActivationAfterDrag(dragDistRef.current)) return;
+                    setFull(p);
                   }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      setFull(p.url);
-                    }
-                  }}
-                  onLoad={(e) => {
-                    const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
-                    if (w > 0) setRatios((mm) => (mm[p.url] ? mm : { ...mm, [p.url]: h / w }));
-                  }}
-                />
+                  aria-label={message(locale, "galleryPhotoLabel")}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={p.url}
+                    alt=""
+                    loading="lazy"
+                    className={styles.tile}
+                    onLoad={(e) => {
+                      const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
+                      if (w > 0) setRatios((mm) => (mm[p.url] ? mm : { ...mm, [p.url]: h / w }));
+                    }}
+                  />
+                </button>
               ))}
             </div>
           );
@@ -358,23 +298,23 @@ export default function Live() {
       </div>
 
       {full && (
-        <div className={styles.lightbox} role="dialog" aria-modal="true" onClick={() => setFull(null)}>
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={full} alt="Event photo" className={styles.fullImg} onClick={(e) => e.stopPropagation()} />
-          <div className={styles.actions} onClick={(e) => e.stopPropagation()}>
-            <button className={styles.save} onClick={() => save(full)} disabled={saving}>
-              {saving ? "Saving…" : "⬇ Save photo"}
-            </button>
-            <button className={styles.close} onClick={() => setFull(null)}>
-              Close
-            </button>
-          </div>
-          {saveMsg && (
-            <p className={styles.saveMsg} onClick={(e) => e.stopPropagation()}>
-              {saveMsg}
-            </p>
-          )}
-        </div>
+        <PhotoLightbox
+          event={event}
+          photo={full}
+          origin={window.location.origin}
+          labels={{
+            title: message(locale, "galleryLightboxTitle"),
+            photoAlt: message(locale, "galleryPhotoAlt"),
+            save: message(locale, "gallerySave"),
+            share: message(locale, "galleryShare"),
+            close: message(locale, "galleryClose"),
+            previous: message(locale, "galleryPrevious"),
+            next: message(locale, "galleryNext"),
+            working: message(locale, "galleryWorking"),
+            actionError: message(locale, "galleryActionError"),
+          }}
+          onClose={() => setFull(null)}
+        />
       )}
     </main>
   );

@@ -1,3 +1,6 @@
+import type { CaptureMetadata } from "../../upload-contract";
+import type { UploadErrorClass } from "./retry-policy";
+
 export type OutboxItem = {
   id: string;
   event: string;
@@ -5,6 +8,13 @@ export type OutboxItem = {
   createdAt: number;
   attempts: number;
   lastError?: string;
+  nextAttemptAt?: number;
+  failureKind?: "retryable" | "permanent" | "auth";
+  errorClass?: UploadErrorClass;
+  /** Optional so rows saved by earlier Booth versions remain readable. */
+  metadata?: CaptureMetadata;
+  /** Reserved for the operator rehearsal flow; durable rows retain it verbatim. */
+  rehearsalId?: string;
 };
 
 export interface OutboxStore {
@@ -12,10 +22,15 @@ export interface OutboxStore {
   list(event: string): Promise<OutboxItem[]>;
   put(item: OutboxItem): Promise<void>;
   remove(id: string): Promise<void>;
+  acquireLease(event: string, ownerId: string, now: number, ttlMs: number): Promise<boolean>;
+  renewLease(event: string, ownerId: string, now: number, ttlMs: number): Promise<boolean>;
+  releaseLease(event: string, ownerId: string): Promise<void>;
+  markFailure(item: OutboxItem, ownerId: string, now: number): Promise<boolean>;
 }
 
 export class MemoryOutboxStore implements OutboxStore {
   private readonly items = new Map<string, OutboxItem>();
+  private readonly leases = new Map<string, { ownerId: string; expiresAt: number }>();
 
   isDurable() {
     return false;
@@ -34,7 +49,45 @@ export class MemoryOutboxStore implements OutboxStore {
   async remove(id: string) {
     this.items.delete(id);
   }
+
+  async acquireLease(event: string, ownerId: string, now: number, ttlMs: number) {
+    const lease = this.leases.get(event);
+    if (lease && lease.ownerId !== ownerId && lease.expiresAt > now) return false;
+    this.leases.set(event, { ownerId, expiresAt: now + ttlMs });
+    return true;
+  }
+
+  async renewLease(event: string, ownerId: string, now: number, ttlMs: number) {
+    const lease = this.leases.get(event);
+    if (!lease || lease.ownerId !== ownerId) return false;
+    this.leases.set(event, { ownerId, expiresAt: now + ttlMs });
+    return true;
+  }
+
+  async releaseLease(event: string, ownerId: string) {
+    if (this.leases.get(event)?.ownerId === ownerId) this.leases.delete(event);
+  }
+
+  async markFailure(item: OutboxItem, ownerId: string, now: number) {
+    const lease = this.leases.get(item.event);
+    const current = this.items.get(item.id);
+    if (
+      !lease ||
+      lease.ownerId !== ownerId ||
+      lease.expiresAt <= now ||
+      !current ||
+      current.event !== item.event
+    ) return false;
+    this.items.set(item.id, item);
+    return true;
+  }
 }
+
+type LeaseRecord = {
+  event: string;
+  ownerId: string;
+  expiresAt: number;
+};
 
 class IndexedDbOutboxStore implements OutboxStore {
   private dbPromise: Promise<IDBDatabase>;
@@ -45,10 +98,13 @@ class IndexedDbOutboxStore implements OutboxStore {
 
   constructor(indexedDB: IDBFactory) {
     this.dbPromise = new Promise((resolve, reject) => {
-      const request = indexedDB.open("ipad-webbooth", 1);
+      const request = indexedDB.open("ipad-webbooth", 2);
       request.onupgradeneeded = () => {
         if (!request.result.objectStoreNames.contains("photo-outbox")) {
           request.result.createObjectStore("photo-outbox", { keyPath: "id" });
+        }
+        if (!request.result.objectStoreNames.contains("photo-outbox-leases")) {
+          request.result.createObjectStore("photo-outbox-leases", { keyPath: "event" });
         }
       };
       request.onsuccess = () => resolve(request.result);
@@ -85,6 +141,110 @@ class IndexedDbOutboxStore implements OutboxStore {
   async remove(id: string) {
     await this.request("readwrite", (store) => store.delete(id));
   }
+
+  private async leaseTransaction(
+    event: string,
+    update: (current: LeaseRecord | undefined, store: IDBObjectStore) => boolean
+  ) {
+    const db = await this.dbPromise;
+    return new Promise<boolean>((resolve, reject) => {
+      const transaction = db.transaction("photo-outbox-leases", "readwrite");
+      const store = transaction.objectStore("photo-outbox-leases");
+      const request = store.get(event);
+      let result = false;
+      request.onsuccess = () => {
+        result = update(request.result as LeaseRecord | undefined, store);
+      };
+      request.onerror = () => {
+        transaction.abort();
+        reject(request.error ?? new Error("Photo outbox lease request failed"));
+      };
+      transaction.oncomplete = () => resolve(result);
+      transaction.onerror = () => reject(
+        transaction.error ?? new Error("Photo outbox lease transaction failed")
+      );
+      transaction.onabort = () => reject(
+        transaction.error ?? new Error("Photo outbox lease transaction aborted")
+      );
+    });
+  }
+
+  acquireLease(event: string, ownerId: string, now: number, ttlMs: number) {
+    return this.leaseTransaction(event, (current, store) => {
+      if (current && current.ownerId !== ownerId && current.expiresAt > now) return false;
+      store.put({ event, ownerId, expiresAt: now + ttlMs } satisfies LeaseRecord);
+      return true;
+    });
+  }
+
+  renewLease(event: string, ownerId: string, now: number, ttlMs: number) {
+    return this.leaseTransaction(event, (current, store) => {
+      if (!current || current.ownerId !== ownerId) return false;
+      store.put({ event, ownerId, expiresAt: now + ttlMs } satisfies LeaseRecord);
+      return true;
+    });
+  }
+
+  async releaseLease(event: string, ownerId: string) {
+    await this.leaseTransaction(event, (current, store) => {
+      if (current?.ownerId === ownerId) store.delete(event);
+      return current?.ownerId === ownerId;
+    });
+  }
+
+  private async failureTransaction(item: OutboxItem, ownerId: string, now: number) {
+    const db = await this.dbPromise;
+    return new Promise<boolean>((resolve, reject) => {
+      const transaction = db.transaction(["photo-outbox", "photo-outbox-leases"], "readwrite");
+      const outbox = transaction.objectStore("photo-outbox");
+      const leases = transaction.objectStore("photo-outbox-leases");
+      const leaseRequest = leases.get(item.event);
+      const itemRequest = outbox.get(item.id);
+      let lease: LeaseRecord | undefined;
+      let current: OutboxItem | undefined;
+      let leaseRead = false;
+      let itemRead = false;
+      let result = false;
+      const replaceIfOwned = () => {
+        if (!leaseRead || !itemRead) return;
+        if (
+          lease?.ownerId !== ownerId ||
+          lease.expiresAt <= now ||
+          !current ||
+          current.event !== item.event
+        ) return;
+        outbox.put(item);
+        result = true;
+      };
+      leaseRequest.onsuccess = () => {
+        lease = leaseRequest.result as LeaseRecord | undefined;
+        leaseRead = true;
+        replaceIfOwned();
+      };
+      itemRequest.onsuccess = () => {
+        current = itemRequest.result as OutboxItem | undefined;
+        itemRead = true;
+        replaceIfOwned();
+      };
+      const fail = (error: DOMException | null, message: string) => {
+        transaction.abort();
+        reject(error ?? new Error(message));
+      };
+      leaseRequest.onerror = () => fail(leaseRequest.error, "Photo outbox lease read failed");
+      itemRequest.onerror = () => fail(itemRequest.error, "Photo outbox item read failed");
+      transaction.oncomplete = () => resolve(result);
+      transaction.onerror = () => reject(
+        transaction.error ?? new Error("Photo outbox failure transaction failed")
+      );
+      transaction.onabort = () => reject(
+        transaction.error ?? new Error("Photo outbox failure transaction aborted")
+      );
+    });
+  }
+
+  markFailure(item: OutboxItem, ownerId: string, now: number) {
+    return this.failureTransaction(item, ownerId, now);
+  }
 }
 
 /** Uses IndexedDB when available, but keeps the booth usable in private/locked-down browsers. */
@@ -120,6 +280,29 @@ export function createOutboxStore(
     remove: async (id) => {
       await memory.remove(id);
       await fallback(() => durable.remove(id), () => Promise.resolve());
+    },
+    acquireLease: (event, ownerId, now, ttlMs) => fallback(
+      () => durable.acquireLease(event, ownerId, now, ttlMs),
+      () => memory.acquireLease(event, ownerId, now, ttlMs)
+    ),
+    renewLease: (event, ownerId, now, ttlMs) => fallback(
+      () => durable.renewLease(event, ownerId, now, ttlMs),
+      () => memory.renewLease(event, ownerId, now, ttlMs)
+    ),
+    releaseLease: (event, ownerId) => fallback(
+      () => durable.releaseLease(event, ownerId),
+      () => memory.releaseLease(event, ownerId)
+    ),
+    markFailure: async (item, ownerId, now) => {
+      if (usingMemory) return memory.markFailure(item, ownerId, now);
+      try {
+        const updated = await durable.markFailure(item, ownerId, now);
+        if (updated) await memory.put(item);
+        return updated;
+      } catch {
+        usingMemory = true;
+        return memory.markFailure(item, ownerId, now);
+      }
     },
   };
 }

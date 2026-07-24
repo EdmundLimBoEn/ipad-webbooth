@@ -23,3 +23,5 @@ jobs:
       - run: bun test
       - run: bun run validate:frames
       - run: bun run build
+      - run: bunx playwright install --with-deps webkit
+      - run: bun run test:browser

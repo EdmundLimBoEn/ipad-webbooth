@@ -26,3 +26,8 @@ test("zero or negative period returns 0", () => {
   expect(wrap(123, 0)).toBe(0);
   expect(wrap(123, -5)).toBe(0);
 });
+
+test("each projector column wraps against its own independent period", () => {
+  expect(wrap(450, 400)).toBe(50);
+  expect(wrap(450, 275)).toBe(175);
+});

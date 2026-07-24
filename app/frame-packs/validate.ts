@@ -1,4 +1,5 @@
 import type { AssetInfo, FramePackManifest, ValidationIssue } from "./types";
+import { isSupportedLocale } from "../i18n/catalog";
 
 const KEY = /^[a-z][a-zA-Z0-9-]*$/;
 const IMAGE_FIELDS = ["bgImage", "overlay", "preview"] as const;
@@ -25,6 +26,26 @@ export function validateFramePacks(
       if (templateKeys.has(key)) issues.push({ path, message: "template key is duplicated across packs" });
       templateKeys.add(key);
       if (!frame.label?.trim()) issues.push({ path: `${path}.label`, message: "label is required" });
+      else if (unicodeCodePointLength(frame.label) > 80) {
+        issues.push({ path: `${path}.label`, message: "label must be at most 80 characters" });
+      }
+      if (frame.labels !== undefined) {
+        if (!frame.labels || typeof frame.labels !== "object" || Array.isArray(frame.labels)) {
+          issues.push({ path: `${path}.labels`, message: "localized labels must be an object" });
+        } else {
+          for (const [locale, label] of Object.entries(frame.labels)) {
+            const labelPath = `${path}.labels.${locale}`;
+            if (!isSupportedLocale(locale)) {
+              issues.push({ path: labelPath, message: "localized label locale is unsupported" });
+            }
+            if (typeof label !== "string" || !label.trim()) {
+              issues.push({ path: labelPath, message: "localized label is required" });
+            } else if (unicodeCodePointLength(label) > 80) {
+              issues.push({ path: labelPath, message: "localized label must be at most 80 characters" });
+            }
+          }
+        }
+      }
       if (!positive(frame.canvas?.w) || !positive(frame.canvas?.h)) {
         issues.push({ path: `${path}.canvas`, message: "canvas dimensions must be positive integers" });
       }
@@ -94,4 +115,8 @@ function nonNegative(value: unknown): value is number {
 
 function validColor(value: string): boolean {
   return /^#[0-9a-f]{3}([0-9a-f]{3})?([0-9a-f]{2})?$/i.test(value);
+}
+
+function unicodeCodePointLength(value: string): number {
+  return Array.from(value).length;
 }

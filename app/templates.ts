@@ -54,12 +54,13 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 }
 
 // Composite captured frames (already mirrored, full-res canvases) into the
-// template. Browser-only (uses canvas). Returns a JPEG blob.
-export async function composite(
+// template. Browser-only (uses canvas). The returned canvas is the exact
+// review surface and remains unencoded until the guest accepts it.
+export async function composeToCanvas(
   frames: CanvasImageSource[],
   frameSizes: { w: number; h: number }[],
   t: Template
-): Promise<Blob> {
+): Promise<HTMLCanvasElement> {
   const canvas = document.createElement("canvas");
   canvas.width = t.canvas.w;
   canvas.height = t.canvas.h;
@@ -91,7 +92,29 @@ export async function composite(
     ctx.drawImage(await loadImage(t.overlay), 0, 0, canvas.width, canvas.height);
   }
 
+  return canvas;
+}
+
+// Encode only after review acceptance so the preview and queued photo share
+// one exact composite.
+export function encodeCanvas(
+  canvas: HTMLCanvasElement,
+  quality = 0.9
+): Promise<Blob> {
   return new Promise((res, rej) =>
-    canvas.toBlob((b) => (b ? res(b) : rej(new Error("could not encode the photo"))), "image/jpeg", 0.9)
+    canvas.toBlob(
+      (b) => (b ? res(b) : rej(new Error("could not encode the photo"))),
+      "image/jpeg",
+      quality
+    )
   );
+}
+
+// Compatibility wrapper for callers that do not yet present a review step.
+export async function composite(
+  frames: CanvasImageSource[],
+  frameSizes: { w: number; h: number }[],
+  t: Template
+): Promise<Blob> {
+  return encodeCanvas(await composeToCanvas(frames, frameSizes, t));
 }

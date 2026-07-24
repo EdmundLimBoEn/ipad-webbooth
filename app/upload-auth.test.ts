@@ -1,5 +1,13 @@
 import { test, expect } from "bun:test";
-import { keyOk, adminOk, hashBoothKey, boothKeyMatches, safeEvent, isImage } from "./upload-auth";
+import {
+  keyOk,
+  adminOk,
+  boothOrAdminOk,
+  hashBoothKey,
+  boothKeyMatches,
+  safeEvent,
+  isImage,
+} from "./upload-auth";
 
 test("keyOk accepts the exact key", () => {
   expect(keyOk("b29b8260981f1548", "b29b8260981f1548")).toBe(true);
@@ -50,6 +58,19 @@ test("booth key hashing round-trips and is salted", async () => {
   expect(await boothKeyMatches("my-booth-key-123", "garbage")).toBe(false);
   // fresh salt every time — identical keys must not produce identical hashes
   expect(await hashBoothKey("my-booth-key-123")).not.toBe(stored);
+});
+
+test("boothOrAdminOk preserves the admin-required fail-closed rule", async () => {
+  const stored = await hashBoothKey("event-key-123");
+  expect(await boothOrAdminOk("admin", "admin", stored)).toBe("ok");
+  expect(await boothOrAdminOk("event-key-123", "admin", stored)).toBe("ok");
+  expect(await boothOrAdminOk("wrong", "admin", stored)).toBe("unauthorized");
+
+  const previous = process.env.ALLOW_KEYLESS;
+  delete process.env.ALLOW_KEYLESS;
+  expect(await boothOrAdminOk("event-key-123", undefined, stored)).toBe("disabled");
+  if (previous === undefined) delete process.env.ALLOW_KEYLESS;
+  else process.env.ALLOW_KEYLESS = previous;
 });
 
 test("safeEvent slugs to a-z0-9- and never emits an underscore", () => {

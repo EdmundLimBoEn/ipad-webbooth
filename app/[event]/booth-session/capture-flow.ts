@@ -1,0 +1,199 @@
+export type CapturePhase =
+  | "picker"
+  | "ready"
+  | "capturing"
+  | "reviewing"
+  | "accepting"
+  | "handoff";
+
+export type ReviewCandidate = {
+  id: string;
+  source: "framed" | "camera-fallback";
+  frameKey?: string;
+  canvas: HTMLCanvasElement;
+};
+
+export type CaptureFlowState = {
+  phase: CapturePhase;
+  frameKey: string | null;
+  captureAttemptId: string | null;
+  candidate: ReviewCandidate | null;
+  autoAcceptPending: boolean;
+  error: string | null;
+};
+
+export type CaptureFlowAction =
+  | { type: "reset" }
+  | { type: "select-frame"; frameKey: string }
+  | { type: "start-capture"; attemptId: string }
+  | { type: "start-fallback-capture"; attemptId: string }
+  | { type: "capture-failed"; attemptId: string; error: string }
+  | {
+      type: "capture-complete";
+      attemptId: string;
+      candidate: ReviewCandidate;
+      reviewEnabled: boolean;
+    }
+  | { type: "more-time"; candidateId: string }
+  | { type: "retake"; candidateId: string }
+  | { type: "accept"; candidateId: string }
+  | { type: "accept-failed"; candidateId: string; error: string }
+  | { type: "enqueue-succeeded"; candidateId: string }
+  | { type: "handoff-complete" };
+
+export const INITIAL_CAPTURE_FLOW_STATE: CaptureFlowState = {
+  phase: "picker",
+  frameKey: null,
+  captureAttemptId: null,
+  candidate: null,
+  autoAcceptPending: false,
+  error: null,
+};
+
+export function reduceCaptureFlow(
+  state: CaptureFlowState,
+  action: CaptureFlowAction
+): CaptureFlowState {
+  switch (action.type) {
+    case "reset":
+      return INITIAL_CAPTURE_FLOW_STATE;
+
+    case "select-frame":
+      if (state.phase !== "picker") return state;
+      return {
+        phase: "ready",
+        frameKey: action.frameKey,
+        captureAttemptId: null,
+        candidate: null,
+        autoAcceptPending: false,
+        error: null,
+      };
+
+    case "start-capture":
+      if (state.phase !== "ready" || !state.frameKey) return state;
+      return {
+        ...state,
+        phase: "capturing",
+        captureAttemptId: action.attemptId,
+        error: null,
+      };
+
+    case "start-fallback-capture":
+      if (
+        state.phase !== "picker"
+        && !(state.phase === "ready" && state.frameKey === null)
+      ) {
+        return state;
+      }
+      return {
+        phase: "capturing",
+        frameKey: null,
+        captureAttemptId: action.attemptId,
+        candidate: null,
+        autoAcceptPending: false,
+        error: null,
+      };
+
+    case "capture-failed":
+      if (
+        state.phase !== "capturing"
+        || state.captureAttemptId !== action.attemptId
+      ) {
+        return state;
+      }
+      return {
+        phase: "ready",
+        frameKey: state.frameKey,
+        captureAttemptId: null,
+        candidate: null,
+        autoAcceptPending: false,
+        error: action.error,
+      };
+
+    case "capture-complete":
+      if (
+        state.phase !== "capturing"
+        || state.captureAttemptId !== action.attemptId
+      ) {
+        return state;
+      }
+      return {
+        ...state,
+        phase: action.reviewEnabled ? "reviewing" : "accepting",
+        captureAttemptId: null,
+        candidate: action.candidate,
+        autoAcceptPending: action.reviewEnabled,
+        error: null,
+      };
+
+    case "more-time":
+      if (!isCurrentCandidate(state, action.candidateId, "reviewing")) {
+        return state;
+      }
+      if (!state.autoAcceptPending) return state;
+      return { ...state, autoAcceptPending: false };
+
+    case "retake":
+      if (!isCurrentCandidate(state, action.candidateId, "reviewing")) {
+        return state;
+      }
+      return {
+        phase: "ready",
+        frameKey: state.frameKey,
+        captureAttemptId: null,
+        candidate: null,
+        autoAcceptPending: false,
+        error: null,
+      };
+
+    case "accept":
+      if (!isCurrentCandidate(state, action.candidateId, "reviewing")) {
+        return state;
+      }
+      return {
+        ...state,
+        phase: "accepting",
+        autoAcceptPending: false,
+        error: null,
+      };
+
+    case "accept-failed":
+      if (!isCurrentCandidate(state, action.candidateId, "accepting")) {
+        return state;
+      }
+      return {
+        ...state,
+        phase: "reviewing",
+        autoAcceptPending: false,
+        error: action.error,
+      };
+
+    case "enqueue-succeeded":
+      if (!isCurrentCandidate(state, action.candidateId, "accepting")) {
+        return state;
+      }
+      return {
+        phase: "handoff",
+        frameKey: null,
+        captureAttemptId: null,
+        candidate: null,
+        autoAcceptPending: false,
+        error: null,
+      };
+
+    case "handoff-complete":
+      if (state.phase !== "handoff") return state;
+      return INITIAL_CAPTURE_FLOW_STATE;
+  }
+}
+
+function isCurrentCandidate(
+  state: CaptureFlowState,
+  candidateId: string,
+  phase: "reviewing" | "accepting"
+): boolean {
+  return (
+    state.phase === phase
+    && state.candidate?.id === candidateId
+  );
+}
