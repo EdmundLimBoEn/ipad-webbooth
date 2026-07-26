@@ -1,9 +1,12 @@
+import type { SupportedLocale } from "../i18n/catalog";
+
 export type Fit = "cover" | "contain";
 
 export type Slot = { x: number; y: number; w: number; h: number; fit?: Fit };
 
 export type FrameDefinition = {
   label: string;
+  labels?: Partial<Record<SupportedLocale, string>>;
   shots: number;
   intervalMs: number;
   canvas: { w: number; h: number };

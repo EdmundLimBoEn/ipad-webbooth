@@ -1,5 +1,11 @@
 import { test, expect } from "bun:test";
-import { localPart, centralPart, endPart } from "./zip";
+import {
+  centralPart,
+  endPart,
+  estimateStoreZipBytes,
+  localPart,
+  storedEntryHeader,
+} from "./zip";
 
 const te = new TextEncoder();
 const le32At = (b: Uint8Array, i: number) => b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | ((b[i + 3] << 24) >>> 0);
@@ -41,4 +47,35 @@ test("zip parts assemble into a structurally valid STORE archive", () => {
   // second central record points at the second local header
   const second = offset + central[0].length;
   expect(le32At(zip, second + 42)).toBe(offsets[1]);
+});
+
+test("stored entry header describes separate bytes without copying them", () => {
+  const name = te.encode("portrait.jpg");
+  const data = te.encode("separate photo bytes");
+  const split = storedEntryHeader(name, data);
+  const combined = localPart(name, data);
+
+  expect(split.header.length).toBe(30 + name.length);
+  expect(split.header.slice(30)).toEqual(name);
+  expect(le32At(split.header, 14) >>> 0).toBe(split.crc >>> 0);
+  expect(le32At(split.header, 18)).toBe(data.length);
+  expect(le32At(split.header, 22)).toBe(data.length);
+  expect(split.size).toBe(data.length);
+  expect(combined.bytes).toEqual(
+    new Uint8Array([...split.header, ...data]),
+  );
+});
+
+test("STORE zip estimates exact local, central, and EOCD byte lengths", () => {
+  const entries = [
+    { nameBytes: te.encode("plain.jpg").length, dataBytes: 123 },
+    { nameBytes: te.encode("照片.jpg").length, dataBytes: 456 },
+  ];
+  const expected = entries.reduce(
+    (total, entry) =>
+      total + 30 + entry.nameBytes + entry.dataBytes + 46 + entry.nameBytes,
+    22,
+  );
+
+  expect(estimateStoreZipBytes(entries)).toBe(expected);
 });

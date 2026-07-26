@@ -1,6 +1,7 @@
 import defaultPackJson from "../../public/templates/default/manifest.json";
 import talentBeaconJson from "../../public/templates/talent-beacon-9-anniversary/manifest.json";
 import type { FrameDefinition, FramePackManifest, Template } from "./types";
+import type { SupportedLocale } from "../i18n/catalog";
 
 export const FRAME_PACKS = [defaultPackJson, talentBeaconJson] as FramePackManifest[];
 
@@ -22,6 +23,14 @@ export const TEMPLATES: Record<string, Template> = Object.fromEntries(
 
 export function assetUrl(packKey: string, asset: string): string {
   return `/templates/${packKey}/${asset}`;
+}
+
+export function frameLabel(
+  frame: Pick<FrameDefinition, "label" | "labels">,
+  locale: SupportedLocale
+): string {
+  const localized = frame.labels?.[locale];
+  return localized?.trim() ? localized : frame.label;
 }
 
 function toRuntimeTemplate(packKey: string, frame: FrameDefinition): Template {

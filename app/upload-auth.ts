@@ -55,6 +55,23 @@ export async function boothKeyMatches(key: string, stored: string): Promise<bool
   return keyOk(await pbkdf2(key, fromHex(saltHex)), hashHex);
 }
 
+/**
+ * Upload authentication accepts either the operational Admin Key or the
+ * current Event's Booth Key. An unavailable Admin Key remains fail-closed:
+ * an Event Booth Key cannot quietly enable uploads in that configuration.
+ */
+export async function boothOrAdminOk(
+  provided: string,
+  adminKey: string | undefined,
+  boothKeyHash?: string
+): Promise<"ok" | "unauthorized" | "disabled"> {
+  const admin = adminOk(provided, adminKey);
+  if (admin !== "unauthorized") return admin;
+  return boothKeyHash && provided && await boothKeyMatches(provided, boothKeyHash)
+    ? "ok"
+    : "unauthorized";
+}
+
 // Slugs an event name to a safe key prefix; anything else -> "event".
 // Shared by every API route (was four hand-synced copies).
 export const safeEvent = slugifyEvent;

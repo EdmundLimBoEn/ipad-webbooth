@@ -74,6 +74,24 @@
   font-weight: 800;
 }
 
+.localePicker {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+}
+
+.localePicker select {
+  min-height: 44px;
+  padding: 0 38px 0 12px;
+  border: 2px solid rgba(255, 255, 255, 0.55);
+  border-radius: 10px;
+  background: #111119;
+  color: #fff;
+  font: inherit;
+}
+
 .choices {
   display: flex;
   gap: 20px;
@@ -98,6 +116,20 @@
 }
 
 .choice:active { transform: scale(0.96); }
+.choice:focus-visible,
+.shutter:focus-visible,
+.change:focus-visible,
+.liveLink:focus-visible,
+.fileBtn:focus-within,
+.localePicker select:focus-visible,
+.reviewActions button:focus-visible,
+.handoffLink:focus-visible,
+.handoffContinue:focus-visible,
+.error:focus-visible,
+.handoffPanel h1:focus-visible {
+  outline: 3px solid #fff;
+  outline-offset: 4px;
+}
 .choice small { font-weight: 500; color: #ffb3d9; font-size: 13px; }
 
 .icon {
@@ -128,6 +160,7 @@
   font-weight: 600;
   backdrop-filter: blur(8px);
   cursor: pointer;
+  min-height: 44px;
 }
 .change:disabled { opacity: 0.5; }
 
@@ -187,6 +220,9 @@
   background: rgba(0, 0, 0, 0.4);
   border-radius: 20px;
   backdrop-filter: blur(8px);
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
 }
 
 .overlay {
@@ -203,6 +239,11 @@
 }
 
 .fileBtn {
+  position: relative;
+  overflow: hidden;
+  display: inline-flex;
+  min-height: 56px;
+  align-items: center;
   padding: 16px 28px;
   background: #fff;
   color: #000;
@@ -225,6 +266,7 @@
   font-weight: 700;
   cursor: pointer;
   z-index: 5;
+  min-height: 44px;
 }
 .retry:disabled {
   cursor: default;
@@ -241,6 +283,156 @@
   border-radius: 12px;
   font-size: 15px;
   max-width: 80vw;
+  min-height: 44px;
+  border: 2px solid rgba(255, 255, 255, 0.8);
+  color: #fff;
+  cursor: pointer;
+  z-index: 8;
+}
+
+.review,
+.handoff {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding:
+    max(24px, env(safe-area-inset-top, 0px))
+    max(24px, env(safe-area-inset-right, 0px))
+    max(24px, env(safe-area-inset-bottom, 0px))
+    max(24px, env(safe-area-inset-left, 0px));
+  background: rgba(5, 5, 10, 0.92);
+  color: #fff;
+}
+
+.review {
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  gap: 20px;
+}
+
+.reviewPreview {
+  display: grid;
+  width: 100%;
+  min-height: 0;
+  place-items: center;
+  overflow: hidden;
+}
+
+.reviewCanvas {
+  display: block;
+  max-width: 100%;
+  max-height: min(68dvh, 760px);
+  width: auto;
+  height: auto;
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+}
+
+.reviewActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+}
+
+.reviewActions button,
+.handoffContinue,
+.handoffLink {
+  display: inline-flex;
+  min-width: 132px;
+  min-height: 52px;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 20px;
+  border: 2px solid rgba(255, 255, 255, 0.55);
+  border-radius: 14px;
+  background: #242431;
+  color: #fff;
+  font: 800 17px/1.2 system-ui, sans-serif;
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.fileInput {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.fileInput:disabled {
+  cursor: not-allowed;
+}
+
+.reviewActions .reviewPrimary,
+.handoffContinue {
+  border-color: #ff65aa;
+  background: #ff2d8b;
+}
+
+.reviewActions button:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
+.reviewAnnouncement {
+  min-height: 44px;
+  max-width: 680px;
+  text-align: center;
+}
+
+.reviewAnnouncement p {
+  margin: 0;
+  padding: 10px;
+}
+
+.reviewAnnouncement [role="alert"] {
+  border-radius: 10px;
+  background: #a7192f;
+}
+
+.handoffPanel {
+  display: flex;
+  width: min(560px, 100%);
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  padding: clamp(26px, 5vw, 48px);
+  border: 1px solid #535263;
+  border-radius: 28px;
+  background: #111119;
+  text-align: center;
+  box-shadow: 0 26px 80px rgba(0, 0, 0, 0.5);
+}
+
+.handoffPanel h1 {
+  margin: 0;
+  border-radius: 8px;
+  font: 850 clamp(34px, 6vw, 54px)/1 ui-rounded, system-ui, sans-serif;
+}
+
+.handoffPanel p {
+  margin: 0;
+  color: #d1cfda;
+  font-size: 18px;
+  line-height: 1.45;
+}
+
+.handoffQr {
+  width: min(320px, 72vw);
+  height: auto;
+  border: 10px solid #fff;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.handoffLink {
+  overflow-wrap: anywhere;
 }
 
 .storageWarning {
@@ -254,5 +446,636 @@
   color: #fff;
   font-size: 13px;
   font-weight: 650;
+  z-index: 12;
+}
+
+.uploadError {
+  position: absolute;
+  left: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  z-index: 12;
+  max-width: min(420px, 75vw);
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: #a7192f;
+  color: #fff;
+}
+
+/* Public operational state is deliberately simple: paused/disconnected only.
+   Device identity, credentials, and heartbeat detail stay private. */
+.connectivity {
+  position: absolute;
+  top: calc(16px + env(safe-area-inset-top, 0px));
+  left: 16px;
+  max-width: min(360px, 70vw);
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(67, 88, 125, 0.96);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
   z-index: 6;
+}
+
+.operationalPause {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  display: grid;
+  place-items: center;
+  padding:
+    max(28px, env(safe-area-inset-top, 0px))
+    max(28px, env(safe-area-inset-right, 0px))
+    max(28px, env(safe-area-inset-bottom, 0px))
+    max(28px, env(safe-area-inset-left, 0px));
+  background: rgba(7, 7, 12, 0.88);
+  color: #fff;
+  backdrop-filter: blur(10px);
+}
+
+.operationalPausePanel {
+  width: min(620px, 100%);
+  padding: clamp(28px, 5vw, 48px);
+  border: 1px solid #5b596a;
+  border-radius: 28px;
+  background: #111119;
+  box-shadow: 0 26px 80px rgba(0, 0, 0, 0.5);
+  text-align: center;
+  animation: pause-arrive 180ms ease-out both;
+}
+
+.operatorControls {
+  position: absolute;
+  top: calc(16px + env(safe-area-inset-top, 0px));
+  right: calc(16px + env(safe-area-inset-right, 0px));
+  z-index: 20;
+}
+
+.operatorToggle {
+  min-width: 96px;
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font: 750 14px/1 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+.operatorPanel {
+  width: min(430px, calc(100vw - 32px));
+  margin-top: 10px;
+  padding: 24px;
+  border: 1px solid #565563;
+  border-radius: 22px;
+  background: #111119;
+  color: #fff;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.58);
+}
+
+.operatorPanel[hidden] {
+  display: none;
+}
+
+.operatorPanel h2 {
+  margin: 4px 0 10px;
+  font-size: 28px;
+}
+
+.operatorPanel p {
+  margin: 0 0 16px;
+  color: #c9c8d2;
+  line-height: 1.45;
+}
+
+.operatorEyebrow {
+  color: #ff7db7 !important;
+  font: 800 11px/1.3 ui-monospace, "SFMono-Regular", Menlo, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.operatorPanel label {
+  display: block;
+  margin-bottom: 7px;
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.operatorPanel input {
+  width: 100%;
+  min-height: 52px;
+  padding: 0 14px;
+  border: 2px solid #4a4959;
+  border-radius: 13px;
+  background: #09090e;
+  color: #fff;
+  font-size: 18px;
+}
+
+.operatorError {
+  margin-top: 12px !important;
+  color: #ffb3cb !important;
+  font-weight: 700;
+}
+
+.operatorActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.operatorActions button {
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 0;
+  border-radius: 12px;
+  background: #34333e;
+  color: #fff;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.operatorActions button[type="submit"] {
+  background: #d41454;
+}
+
+.operatorActions button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.operatorToggle:focus-visible,
+.operatorPanel input:focus-visible,
+.operatorActions button:focus-visible {
+  outline: 3px solid #fff;
+  outline-offset: 4px;
+}
+
+.wakeFallback {
+  position: absolute;
+  left: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  z-index: 8;
+  max-width: min(520px, calc(100vw - 32px));
+  padding: 12px 16px;
+  border-radius: 13px;
+  background: rgba(145, 90, 0, 0.96);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.exited {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: #08080d;
+  color: #fff;
+  text-align: center;
+}
+
+.exited > div {
+  width: min(620px, 100%);
+  padding: clamp(30px, 6vw, 52px);
+  border: 1px solid #4c4b58;
+  border-radius: 28px;
+  background: #111119;
+}
+
+.exited h1 {
+  margin: 10px 0 18px;
+  font-size: clamp(38px, 7vw, 72px);
+}
+
+.exited p,
+.exited strong {
+  display: block;
+  margin: 10px 0;
+  line-height: 1.5;
+}
+
+.operationalEyebrow {
+  margin: 0 0 12px;
+  color: #ff8fc2;
+  font: 800 12px/1.3 ui-monospace, "SFMono-Regular", Menlo, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.operationalPausePanel h1 {
+  margin: 0;
+  font: 850 clamp(38px, 7vw, 58px)/0.98 ui-rounded, "Arial Rounded MT Bold", system-ui, sans-serif;
+  letter-spacing: -0.045em;
+}
+
+.operationalPausePanel > p:last-child {
+  margin: 18px auto 0;
+  max-width: 460px;
+  color: #b9b8c6;
+  font-size: clamp(17px, 2.4vw, 21px);
+  line-height: 1.45;
+}
+
+@keyframes pause-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Operator unlock: one calm, explicit path from recovered Outbox to camera. */
+.unlock {
+  --unlock-surface: #111119;
+  --unlock-raised: #191924;
+  --unlock-line: #353543;
+  --unlock-muted: #b9b8c6;
+  --unlock-signal: #ff2d8b;
+  --unlock-safe: #70e0bb;
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding:
+    max(28px, env(safe-area-inset-top, 0px))
+    max(28px, env(safe-area-inset-right, 0px))
+    max(28px, env(safe-area-inset-bottom, 0px))
+    max(28px, env(safe-area-inset-left, 0px));
+  background: #07070c;
+  color: #fff;
+}
+
+.unlockPanel {
+  width: min(760px, 100%);
+  padding: clamp(28px, 5vw, 54px);
+  border: 1px solid var(--unlock-line);
+  border-radius: 28px;
+  background: var(--unlock-surface);
+  box-shadow: 0 26px 80px rgba(0, 0, 0, 0.5);
+  animation: unlock-arrive 180ms ease-out both;
+}
+
+@keyframes unlock-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.unlockHeader {
+  max-width: 610px;
+}
+
+.unlockEyebrow {
+  margin: 0 0 12px;
+  color: #ff8fc2;
+  font: 800 12px/1.3 ui-monospace, "SFMono-Regular", Menlo, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.unlockHeader h1 {
+  margin: 0;
+  font: 850 clamp(38px, 7vw, 64px)/0.98 ui-rounded, "Arial Rounded MT Bold", system-ui, sans-serif;
+  letter-spacing: -0.045em;
+}
+
+.unlockLead {
+  max-width: 560px;
+  margin: 18px 0 0;
+  color: var(--unlock-muted);
+  font-size: clamp(17px, 2.4vw, 21px);
+  line-height: 1.45;
+}
+
+.readinessRail {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  margin: 32px 0 22px;
+  overflow: hidden;
+  border: 1px solid var(--unlock-line);
+  border-radius: 16px;
+  background: #0b0b11;
+}
+
+.readinessRail > div {
+  position: relative;
+  min-width: 0;
+  min-height: 82px;
+  padding: 16px 18px 15px 21px;
+  border-right: 1px solid var(--unlock-line);
+}
+
+.readinessRail > div:last-child {
+  border-right: 0;
+}
+
+.readinessRail > div::before {
+  position: absolute;
+  top: 17px;
+  left: 10px;
+  width: 4px;
+  height: 34px;
+  border-radius: 4px;
+  background: #686779;
+  content: "";
+}
+
+.readinessRail > div[data-ready="true"]::before {
+  background: var(--unlock-safe);
+}
+
+.readinessRail span,
+.readinessRail strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.readinessRail span {
+  margin-bottom: 7px;
+  color: #8e8d9d;
+  font: 750 10px/1.2 ui-monospace, "SFMono-Regular", Menlo, monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.readinessRail strong {
+  color: #f4f3f8;
+  font-size: 14px;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.readinessRail > div[data-ready="true"] strong {
+  color: var(--unlock-safe);
+}
+
+.unlockStatus {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 24px;
+  color: var(--unlock-muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.unlockStatus strong {
+  flex: 0 0 auto;
+  color: #fff;
+}
+
+.unlockStatus span {
+  text-align: right;
+}
+
+.unlockForm {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px 14px;
+}
+
+.unlockForm > label:first-child {
+  grid-column: 1 / -1;
+  color: #f4f3f8;
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.unlockForm > input {
+  width: 100%;
+  min-height: 56px;
+  padding: 0 16px;
+  border: 2px solid #4a4959;
+  border-radius: 14px;
+  outline: none;
+  background: #09090e;
+  color: #fff;
+  font-size: 20px;
+}
+
+.unlockForm > input:focus-visible {
+  border-color: #fff;
+  outline: 3px solid var(--unlock-signal);
+  outline-offset: 3px;
+}
+
+.unlockForm button,
+.unlockRetry {
+  min-width: 168px;
+  min-height: 56px;
+  padding: 0 24px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--unlock-signal);
+  color: #fff;
+  font-size: 17px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.unlockForm button:disabled,
+.unlockRetry:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.unlockForm button:focus-visible,
+.unlockRetry:focus-visible,
+.remember:focus-within {
+  outline: 3px solid #fff;
+  outline-offset: 4px;
+}
+
+.remember {
+  grid-column: 1 / -1;
+  display: inline-flex;
+  width: fit-content;
+  min-height: 44px;
+  align-items: center;
+  gap: 11px;
+  border-radius: 8px;
+  color: var(--unlock-muted);
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.remember input {
+  width: 24px;
+  height: 24px;
+  accent-color: var(--unlock-signal);
+}
+
+.unlockRetry {
+  display: block;
+  margin-left: auto;
+}
+
+@media (max-width: 620px) {
+  .unlock {
+    place-items: start center;
+    padding: 18px;
+  }
+
+  .unlockPanel {
+    padding: 26px 22px;
+    border-radius: 22px;
+  }
+
+  .readinessRail {
+    grid-template-columns: 1fr;
+  }
+
+  .readinessRail > div {
+    min-height: 67px;
+    border-right: 0;
+    border-bottom: 1px solid var(--unlock-line);
+  }
+
+  .readinessRail > div:last-child {
+    border-bottom: 0;
+  }
+
+  .unlockStatus {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .unlockStatus span {
+    text-align: left;
+  }
+
+  .unlockForm {
+    grid-template-columns: 1fr;
+  }
+
+  .unlockForm button,
+  .unlockRetry {
+    width: 100%;
+  }
+
+  .reviewActions {
+    width: 100%;
+  }
+
+  .reviewActions button {
+    flex: 1 1 140px;
+  }
+}
+
+@media (forced-colors: active) {
+  .unlock,
+  .unlockPanel,
+  .operationalPause,
+  .operationalPausePanel,
+  .connectivity,
+  .readinessRail,
+  .readinessRail > div,
+  .unlockForm > input,
+  .review,
+  .handoff,
+  .handoffPanel,
+  .reviewActions button,
+  .handoffContinue,
+  .handoffLink,
+  .localePicker select,
+  .error {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
+
+  .unlockForm button:focus-visible,
+  .unlockRetry:focus-visible,
+  .unlockForm > input:focus-visible,
+  .operatorToggle:focus-visible,
+  .operatorPanel input:focus-visible,
+  .operatorActions button:focus-visible,
+  .choice:focus-visible,
+  .shutter:focus-visible,
+  .change:focus-visible,
+  .liveLink:focus-visible,
+  .remember:focus-within,
+  .reviewActions button:focus-visible,
+  .handoffLink:focus-visible,
+  .handoffContinue:focus-visible,
+  .localePicker select:focus-visible,
+  .error:focus-visible,
+  .handoffPanel h1:focus-visible {
+    outline: 3px solid Highlight;
+    outline-offset: 4px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .unlockPanel,
+  .operationalPausePanel,
+  .operatorPanel,
+  .flash {
+    animation: none;
+  }
+
+  .choice:active,
+  .shutter:active {
+    transform: none;
+  }
+}
+
+.rehearsalStatus {
+  position: fixed;
+  inset-block-start: 12px;
+  inset-inline-start: 12px;
+  z-index: 35;
+  width: min(390px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  overflow: auto;
+  border: 3px solid #fff;
+  padding: 14px;
+  color: #fff;
+  background: rgba(12, 12, 12, .94);
+  box-shadow: 7px 7px 0 #c51651;
+}
+.rehearsalStatus > div:first-child p {
+  color: #ffd544;
+  font: 800 10px/1 ui-monospace, monospace;
+  text-transform: uppercase;
+}
+.rehearsalStatus h2 { margin-block: 6px; font: 900 25px/1 system-ui, sans-serif; }
+.rehearsalStatus code { overflow-wrap: anywhere; font-size: 10px; }
+.rehearsalStatus dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-block: 12px; }
+.rehearsalStatus dl div { border: 1px solid #777; padding: 8px; }
+.rehearsalStatus dt { color: #bbb; font-size: 10px; }
+.rehearsalStatus dd { margin-top: 4px; font-weight: 800; }
+.rehearsalStatus > p { margin-block: 10px; font-size: 12px; line-height: 1.4; }
+.rehearsalStatus .rehearsalWarning { border-inline-start: 5px solid #ffd544; padding: 9px; color: #111; background: #ffd544; }
+.rehearsalStatus button { min-width: 44px; min-height: 44px; width: 100%; border: 2px solid #fff; color: #fff; background: #c51651; font-weight: 900; cursor: pointer; }
+.rehearsalStatus button:focus-visible { outline: 3px solid #ffd544; outline-offset: 3px; }
+
+@media (forced-colors: active) {
+  .rehearsalStatus { border-color: CanvasText; background: Canvas; color: CanvasText; box-shadow: none; }
+  .rehearsalStatus button:focus-visible { outline-color: Highlight; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rehearsalStatus, .rehearsalStatus * { animation: none !important; transition: none !important; }
 }
