@@ -95,6 +95,11 @@ async function installGuestMocks(
     ) => {
       if (delay === 2_000 && typeof callback === "function") {
         fireAutoAccept = () => callback(...args);
+        // Do not accelerate CaptureReview's 2s auto-accept. A 120ms timer
+        // beats Playwright's click actionability wait: Use Photo / Retake
+        // are found, then disabled and unmounted into handoff. Tests that
+        // need auto-accept call __fireGuestAutoAccept after review is visible.
+        return nativeSetTimeout(() => {}, 0);
       }
       const accelerated = delay === 1_000
         ? 12
@@ -102,11 +107,9 @@ async function installGuestMocks(
           ? 4
           : delay === 400
             ? 5
-            : delay === 2_000
-              ? 120
-              : delay === 5_000
-                ? 150
-                : delay;
+            : delay === 5_000
+              ? 150
+              : delay;
       return nativeSetTimeout(callback, accelerated, ...args);
     }) as typeof window.setTimeout;
 
@@ -508,6 +511,20 @@ async function reviewCanvasId(page: Page): Promise<string> {
   return id!;
 }
 
+async function cancelReviewAutoAccept(page: Page) {
+  await page.getByRole("button", { name: "More Time" }).click();
+}
+
+async function fireReviewAutoAccept(page: Page) {
+  await page.evaluate(() => {
+    (
+      window as typeof window & {
+        __fireGuestAutoAccept(): void;
+      }
+    ).__fireGuestAutoAccept();
+  });
+}
+
 async function captureFrame(page: Page, buttonName: RegExp) {
   await page.getByRole("button", { name: buttonName }).click();
   await page.getByRole("button", { name: "Start" }).click();
@@ -582,6 +599,7 @@ test("WebKit reviews the exact one-shot and multi-shot canvas before one durable
   const firstReviewCanvas = await reviewCanvasId(page);
   expect((await browserState(page)).encodedCanvasIds).toEqual([]);
 
+  await cancelReviewAutoAccept(page);
   await page.getByRole("button", { name: "Retake" }).click();
   await expect(page.getByRole("button", { name: "Start" })).toBeFocused();
   expect(await outboxIds(page)).toEqual([]);
@@ -589,7 +607,7 @@ test("WebKit reviews the exact one-shot and multi-shot canvas before one durable
   await page.getByRole("button", { name: "Start" }).click();
   const acceptedCanvas = await reviewCanvasId(page);
   expect(acceptedCanvas).not.toBe(firstReviewCanvas);
-  await page.getByRole("button", { name: "More Time" }).click();
+  await cancelReviewAutoAccept(page);
   await page.waitForTimeout(220);
   await expect(page.getByRole("img", { name: "Photo preview" })).toBeVisible();
   expect(await outboxIds(page)).toEqual([]);
@@ -636,6 +654,7 @@ test("WebKit reviews the exact one-shot and multi-shot canvas before one durable
   fixture.holdUploads = true;
   await captureFrame(page, /Beacon 3 photos/);
   const multiReviewCanvas = await reviewCanvasId(page);
+  await fireReviewAutoAccept(page);
   await expect(page.getByRole("heading", { name: "Photo safely queued." })).toBeVisible();
   const multiCaptureId = (await outboxIds(page))[0];
   expect(multiCaptureId).toBeTruthy();
@@ -713,7 +732,7 @@ test("WebKit fences encode races and keeps the newer handoff during delayed reco
 
   await captureFrame(page, /Square 1 photo/);
   const failedCanvas = await reviewCanvasId(page);
-  await page.getByRole("button", { name: "More Time" }).click();
+  await cancelReviewAutoAccept(page);
   await page.evaluate(() => {
     (window as typeof window & {
       __guestCaptureTest: GuestBrowserState;
@@ -736,9 +755,11 @@ test("WebKit fences encode races and keeps the newer handoff during delayed reco
   await captureFrame(page, /Square 1 photo/);
   const newerCanvas = await reviewCanvasId(page);
   await page.evaluate(() => {
-    (window as typeof window & {
-      __fireGuestAutoAccept(): void;
-    }).__fireGuestAutoAccept();
+    (
+      window as typeof window & {
+        __fireGuestAutoAccept(): void;
+      }
+    ).__fireGuestAutoAccept();
     const buttons = [...document.querySelectorAll("button")];
     const use = buttons.find((button) => button.textContent?.trim() === "Use Photo");
     use?.click();
@@ -834,6 +855,7 @@ test("WebKit file-camera fallback reaches review when camera and audio are unava
   });
   const fallbackCanvas = await reviewCanvasId(page);
   fixture.holdUploads = true;
+  await cancelReviewAutoAccept(page);
   await page.getByRole("button", { name: "Use Photo" }).click();
   await expect(page.getByRole("heading", { name: "Photo safely queued." })).toBeVisible();
   expect((await browserState(page)).encodedCanvasIds).toEqual([fallbackCanvas]);
